@@ -185,6 +185,17 @@ pub(crate) fn seal_tree(
 }
 
 pub(crate) fn verify_sealed_tree(root: &File, expected: &SealedTreeReceipt) -> Result<(), Error> {
+    verify_tree(root, expected, Walk::Verify)
+}
+
+pub(crate) fn verify_publishing_tree(
+    root: &File,
+    expected: &SealedTreeReceipt,
+) -> Result<(), Error> {
+    verify_tree(root, expected, Walk::Publishing)
+}
+
+fn verify_tree(root: &File, expected: &SealedTreeReceipt, walk: Walk<'_>) -> Result<(), Error> {
     if !valid_digest(&expected.manifest.digest) || !valid_digest(&expected.content_digest) {
         return Err(Error::new(
             "STORAGE_UNSUPPORTED",
@@ -193,8 +204,14 @@ pub(crate) fn verify_sealed_tree(root: &File, expected: &SealedTreeReceipt) -> R
     }
     let mut hasher = content_hasher();
     let mut entries = 0;
-    walk_tree(root, &[], Walk::Verify, &mut hasher, &mut entries)?;
-    if stable_directory_node(Identity::from_file(root)?, expected.root)
+    walk_tree(root, &[], walk, &mut hasher, &mut entries)?;
+    let current = Identity::from_file(root)?;
+    let binding_matches = if matches!(walk, Walk::Publishing) {
+        publishing_binding(current, expected.root)
+    } else {
+        stable_directory_node(current, expected.root)
+    };
+    if binding_matches
         && volume_id(root)? == expected.volume
         && entries == expected.manifest.entries
         && authority::hex(&hasher.finalize()) == expected.content_digest
@@ -521,6 +538,7 @@ pub(crate) fn probe_native_cow(parent: &File) -> Result<(), Error> {
 enum Walk<'a> {
     Seal,
     Verify,
+    Publishing,
     Clone(&'a File),
     Worktree,
 }
@@ -535,7 +553,10 @@ fn walk_tree(
     let source_identity = Identity::from_file(source)?;
     let source_is_private = matches!(walk, Walk::Seal);
     let worktree = matches!(walk, Walk::Worktree);
-    let valid_source = if source_is_private {
+    let publishing_root = matches!(walk, Walk::Publishing) && prefix.is_empty();
+    let valid_source = if publishing_root {
+        publishing_directory(source_identity)
+    } else if source_is_private {
         private_directory(source_identity)
     } else if worktree {
         worktree_directory(source_identity)
@@ -550,7 +571,7 @@ fn walk_tree(
     }
     let destination = match walk {
         Walk::Clone(destination) => Some(destination),
-        Walk::Seal | Walk::Verify | Walk::Worktree => None,
+        Walk::Seal | Walk::Verify | Walk::Publishing | Walk::Worktree => None,
     };
     if let Some(destination) = destination {
         if !clone_destination_directory(Identity::from_file(destination)?)
@@ -742,7 +763,9 @@ fn walk_tree(
         chmod(source, 0o555)?;
     }
     let final_identity = Identity::from_file(source)?;
-    let valid_final = if worktree {
+    let valid_final = if publishing_root {
+        publishing_directory(final_identity)
+    } else if worktree {
         worktree_directory(final_identity)
     } else {
         sealed_directory(final_identity)
@@ -913,6 +936,13 @@ fn native_clone_file(
         {
             return Err(cleanup(storage_io(
                 "FICLONE cannot provide native copy-on-write",
+            )));
+        }
+        if let Err(error) = destination.sync_all() {
+            return Err(cleanup(Error::io(
+                "STORAGE_UNSUPPORTED",
+                "cannot sync FICLONE destination before FIEMAP",
+                error,
             )));
         }
         let shared = match fiemap_proves_shared(source, &destination) {
@@ -1106,6 +1136,25 @@ pub(crate) fn sealed_directory(identity: Identity) -> bool {
         && identity.uid == current_uid()
         && identity.mode == 0o555
         && identity.nlink >= 2
+}
+
+#[cfg(target_os = "macos")]
+fn publishing_directory(identity: Identity) -> bool {
+    identity.directory()
+        && identity.uid == current_uid()
+        && matches!(identity.mode, 0o555 | 0o755)
+        && identity.nlink >= 2
+}
+
+#[cfg(target_os = "linux")]
+fn publishing_directory(identity: Identity) -> bool {
+    sealed_directory(identity)
+}
+
+pub(crate) fn publishing_binding(current: Identity, expected: Identity) -> bool {
+    let mut adjusted = expected;
+    adjusted.mode = current.mode;
+    publishing_directory(current) && current.same_node(adjusted)
 }
 
 pub(crate) fn sealed_regular(identity: Identity) -> bool {
@@ -1748,59 +1797,63 @@ fn fiemap_proves_shared(source: &File, destination: &File) -> Result<bool, Error
     {
         return Ok(false);
     }
-    let mut source_map: Buffer = unsafe { std::mem::zeroed() };
-    let mut destination_map: Buffer = unsafe { std::mem::zeroed() };
-    for map in [&mut source_map, &mut destination_map] {
-        map.map.length = u64::MAX;
-        map.map.flags = SYNC;
-        map.map.extent_count = map.extents.len() as u32;
-    }
-    if unsafe { libc::ioctl(source.as_raw_fd(), REQUEST, &mut source_map) } != 0
-        || unsafe { libc::ioctl(destination.as_raw_fd(), REQUEST, &mut destination_map) } != 0
-    {
-        return Err(storage_io("cannot obtain FIEMAP shared-extent evidence"));
-    }
-    let count = source_map.map.mapped as usize;
-    if count != destination_map.map.mapped as usize || count > source_map.extents.len() {
-        return Ok(false);
-    }
-    if count == 0 {
-        return Ok(source_size == 0);
-    }
-    if source_map.extents[count - 1].flags & LAST == 0
-        || destination_map.extents[count - 1].flags & LAST == 0
-    {
-        return Ok(false);
+    if source_size == 0 {
+        return Ok(true);
     }
     let forbidden =
         UNKNOWN | DELALLOC | ENCODED | DATA_ENCRYPTED | NOT_ALIGNED | INLINE | TAIL | UNWRITTEN;
     let mut covered = 0_u64;
-    for (index, (left, right)) in source_map.extents[..count]
-        .iter()
-        .zip(&destination_map.extents[..count])
-        .enumerate()
-    {
-        let last = index + 1 == count;
-        if left.logical != covered
-            || left.logical != right.logical
-            || left.physical != right.physical
-            || left.length == 0
-            || left.length != right.length
-            || left.flags & forbidden != 0
-            || right.flags & forbidden != 0
-            || left.flags & SHARED == 0
-            || right.flags & SHARED == 0
-            || (left.flags & LAST != 0) != last
-            || (right.flags & LAST != 0) != last
+    while covered < source_size {
+        let mut source_map: Buffer = unsafe { std::mem::zeroed() };
+        let mut destination_map: Buffer = unsafe { std::mem::zeroed() };
+        for map in [&mut source_map, &mut destination_map] {
+            map.map.start = covered;
+            map.map.length = source_size - covered;
+            map.map.flags = SYNC;
+            map.map.extent_count = map.extents.len() as u32;
+        }
+        if unsafe { libc::ioctl(source.as_raw_fd(), REQUEST, &mut source_map) } != 0
+            || unsafe { libc::ioctl(destination.as_raw_fd(), REQUEST, &mut destination_map) } != 0
+        {
+            return Err(storage_io("cannot obtain FIEMAP shared-extent evidence"));
+        }
+        let count = source_map.map.mapped as usize;
+        if count == 0
+            || count != destination_map.map.mapped as usize
+            || count > source_map.extents.len()
         {
             return Ok(false);
         }
-        let Some(next) = covered.checked_add(left.length) else {
-            return Ok(false);
-        };
-        covered = next;
+        for (left, right) in source_map.extents[..count]
+            .iter()
+            .zip(&destination_map.extents[..count])
+        {
+            if left.logical != covered
+                || left.logical != right.logical
+                || left.physical != right.physical
+                || left.length == 0
+                || left.length != right.length
+                || left.flags & forbidden != 0
+                || right.flags & forbidden != 0
+                || left.flags & SHARED == 0
+                || right.flags & SHARED == 0
+            {
+                return Ok(false);
+            }
+            let Some(next) = covered.checked_add(left.length) else {
+                return Ok(false);
+            };
+            let reaches_end = next >= source_size;
+            if (left.flags & LAST != 0) != reaches_end || (right.flags & LAST != 0) != reaches_end {
+                return Ok(false);
+            }
+            covered = next.min(source_size);
+            if covered == source_size {
+                break;
+            }
+        }
     }
-    Ok(covered == source_size)
+    Ok(true)
 }
 
 #[cfg(target_os = "macos")]

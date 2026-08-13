@@ -309,8 +309,15 @@ fn publish_template(
         named_identity(container, &ready_name)?,
     ) {
         (Some(_), None) => {
-            sealed_root(container, &building_name, &sealed, &record.volume)?;
-            if let Err(error) = rename_ready(container, &building_name, &ready_name, sealed.root) {
+            let root = publishing_root(container, &building_name, &sealed, &record.volume)?;
+            if let Err(error) = rename_ready(
+                container,
+                &building_name,
+                &ready_name,
+                &root,
+                &sealed,
+                &record.volume,
+            ) {
                 if error.code != "TEMPLATE_IO_FAILED" {
                     return Err(error);
                 }
@@ -335,6 +342,8 @@ fn publish_template(
             }
         }
         (None, Some(_)) => {
+            let root = publishing_root(container, &ready_name, &sealed, &record.volume)?;
+            seal_publishing_root(&root, sealed.root)?;
             sealed_root(container, &ready_name, &sealed, &record.volume)?;
         }
         _ => {
@@ -484,6 +493,85 @@ fn sealed_root(
     }
     storage::verify_sealed_tree(&root, sealed)?;
     Ok(root)
+}
+
+fn publishing_root(
+    container: &File,
+    name: &str,
+    sealed: &storage::SealedTreeReceipt,
+    volume: &str,
+) -> Result<File, Error> {
+    let entry = named_identity(container, name)?
+        .ok_or_else(|| Error::new("TEMPLATE_CORRUPT", "publishing template root is absent"))?;
+    let name_c = cstring(name.as_bytes(), "template root")?;
+    let root = storage::open_directory_at(container.as_raw_fd(), &name_c)
+        .map_err(|_| Error::new("TEMPLATE_CORRUPT", "publishing template root is invalid"))?;
+    let descriptor = Identity::from_file(&root)?;
+    if !storage::publishing_binding(entry, sealed.root)
+        || !storage::publishing_binding(descriptor, sealed.root)
+        || storage::volume_id(&root)? != volume
+    {
+        return Err(Error::new(
+            "TEMPLATE_CORRUPT",
+            "publishing template root binding is invalid",
+        ));
+    }
+    storage::verify_publishing_tree(&root, sealed)?;
+    Ok(root)
+}
+
+fn set_publishing_root_mode(root: &File, expected: Identity, mode: u32) -> Result<(), Error> {
+    if !matches!(mode, 0o555 | 0o755)
+        || !storage::publishing_binding(Identity::from_file(root)?, expected)
+    {
+        return Err(Error::new(
+            "TEMPLATE_RECOVERY_REQUIRED",
+            "publishing template root changed before mode transition",
+        ));
+    }
+    if unsafe { libc::fchmod(root.as_raw_fd(), mode as libc::mode_t) } != 0 {
+        return Err(Error::io(
+            "TEMPLATE_RECOVERY_REQUIRED",
+            "cannot change publishing template root mode",
+            io::Error::last_os_error(),
+        ));
+    }
+    root.sync_all().map_err(|error| {
+        Error::io(
+            "TEMPLATE_RECOVERY_REQUIRED",
+            "cannot sync publishing template root mode",
+            error,
+        )
+    })?;
+    let current = Identity::from_file(root)?;
+    if current.mode != mode || !storage::publishing_binding(current, expected) {
+        return Err(Error::new(
+            "TEMPLATE_RECOVERY_REQUIRED",
+            "publishing template root changed after mode transition",
+        ));
+    }
+    Ok(())
+}
+
+fn seal_publishing_root(root: &File, expected: Identity) -> Result<(), Error> {
+    set_publishing_root_mode(root, expected, 0o555)
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_publishing_root(root: &File, expected: Identity) -> Result<(), Error> {
+    set_publishing_root_mode(root, expected, 0o755)
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_publishing_root(root: &File, expected: Identity) -> Result<(), Error> {
+    if storage::publishing_binding(Identity::from_file(root)?, expected) {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "TEMPLATE_RECOVERY_REQUIRED",
+            "publishing template root changed before rename",
+        ))
+    }
 }
 
 fn named_identity(container: &File, name: &str) -> Result<Option<Identity>, Error> {
@@ -1261,16 +1349,22 @@ fn rename_ready(
     parent: &File,
     building: &str,
     ready: &str,
-    expected: Identity,
+    root: &File,
+    sealed: &storage::SealedTreeReceipt,
+    volume: &str,
 ) -> Result<(), Error> {
     let building = cstring(building.as_bytes(), "building root")?;
     let ready = cstring(ready.as_bytes(), "ready root")?;
-    if storage::identity_at(parent.as_raw_fd(), &building)? != expected {
+    if !storage::publishing_binding(
+        storage::identity_at(parent.as_raw_fd(), &building)?,
+        sealed.root,
+    ) {
         return Err(Error::new(
             "TEMPLATE_CORRUPT",
             "template root changed before READY rename",
         ));
     }
+    prepare_publishing_root(root, sealed.root)?;
     match authority::rename_no_replace(parent.as_raw_fd(), &building, &ready) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::Interrupted => {
@@ -1281,14 +1375,16 @@ fn rename_ready(
             ))
         }
         Err(error) => {
+            seal_publishing_root(root, sealed.root)?;
             return Err(Error::io(
                 "TEMPLATE_IO_FAILED",
                 "cannot publish READY template root",
                 error,
-            ))
+            ));
         }
     }
-    if storage::identity_at(parent.as_raw_fd(), &ready)? != expected {
+    seal_publishing_root(root, sealed.root)?;
+    if storage::identity_at(parent.as_raw_fd(), &ready)? != sealed.root {
         return Err(Error::new(
             "TEMPLATE_RECOVERY_REQUIRED",
             "READY template binding changed after rename",
@@ -1301,12 +1397,15 @@ fn rename_ready(
             error,
         )
     })?;
-    if storage::identity_at(parent.as_raw_fd(), &ready)? != expected {
+    if storage::identity_at(parent.as_raw_fd(), &ready)? != sealed.root {
         return Err(Error::new(
             "TEMPLATE_RECOVERY_REQUIRED",
             "READY template binding changed after sync",
         ));
     }
+    let ready_name = std::str::from_utf8(ready.to_bytes())
+        .map_err(|_| Error::new("TEMPLATE_CORRUPT", "READY root name is not UTF-8"))?;
+    sealed_root(parent, ready_name, sealed, volume)?;
     Ok(())
 }
 
