@@ -773,6 +773,24 @@ fn git(cwd: &Path, args: &[OsString]) -> Output {
     output
 }
 
+fn real_git() -> &'static Path {
+    static REAL_GIT: OnceLock<PathBuf> = OnceLock::new();
+    REAL_GIT
+        .get_or_init(|| {
+            env::split_paths(&env::var_os("PATH").expect("PATH"))
+                .map(|directory| directory.join("git"))
+                .find(|candidate| {
+                    candidate.is_file()
+                        && candidate
+                            .metadata()
+                            .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+                })
+                .and_then(|candidate| fs::canonicalize(candidate).ok())
+                .expect("resolve real Git executable")
+        })
+        .as_path()
+}
+
 fn git_args(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
 }
@@ -1135,7 +1153,7 @@ fn create_cleans_known_status_failure_and_retains_unknown_git_failure() {
         let script = wrapper.join("git");
         fs::write(
             &script,
-            "#!/bin/sh\ncase \"$VWS_TEST_MODE:$1\" in\ndirty:status) printf '%s\\n' '?? injected'; exit 0 ;;\ngitfail:init) exit 77 ;;\nesac\nexec /usr/bin/git \"$@\"\n",
+            "#!/bin/sh\ncase \"$VWS_TEST_MODE:$1\" in\ndirty:status) printf '%s\\n' '?? injected'; exit 0 ;;\ngitfail:init) exit 77 ;;\nesac\nexec \"$VWS_TEST_REAL_GIT\" \"$@\"\n",
         )
         .expect("write Git wrapper");
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
@@ -1144,6 +1162,7 @@ fn create_cleans_known_status_failure_and_retains_unknown_git_failure() {
         let output = vws_command(&home, create_args(&bare, mode))
             .env("PATH", path)
             .env("VWS_TEST_MODE", mode)
+            .env("VWS_TEST_REAL_GIT", real_git())
             .output()
             .expect("run injected create");
         assert!(
@@ -1281,16 +1300,20 @@ fn replace_payload(record: &[u8], payload: &str) -> Vec<u8> {
 #[test]
 fn template_crash_prefix_recovery_table_keeps_exact_receipts() {
     require_native_cow();
-    let mut cases = vec![
+    #[cfg(target_os = "linux")]
+    let cases = [
         ("post-mkdir", "PREPARED", "READY"),
         ("post-seal", "MATERIALIZING", "TEMPLATE_INCOMPLETE"),
         ("post-rename", "PUBLISHING", "READY"),
     ];
     #[cfg(target_os = "macos")]
-    cases.extend([
+    let cases = [
+        ("post-mkdir", "PREPARED", "READY"),
+        ("post-seal", "MATERIALIZING", "TEMPLATE_INCOMPLETE"),
+        ("post-rename", "PUBLISHING", "READY"),
         ("post-unseal", "PUBLISHING", "READY"),
         ("post-rename-unsealed", "PUBLISHING", "READY"),
-    ]);
+    ];
     for (checkpoint, stage, expected) in cases {
         let mut sandbox = Sandbox::new();
         let bare = fixture_repo(&sandbox, false);
@@ -1320,14 +1343,16 @@ fn template_crash_prefix_recovery_table_keeps_exact_receipts() {
         let script = wrapper.join("git");
         fs::write(
             &script,
-            "#!/bin/sh\nif [ \"$1\" = init ]; then\n  printf 'HELLO %s %s %s\\n' \"$VWS_TEST_NONCE\" \"$$\" \"$$\" >&3 || exit 90\n  IFS=' ' read -r action nonce <&3 || exit 91\n  [ \"$action\" = ARM ] && [ \"$nonce\" = \"$VWS_TEST_NONCE\" ] || exit 92\n  printf 'PAUSED %s\\n' \"$nonce\" >&3 || exit 93\n  IFS= read -r _ <&3\n  exit 94\nfi\nexec /usr/bin/git \"$@\"\n",
+            "#!/bin/sh\nif [ \"$1\" = init ]; then\n  printf 'HELLO %s %s %s\\n' \"$VWS_TEST_NONCE\" \"$$\" \"$$\" >&3 || exit 90\n  IFS=' ' read -r action nonce <&3 || exit 91\n  [ \"$action\" = ARM ] && [ \"$nonce\" = \"$VWS_TEST_NONCE\" ] || exit 92\n  printf 'PAUSED %s\\n' \"$nonce\" >&3 || exit 93\n  IFS= read -r _ <&3\n  exit 94\nfi\nexec \"$VWS_TEST_REAL_GIT\" \"$@\"\n",
         )
         .expect("write pause wrapper");
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
             .expect("protect pause wrapper");
         let path = format!("{}:{}", wrapper.display(), env::var("PATH").expect("PATH"));
         let mut command = vws_command(&home, create_args(&bare, &format!("paused-{checkpoint}")));
-        command.env("PATH", path);
+        command
+            .env("PATH", path)
+            .env("VWS_TEST_REAL_GIT", real_git());
         let mut owner = CrashPrefixOwner::spawn(command, &script).expect("arm crash prefix owner");
         let observed = catch_unwind(AssertUnwindSafe(|| {
             let sessions = state.join("sessions");
