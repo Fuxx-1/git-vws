@@ -1814,7 +1814,7 @@ fn fiemap_proves_shared(source: &File, destination: &File) -> Result<bool, Error
         map: Fiemap,
         extents: [Extent; 32],
     }
-    const REQUEST: libc::Ioctl = 0xc020_660b as libc::Ioctl;
+    const REQUEST: libc::Ioctl = 0xc020_660bu32 as libc::Ioctl;
     const SYNC: u32 = 0x0000_0001;
     const LAST: u32 = 0x0000_0001;
     const UNKNOWN: u32 = 0x0000_0002;
