@@ -1226,6 +1226,14 @@ fn atomic_replace(path: &Path, bytes: &[u8]) {
 
 fn rename_and_sync(from: &Path, to: &Path) {
     assert_eq!(from.parent(), to.parent(), "rename crossed fixture parents");
+    #[cfg(target_os = "macos")]
+    {
+        fs::set_permissions(from, fs::Permissions::from_mode(0o755))
+            .expect("unseal fixture root before rename");
+        File::open(from)
+            .and_then(|root| root.sync_all())
+            .expect("sync unsealed fixture root");
+    }
     fs::rename(from, to).expect("rename fixture namespace");
     fsync_parent(from.parent().expect("fixture parent"));
 }
@@ -1401,7 +1409,14 @@ fn template_crash_prefix_recovery_table_keeps_exact_receipts() {
                 root.sync_all().expect("sync prepared root");
                 fsync_parent(&templates);
             }
-            "MATERIALIZING" => rename_and_sync(&ready_root, &building_root),
+            "MATERIALIZING" => {
+                rename_and_sync(&ready_root, &building_root);
+                fs::set_permissions(&building_root, fs::Permissions::from_mode(0o555))
+                    .expect("restore sealed materializing root mode");
+                File::open(&building_root)
+                    .and_then(|root| root.sync_all())
+                    .expect("sync sealed materializing root");
+            }
             "PUBLISHING" if checkpoint == "post-unseal" => {
                 rename_and_sync(&ready_root, &building_root);
                 fs::set_permissions(&building_root, fs::Permissions::from_mode(0o755))
