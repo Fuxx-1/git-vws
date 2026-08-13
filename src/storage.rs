@@ -16,6 +16,50 @@ const DIRECTORY_TYPE: u32 = libc::S_IFDIR;
 const REGULAR_TYPE: u32 = libc::S_IFREG;
 #[cfg(target_os = "linux")]
 const SYMLINK_TYPE: u32 = libc::S_IFLNK;
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct LinuxStatxTimestamp {
+    tv_sec: i64,
+    tv_nsec: u32,
+    reserved: i32,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct LinuxStatx {
+    stx_mask: u32,
+    stx_blksize: u32,
+    stx_attributes: u64,
+    stx_nlink: u32,
+    stx_uid: u32,
+    stx_gid: u32,
+    stx_mode: u16,
+    spare0: u16,
+    stx_ino: u64,
+    stx_size: u64,
+    stx_blocks: u64,
+    stx_attributes_mask: u64,
+    stx_atime: LinuxStatxTimestamp,
+    stx_btime: LinuxStatxTimestamp,
+    stx_ctime: LinuxStatxTimestamp,
+    stx_mtime: LinuxStatxTimestamp,
+    stx_rdev_major: u32,
+    stx_rdev_minor: u32,
+    stx_dev_major: u32,
+    stx_dev_minor: u32,
+    stx_mnt_id: u64,
+    stx_dio_mem_align: u32,
+    stx_dio_offset_align: u32,
+    stx_subvol: u64,
+    stx_atomic_write_unit_min: u32,
+    stx_atomic_write_unit_max: u32,
+    stx_atomic_write_segments_max: u32,
+    stx_dio_read_offset_align: u32,
+    stx_atomic_write_unit_max_opt: u32,
+    spare2: u32,
+    spare3: [u64; 8],
+}
 #[cfg(target_os = "macos")]
 const DIRECTORY_TYPE: u32 = libc::S_IFDIR as u32;
 #[cfg(target_os = "macos")]
@@ -929,7 +973,7 @@ fn native_clone_file(
         if unsafe {
             libc::ioctl(
                 destination.as_raw_fd(),
-                libc::FICLONE as libc::c_ulong,
+                libc::FICLONE as libc::Ioctl,
                 source.as_raw_fd(),
             )
         } != 0
@@ -1102,20 +1146,23 @@ fn mount_id(directory: &File) -> Result<u64, Error> {
 
 #[cfg(target_os = "linux")]
 fn mount_id(directory: &File) -> Result<u64, Error> {
-    let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+    const AT_EMPTY_PATH: libc::c_int = 0x1000;
+    const STATX_MNT_ID: u32 = 0x1000;
+    let mut stat: LinuxStatx = unsafe { std::mem::zeroed() };
     if unsafe {
-        libc::statx(
+        libc::syscall(
+            libc::SYS_statx,
             directory.as_raw_fd(),
             c"".as_ptr(),
-            libc::AT_EMPTY_PATH,
-            libc::STATX_MNT_ID,
+            AT_EMPTY_PATH,
+            STATX_MNT_ID,
             &mut stat,
         )
-    } != 0
+    } < 0
     {
         return Err(storage_io("cannot obtain Linux mount id"));
     }
-    if stat.stx_mask & libc::STATX_MNT_ID == 0 {
+    if stat.stx_mask & STATX_MNT_ID == 0 {
         return Err(Error::new(
             "STORAGE_UNSUPPORTED",
             "Linux did not return a mount id for native COW",
@@ -1537,7 +1584,7 @@ fn has_platform_flags_fd(fd: RawFd) -> Result<bool, Error> {
     #[cfg(target_os = "linux")]
     {
         let mut flags: libc::c_int = 0;
-        if unsafe { libc::ioctl(fd, libc::FS_IOC_GETFLAGS as libc::c_ulong, &mut flags) } != 0 {
+        if unsafe { libc::ioctl(fd, libc::FS_IOC_GETFLAGS as libc::Ioctl, &mut flags) } != 0 {
             return Err(storage_io("cannot inspect native COW file flags"));
         }
         Ok(flags != 0)
@@ -1767,7 +1814,7 @@ fn fiemap_proves_shared(source: &File, destination: &File) -> Result<bool, Error
         map: Fiemap,
         extents: [Extent; 32],
     }
-    const REQUEST: libc::c_ulong = 0xc020_660b;
+    const REQUEST: libc::Ioctl = 0xc020_660b as libc::Ioctl;
     const SYNC: u32 = 0x0000_0001;
     const LAST: u32 = 0x0000_0001;
     const UNKNOWN: u32 = 0x0000_0002;
