@@ -18,6 +18,10 @@ const MAX_LS_TREE_RECORD: usize = 1024 * 1024;
 const MAX_SYMLINK: usize = 4096;
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const POLICY_VERSION: &[u8] = b"git-vws/checkout-policy/v1";
+#[cfg(target_os = "linux")]
+const SYMLINK_TYPE: u32 = libc::S_IFLNK;
+#[cfg(target_os = "macos")]
+const SYMLINK_TYPE: u32 = libc::S_IFLNK as u32;
 static NEXT_BUILD: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) struct Template {
@@ -758,8 +762,7 @@ fn write_symlink(child: &mut GitChild, parent: &File, name: &CStr, size: u64) ->
         ));
     }
     let identity = storage::identity_at(parent.as_raw_fd(), name)?;
-    if identity.kind != libc::S_IFLNK as u32 || identity.uid != current_uid() || identity.nlink != 1
-    {
+    if identity.kind != SYMLINK_TYPE || identity.uid != current_uid() || identity.nlink != 1 {
         return Err(Error::new(
             "TEMPLATE_IO_FAILED",
             "template symbolic link identity is invalid",

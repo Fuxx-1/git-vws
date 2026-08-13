@@ -18,6 +18,18 @@ const STATE_ROOT: &[u8] = b".git-vws";
 const MAX_GIT_OUTPUT: usize = 1024;
 const MAX_RECORD_BYTES: usize = 4096;
 const GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
+const FILE_TYPE_MASK: u32 = libc::S_IFMT;
+#[cfg(target_os = "linux")]
+const DIRECTORY_TYPE: u32 = libc::S_IFDIR;
+#[cfg(target_os = "linux")]
+const REGULAR_TYPE: u32 = libc::S_IFREG;
+#[cfg(target_os = "macos")]
+const FILE_TYPE_MASK: u32 = libc::S_IFMT as u32;
+#[cfg(target_os = "macos")]
+const DIRECTORY_TYPE: u32 = libc::S_IFDIR as u32;
+#[cfg(target_os = "macos")]
+const REGULAR_TYPE: u32 = libc::S_IFREG as u32;
 static NEXT_TEMP: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 type ExchangeMutator = fn(RawFd, &CStr);
@@ -94,7 +106,7 @@ impl Identity {
             ino: stat.st_ino,
             uid: stat.st_uid,
             mode: stat.st_mode as u32 & 0o7777,
-            kind: stat.st_mode as u32 & libc::S_IFMT as u32,
+            kind: stat.st_mode as u32 & FILE_TYPE_MASK,
             nlink: stat.st_nlink as u64,
         }
     }
@@ -121,11 +133,11 @@ impl Identity {
     }
 
     pub(crate) fn directory(&self) -> bool {
-        self.kind == libc::S_IFDIR as u32
+        self.kind == DIRECTORY_TYPE
     }
 
     pub(crate) fn regular(&self) -> bool {
-        self.kind == libc::S_IFREG as u32
+        self.kind == REGULAR_TYPE
     }
 
     pub(crate) fn same_node(&self, other: Self) -> bool {
@@ -1464,7 +1476,7 @@ fn parse_record(bytes: &[u8]) -> Result<Record, Error> {
             ino: parse_number(values[3], "ino")?,
             uid: parse_number(values[4], "uid")?,
             mode: parse_number(values[5], "mode")?,
-            kind: libc::S_IFDIR as u32,
+            kind: DIRECTORY_TYPE,
             nlink: 0,
         },
         object_format,
@@ -1539,7 +1551,7 @@ fn identity_from_metadata(metadata: &fs::Metadata) -> Identity {
         ino: metadata.ino(),
         uid: metadata.uid(),
         mode: metadata.mode() & 0o7777,
-        kind: metadata.mode() & libc::S_IFMT as u32,
+        kind: metadata.mode() & FILE_TYPE_MASK,
         nlink: metadata.nlink(),
     }
 }

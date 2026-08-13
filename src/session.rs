@@ -15,6 +15,22 @@ use std::time::Duration;
 
 const MAX_RECORD: usize = 16 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(target_os = "linux")]
+const FILE_TYPE_MASK: u32 = libc::S_IFMT;
+#[cfg(target_os = "linux")]
+const DIRECTORY_TYPE: u32 = libc::S_IFDIR;
+#[cfg(target_os = "linux")]
+const REGULAR_TYPE: u32 = libc::S_IFREG;
+#[cfg(target_os = "linux")]
+const SYMLINK_TYPE: u32 = libc::S_IFLNK;
+#[cfg(target_os = "macos")]
+const FILE_TYPE_MASK: u32 = libc::S_IFMT as u32;
+#[cfg(target_os = "macos")]
+const DIRECTORY_TYPE: u32 = libc::S_IFDIR as u32;
+#[cfg(target_os = "macos")]
+const REGULAR_TYPE: u32 = libc::S_IFREG as u32;
+#[cfg(target_os = "macos")]
+const SYMLINK_TYPE: u32 = libc::S_IFLNK as u32;
 
 pub(crate) struct CreateRequest {
     pub(crate) name: OsString,
@@ -1081,7 +1097,7 @@ fn sync_tree(directory: &File) -> Result<(), Error> {
         let name = cstring(&bytes, "private Git metadata")?;
         let entry = storage::identity_at(directory.as_raw_fd(), &name)?;
         match entry.kind {
-            kind if kind == libc::S_IFDIR as u32 => {
+            kind if kind == DIRECTORY_TYPE => {
                 let child = storage::open_directory_at(directory.as_raw_fd(), &name)?;
                 if Identity::from_file(&child)? != entry {
                     return Err(Error::new(
@@ -1091,7 +1107,7 @@ fn sync_tree(directory: &File) -> Result<(), Error> {
                 }
                 sync_tree(&child)?;
             }
-            kind if kind == libc::S_IFREG as u32 => {
+            kind if kind == REGULAR_TYPE => {
                 let raw = unsafe {
                     libc::openat(
                         directory.as_raw_fd(),
@@ -1121,7 +1137,7 @@ fn sync_tree(directory: &File) -> Result<(), Error> {
                     )
                 })?;
             }
-            kind if kind == libc::S_IFLNK as u32 => {}
+            kind if kind == SYMLINK_TYPE => {}
             _ => {
                 return Err(Error::new(
                     "SESSION_IO_FAILED",
@@ -1213,7 +1229,7 @@ fn bind_path(path: &Path, descriptor: &File, label: &str) -> Result<(), Error> {
         ino: metadata.ino(),
         uid: metadata.uid(),
         mode: metadata.mode() & 0o7777,
-        kind: metadata.mode() & libc::S_IFMT as u32,
+        kind: metadata.mode() & FILE_TYPE_MASK,
         nlink: metadata.nlink(),
     };
     if entry != Identity::from_file(descriptor)? {
@@ -1325,7 +1341,7 @@ mod tests {
             ino: 1,
             uid: current_uid(),
             mode: 0o700,
-            kind: libc::S_IFDIR as u32,
+            kind: DIRECTORY_TYPE,
             nlink: 2,
         };
         let sid = "a".repeat(64);
