@@ -14,6 +14,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 static NEXT_SANDBOX: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_os = "linux")]
+const FILE_TYPE_MASK: u32 = libc::S_IFMT;
+#[cfg(target_os = "linux")]
+const DIRECTORY_TYPE: u32 = libc::S_IFDIR;
+#[cfg(target_os = "macos")]
+const FILE_TYPE_MASK: u32 = libc::S_IFMT as u32;
+#[cfg(target_os = "macos")]
+const DIRECTORY_TYPE: u32 = libc::S_IFDIR as u32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Node {
@@ -31,7 +39,7 @@ impl Node {
             ino: stat.st_ino,
             uid: stat.st_uid,
             mode: stat.st_mode as u32 & 0o7777,
-            kind: stat.st_mode as u32 & libc::S_IFMT as u32,
+            kind: stat.st_mode as u32 & FILE_TYPE_MASK,
         }
     }
 }
@@ -62,7 +70,7 @@ impl Sandbox {
         let root = open_dir(parent.as_raw_fd(), &name).expect("open sandbox");
         assert_eq!(unsafe { libc::fchmod(root.as_raw_fd(), 0o700) }, 0);
         let node = fstat(&root).expect("stat sandbox");
-        assert!(node.kind == libc::S_IFDIR as u32 && node.mode == 0o700);
+        assert!(node.kind == DIRECTORY_TYPE && node.mode == 0o700);
         Self {
             parent,
             parent_path: parent_path.clone(),
@@ -140,7 +148,7 @@ fn clear_directory(fd: RawFd, device: u64) -> io::Result<()> {
         if before.dev != device || before.uid != unsafe { libc::geteuid() } {
             return Err(io::Error::from(io::ErrorKind::PermissionDenied));
         }
-        if before.kind == libc::S_IFDIR as u32 {
+        if before.kind == DIRECTORY_TYPE {
             let child = open_dir(fd, &name)?;
             if fstat(&child)? != before {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));

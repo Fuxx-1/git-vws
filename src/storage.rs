@@ -10,6 +10,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 const MAX_SYMLINK: usize = 4096;
 static NEXT_PROBE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_os = "linux")]
+const DIRECTORY_TYPE: u32 = libc::S_IFDIR;
+#[cfg(target_os = "linux")]
+const REGULAR_TYPE: u32 = libc::S_IFREG;
+#[cfg(target_os = "linux")]
+const SYMLINK_TYPE: u32 = libc::S_IFLNK;
+#[cfg(target_os = "macos")]
+const DIRECTORY_TYPE: u32 = libc::S_IFDIR as u32;
+#[cfg(target_os = "macos")]
+const REGULAR_TYPE: u32 = libc::S_IFREG as u32;
+#[cfg(target_os = "macos")]
+const SYMLINK_TYPE: u32 = libc::S_IFLNK as u32;
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
@@ -575,7 +587,7 @@ fn walk_tree(
         }
         path.extend_from_slice(&bytes);
         match entry.kind {
-            kind if kind == libc::S_IFDIR as u32 => {
+            kind if kind == DIRECTORY_TYPE => {
                 let valid_directory = if source_is_private {
                     private_directory(entry)
                 } else if worktree {
@@ -630,7 +642,7 @@ fn walk_tree(
                     walk_tree(&child, &path, walk, hasher, entries)?;
                 }
             }
-            kind if kind == libc::S_IFREG as u32 => {
+            kind if kind == REGULAR_TYPE => {
                 if !(if worktree {
                     worktree_regular(entry)
                 } else {
@@ -679,7 +691,7 @@ fn walk_tree(
                     Error::new("STORAGE_UNSUPPORTED", "sealed-tree entry count overflow")
                 })?;
             }
-            kind if kind == libc::S_IFLNK as u32 => {
+            kind if kind == SYMLINK_TYPE => {
                 if entry.nlink != 1 || link_metadata_present(source.as_raw_fd(), &name, &stat)? {
                     return Err(Error::new(
                         "STORAGE_UNSUPPORTED",
@@ -696,7 +708,7 @@ fn walk_tree(
                         return Err(storage_io("cannot clone symbolic link"));
                     }
                     let destination_stat = stat_at(destination.as_raw_fd(), &name)?;
-                    if Identity::from_stat(&destination_stat).kind != libc::S_IFLNK as u32
+                    if Identity::from_stat(&destination_stat).kind != SYMLINK_TYPE
                         || link_metadata_present(destination.as_raw_fd(), &name, &destination_stat)?
                         || read_link_at(destination.as_raw_fd(), &name)? != target
                     {
@@ -1143,7 +1155,7 @@ fn stable_directory_node_allows_only_link_count_drift() {
         ino: 2,
         uid: 3,
         mode: 0o700,
-        kind: libc::S_IFDIR as u32,
+        kind: DIRECTORY_TYPE,
         nlink: 2,
     };
     let mut link_drift = expected;
@@ -1158,7 +1170,7 @@ fn stable_directory_node_allows_only_link_count_drift() {
             ..expected
         },
         Identity {
-            kind: libc::S_IFREG as u32,
+            kind: REGULAR_TYPE,
             ..expected
         },
     ] {
@@ -1591,7 +1603,7 @@ fn remove_owned_children(directory: &File, device: u64) -> Result<(), Error> {
             ));
         }
         match entry.kind {
-            kind if kind == libc::S_IFDIR as u32 => {
+            kind if kind == DIRECTORY_TYPE => {
                 let child = open_directory_at(directory.as_raw_fd(), &name)?;
                 if !stable_directory_node(Identity::from_file(&child)?, entry) {
                     return Err(Error::new(
@@ -1614,7 +1626,7 @@ fn remove_owned_children(directory: &File, device: u64) -> Result<(), Error> {
                     return Err(storage_io("cannot remove owned tree directory"));
                 }
             }
-            kind if kind == libc::S_IFREG as u32 || kind == libc::S_IFLNK as u32 => {
+            kind if kind == REGULAR_TYPE || kind == SYMLINK_TYPE => {
                 if identity_at(directory.as_raw_fd(), &name)? != entry {
                     return Err(Error::new(
                         "STORAGE_RECOVERY_REQUIRED",

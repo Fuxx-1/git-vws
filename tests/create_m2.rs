@@ -20,6 +20,22 @@ use serde_json::Value;
 
 static NEXT_SANDBOX: AtomicUsize = AtomicUsize::new(0);
 static NATIVE_COW_PROBE: OnceLock<Output> = OnceLock::new();
+#[cfg(target_os = "linux")]
+const FILE_TYPE_MASK: u32 = libc::S_IFMT;
+#[cfg(target_os = "linux")]
+const DIRECTORY_TYPE: u32 = libc::S_IFDIR;
+#[cfg(target_os = "linux")]
+const REGULAR_TYPE: u32 = libc::S_IFREG;
+#[cfg(target_os = "linux")]
+const SYMLINK_TYPE: u32 = libc::S_IFLNK;
+#[cfg(target_os = "macos")]
+const FILE_TYPE_MASK: u32 = libc::S_IFMT as u32;
+#[cfg(target_os = "macos")]
+const DIRECTORY_TYPE: u32 = libc::S_IFDIR as u32;
+#[cfg(target_os = "macos")]
+const REGULAR_TYPE: u32 = libc::S_IFREG as u32;
+#[cfg(target_os = "macos")]
+const SYMLINK_TYPE: u32 = libc::S_IFLNK as u32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Node {
@@ -37,7 +53,7 @@ impl Node {
             ino: stat.st_ino,
             uid: stat.st_uid,
             mode: stat.st_mode as u32 & 0o7777,
-            kind: stat.st_mode as u32 & libc::S_IFMT as u32,
+            kind: stat.st_mode as u32 & FILE_TYPE_MASK,
         }
     }
 }
@@ -191,7 +207,7 @@ fn clear_owned(parent: RawFd, device: u64) -> io::Result<()> {
         if before.dev != device || before.uid != unsafe { libc::geteuid() } {
             return Err(io::Error::from(io::ErrorKind::PermissionDenied));
         }
-        if before.kind == libc::S_IFDIR as u32 {
+        if before.kind == DIRECTORY_TYPE {
             let child = open_directory(parent, &name)?;
             let mut expected = node(&child)?;
             if expected != before {
@@ -211,7 +227,7 @@ fn clear_owned(parent: RawFd, device: u64) -> io::Result<()> {
             if unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
                 return Err(io::Error::last_os_error());
             }
-        } else if before.kind == libc::S_IFREG as u32 || before.kind == libc::S_IFLNK as u32 {
+        } else if before.kind == REGULAR_TYPE || before.kind == SYMLINK_TYPE {
             if unsafe { libc::unlinkat(parent, name.as_ptr(), 0) } != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -499,7 +515,7 @@ fn path_node(path: &Path) -> io::Result<Node> {
         ino: metadata.ino(),
         uid: metadata.uid(),
         mode: metadata.mode() & 0o7777,
-        kind: metadata.mode() & libc::S_IFMT as u32,
+        kind: metadata.mode() & FILE_TYPE_MASK,
     })
 }
 
