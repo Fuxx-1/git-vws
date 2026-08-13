@@ -31,6 +31,25 @@ jobs:
       - run: cargo check --locked --all-targets
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
+  linux-musl:
+    name: Linux musl release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - run: cargo build --locked --release --target x86_64-unknown-linux-musl
+      - name: Verify Git extension entry point
+        shell: bash
+        run: |
+          target/x86_64-unknown-linux-musl/release/git-vws --version
+          PATH="$PWD/target/x86_64-unknown-linux-musl/release:$PATH" git vws -h
+
   macos:
     name: macOS APFS (${{ matrix.asset }})
     strategy:
