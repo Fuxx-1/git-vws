@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo check --locked --all-targets
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  macos:
+    name: macOS APFS (${{ matrix.asset }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            asset: aarch64-apple-darwin
+          - os: macos-15-intel
+            asset: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: rustfmt, clippy
+      - name: Record host identity
+        shell: bash
+        run: |
+          mkdir -p runner-evidence
+          {
+            sw_vers
+            uname -a
+            rustc --version --verbose
+            cargo --version
+            git --version
+            diskutil info / | grep -E 'File System Personality|Device Node|Volume Name'
+          } > runner-evidence/host.txt
+      - name: Run full test suite
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --all-targets -- --test-threads=1 2>&1 | tee runner-evidence/tests.log
+      - run: cargo build --locked --release
+      - name: Verify Git extension entry point
+        shell: bash
+        run: |
+          target/release/git-vws --version
+          PATH="$PWD/target/release:$PATH" git vws -h
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: ci-macos-${{ matrix.asset }}
+          path: runner-evidence
+          if-no-files-found: error
+
+  linux-native-cow:
+    name: Linux XFS FICLONE/FIEMAP
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: rustfmt, clippy
+      - name: Install XFS tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+      - name: Prepare ephemeral XFS reflink volume
+        shell: bash
+        run: |
+          image="$RUNNER_TEMP/git-vws-xfs.img"
+          mountpoint="$RUNNER_TEMP/git-vws-xfs"
+          truncate -s 4G "$image"
+          sudo mkfs.xfs -f -m reflink=1 -d file,size=4g "$image"
+          sudo mkdir -p "$mountpoint"
+          sudo mount -o loop "$image" "$mountpoint"
+          sudo chown "$(id -u):$(id -g)" "$mountpoint"
+          mkdir "$mountpoint/tmp"
+          chmod 700 "$mountpoint/tmp"
+          echo "VWS_XFS_IMAGE=$image" >> "$GITHUB_ENV"
+          echo "VWS_XFS_MOUNT=$mountpoint" >> "$GITHUB_ENV"
+          echo "TMPDIR=$mountpoint/tmp" >> "$GITHUB_ENV"
+      - name: Record host and filesystem identity
+        shell: bash
+        run: |
+          mkdir -p runner-evidence
+          {
+            uname -a
+            rustc --version --verbose
+            cargo --version
+            git --version
+            findmnt -T "$TMPDIR" -o SOURCE,FSTYPE,OPTIONS
+            sudo xfs_info "$VWS_XFS_MOUNT"
+          } > runner-evidence/host.txt
+          test "$(findmnt -T "$TMPDIR" -no FSTYPE)" = xfs
+          sudo xfs_info "$VWS_XFS_MOUNT" | grep -q 'reflink=1'
+      - name: Run full test suite on XFS reflink
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --all-targets -- --test-threads=1 2>&1 | tee runner-evidence/tests.log
+      - run: cargo build --locked --release
+      - name: Verify Git extension entry point
+        shell: bash
+        run: |
+          target/release/git-vws --version
+          PATH="$PWD/target/release:$PATH" git vws -h
+      - name: Unmount and remove ephemeral volume
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if mountpoint -q "${VWS_XFS_MOUNT:-}"; then
+            sudo umount "$VWS_XFS_MOUNT"
+          fi
+          if [ -n "${VWS_XFS_MOUNT:-}" ]; then
+            sudo rm -rf -- "$VWS_XFS_MOUNT"
+            test ! -e "$VWS_XFS_MOUNT"
+          fi
+          if [ -n "${VWS_XFS_IMAGE:-}" ]; then
+            rm -f "$VWS_XFS_IMAGE"
+            test ! -e "$VWS_XFS_IMAGE"
+          fi
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: ci-linux-x86_64-xfs-reflink
+          path: runner-evidence
+          if-no-files-found: error
