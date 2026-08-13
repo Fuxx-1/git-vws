@@ -1765,13 +1765,19 @@ pub(crate) fn rename_no_replace(parent: RawFd, old: &CStr, new: &CStr) -> io::Re
 
 #[cfg(target_os = "linux")]
 pub(crate) fn rename_no_replace(parent: RawFd, old: &CStr, new: &CStr) -> io::Result<()> {
+    rename_at2(parent, old, new, libc::RENAME_NOREPLACE)
+}
+
+#[cfg(target_os = "linux")]
+fn rename_at2(parent: RawFd, old: &CStr, new: &CStr, flags: libc::c_uint) -> io::Result<()> {
     if unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             parent,
             old.as_ptr(),
             parent,
             new.as_ptr(),
-            libc::RENAME_NOREPLACE,
+            flags,
         )
     } != 0
     {
@@ -1896,8 +1902,8 @@ fn rename_result_is_unknown(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::Interrupted
 }
 
+#[cfg(target_os = "macos")]
 fn rename_exchange(parent: RawFd, left: &CStr, right: &CStr) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
     let result = unsafe {
         libc::renameatx_np(
             parent,
@@ -1907,21 +1913,16 @@ fn rename_exchange(parent: RawFd, left: &CStr, right: &CStr) -> io::Result<()> {
             libc::RENAME_SWAP,
         )
     };
-    #[cfg(target_os = "linux")]
-    let result = unsafe {
-        libc::renameat2(
-            parent,
-            left.as_ptr(),
-            parent,
-            right.as_ptr(),
-            libc::RENAME_EXCHANGE,
-        )
-    };
     if result == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_exchange(parent: RawFd, left: &CStr, right: &CStr) -> io::Result<()> {
+    rename_at2(parent, left, right, libc::RENAME_EXCHANGE)
 }
 
 pub(crate) fn read_file_binding(
