@@ -661,17 +661,19 @@ fn init_private_common(
     template.push(empty_template.as_os_str());
     let mut object_format = OsString::from("--object-format=");
     object_format.push(&authority.object_format);
-    let mut ref_format = OsString::from("--ref-format=");
-    ref_format.push(&authority.ref_format);
-    let args = [
+    let mut args = vec![
         OsString::from("init"),
         OsString::from("--bare"),
         OsString::from("--quiet"),
         object_format,
-        ref_format,
         template,
         common.as_os_str().to_os_string(),
     ];
+    if authority.ref_format != "files" {
+        let mut ref_format = OsString::from("--ref-format=");
+        ref_format.push(&authority.ref_format);
+        args.insert(4, ref_format);
+    }
     require_clean(
         git::capture(&args, None, GIT_TIMEOUT, AuditConfig::Isolated).map_err(git_error)?,
         "initialize private common-dir",

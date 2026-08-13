@@ -34,9 +34,16 @@ jobs:
           esac
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+  validation:
+    name: Validate macOS/Linux on release commit
+    needs: validate-tag
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   build:
     name: Build ${{ matrix.asset }}
-    needs: validate-tag
+    needs: [validate-tag, validation]
     strategy:
       fail-fast: false
       matrix:
@@ -78,12 +85,14 @@ jobs:
           package="git-vws-v${VERSION}-${{ matrix.asset }}"
           mkdir -p "$package"
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$package/"
-          cp README.md "$package/"
+          cp README.md LICENSE LICENSE-MIT LICENSE-APACHE "$package/"
           tar -czf "$package.tar.gz" "$package"
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$package.tar.gz" > "$package.tar.gz.sha256"
+            sha256sum -c "$package.tar.gz.sha256"
           else
             shasum -a 256 "$package.tar.gz" > "$package.tar.gz.sha256"
+            shasum -a 256 -c "$package.tar.gz.sha256"
           fi
       - uses: actions/upload-artifact@v5
         with:
@@ -95,7 +104,7 @@ jobs:
 
   publish:
     name: Publish prerelease
-    needs: [validate-tag, build]
+    needs: [validate-tag, validation, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -108,7 +117,13 @@ jobs:
       - name: Create combined checksum manifest
         working-directory: release-assets
         shell: bash
-        run: sha256sum *.tar.gz > SHA256SUMS
+        run: |
+          set -euo pipefail
+          for checksum in *.tar.gz.sha256; do
+            sha256sum -c "$checksum"
+          done
+          sha256sum *.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
       - name: Create GitHub prerelease
         shell: bash
         env:

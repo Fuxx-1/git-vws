@@ -401,8 +401,9 @@ pub(crate) fn probe_native_cow(parent: &File) -> Result<(), Error> {
         let mut source = unsafe { File::from_raw_fd(raw) };
         let mut source_node = Identity::from_file(&source)?;
         source_identity = Some(source_node);
+        let probe_payload = vec![b'g'; 64 * 1024];
         source
-            .write_all(b"git-vws-native-cow-probe")
+            .write_all(&probe_payload)
             .and_then(|_| source.sync_all())
             .map_err(|error| {
                 Error::io(
