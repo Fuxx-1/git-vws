@@ -101,13 +101,21 @@ pub(crate) struct Identity {
 
 impl Identity {
     pub(crate) fn from_stat(stat: &libc::stat) -> Self {
+        #[cfg(target_os = "linux")]
+        let (dev, mode, nlink) = (stat.st_dev, stat.st_mode, stat.st_nlink);
+        #[cfg(target_os = "macos")]
+        let (dev, mode, nlink) = (
+            stat.st_dev as u64,
+            stat.st_mode as u32,
+            stat.st_nlink as u64,
+        );
         Self {
-            dev: stat.st_dev as u64,
+            dev,
             ino: stat.st_ino,
             uid: stat.st_uid,
-            mode: stat.st_mode as u32 & 0o7777,
-            kind: stat.st_mode as u32 & FILE_TYPE_MASK,
-            nlink: stat.st_nlink as u64,
+            mode: mode & 0o7777,
+            kind: mode & FILE_TYPE_MASK,
+            nlink,
         }
     }
 

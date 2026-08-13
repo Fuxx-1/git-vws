@@ -303,7 +303,13 @@ fn init(home: &Path, authority: &Path) -> Output {
 
 fn init_command(home: &Path, authority: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_git-vws"));
-    command.arg("init").arg(authority).env("HOME", home);
+    command
+        .arg("init")
+        .arg(authority)
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_ATTR_NOSYSTEM", "1");
     for name in [
         "GIT_DIR",
         "GIT_WORK_TREE",
