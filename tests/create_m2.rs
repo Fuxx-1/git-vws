@@ -1281,11 +1281,17 @@ fn replace_payload(record: &[u8], payload: &str) -> Vec<u8> {
 #[test]
 fn template_crash_prefix_recovery_table_keeps_exact_receipts() {
     require_native_cow();
-    for (checkpoint, stage, expected) in [
+    let mut cases = vec![
         ("post-mkdir", "PREPARED", "READY"),
         ("post-seal", "MATERIALIZING", "TEMPLATE_INCOMPLETE"),
         ("post-rename", "PUBLISHING", "READY"),
-    ] {
+    ];
+    #[cfg(target_os = "macos")]
+    cases.extend([
+        ("post-unseal", "PUBLISHING", "READY"),
+        ("post-rename-unsealed", "PUBLISHING", "READY"),
+    ]);
+    for (checkpoint, stage, expected) in cases {
         let mut sandbox = Sandbox::new();
         let bare = fixture_repo(&sandbox, false);
         let home = home(&sandbox);
@@ -1371,12 +1377,23 @@ fn template_crash_prefix_recovery_table_keeps_exact_receipts() {
                 fsync_parent(&templates);
             }
             "MATERIALIZING" => rename_and_sync(&ready_root, &building_root),
+            "PUBLISHING" if checkpoint == "post-unseal" => {
+                rename_and_sync(&ready_root, &building_root);
+                fs::set_permissions(&building_root, fs::Permissions::from_mode(0o755))
+                    .expect("unseal publishing root");
+                fsync_parent(&templates);
+            }
+            "PUBLISHING" if checkpoint == "post-rename-unsealed" => {
+                fs::set_permissions(&ready_root, fs::Permissions::from_mode(0o755))
+                    .expect("unseal renamed publishing root");
+                fsync_parent(&templates);
+            }
             "PUBLISHING" => {}
             _ => unreachable!("table stage"),
         }
         atomic_replace(&record, &replace_payload(&ready_record, &payload));
 
-        let root = if stage != "PUBLISHING" {
+        let root = if stage != "PUBLISHING" || checkpoint == "post-unseal" {
             &building_root
         } else {
             &ready_root
@@ -1413,12 +1430,23 @@ fn template_crash_prefix_recovery_table_keeps_exact_receipts() {
                 "{checkpoint} did not commit READY"
             );
             assert!(ready_root.is_dir(), "{checkpoint} READY root was absent");
-            if stage == "PUBLISHING" {
+            if checkpoint == "post-rename" {
                 assert_eq!(snapshot(&ready_root), root_before);
                 assert_eq!(
                     path_node(&ready_root).expect("stat READY root"),
                     identity_before
                 );
+            } else if matches!(checkpoint, "post-unseal" | "post-rename-unsealed") {
+                let mut expected_snapshot = root_before;
+                expected_snapshot[..4].copy_from_slice(&(DIRECTORY_TYPE | 0o555).to_be_bytes());
+                assert_eq!(snapshot(&ready_root), expected_snapshot);
+                let recovered = path_node(&ready_root).expect("stat resealed READY root");
+                assert_eq!(recovered.dev, identity_before.dev);
+                assert_eq!(recovered.ino, identity_before.ino);
+                assert_eq!(recovered.uid, identity_before.uid);
+                assert_eq!(recovered.kind, identity_before.kind);
+                assert_eq!(recovered.mode, 0o555);
+                assert!(!building_root.exists(), "unsealed building root survived");
             } else {
                 assert!(!building_root.exists(), "prepared building root survived");
             }
