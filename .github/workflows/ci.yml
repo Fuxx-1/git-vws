@@ -46,6 +46,35 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+      - name: Prepare clean Git capability host
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p runner-evidence
+          git_bin="$(command -v git)"
+          git config --show-origin --show-scope --includes --list \
+            > runner-evidence/git-config-before.txt
+          git config --global --unset-regexp '^filter\.' || true
+          git config --global --unset-regexp '^lfs\.' || true
+          git config --global --unset-regexp '^include(if)?\.' || true
+          git config --global --unset-all core.attributesfile || true
+          sudo "$git_bin" config --system --unset-regexp '^filter\.' || true
+          sudo "$git_bin" config --system --unset-regexp '^lfs\.' || true
+          sudo "$git_bin" config --system --unset-regexp '^include(if)?\.' || true
+          sudo "$git_bin" config --system --unset-all core.attributesfile || true
+          git config --show-origin --show-scope --includes --list \
+            > runner-evidence/git-config-after.txt
+          if git config --show-origin --show-scope --includes \
+            --get-regexp '^(filter|lfs|include(if)?)\.|^core\.attributesfile$'; then
+            echo 'Unsupported Git configuration remains' >&2
+            exit 1
+          fi
+          system_attributes="$(git var GIT_ATTR_SYSTEM)"
+          global_attributes="$(git var GIT_ATTR_GLOBAL)"
+          printf 'system=%s\nglobal=%s\n' "$system_attributes" "$global_attributes" \
+            > runner-evidence/git-attributes-paths.txt
+          test ! -e "$system_attributes"
+          test ! -e "$global_attributes"
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
           components: rustfmt, clippy
@@ -87,6 +116,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Prepare clean Git capability host
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p runner-evidence
+          git_bin="$(command -v git)"
+          git config --show-origin --show-scope --includes --list \
+            > runner-evidence/git-config-before.txt
+          git config --global --unset-regexp '^filter\.' || true
+          git config --global --unset-regexp '^lfs\.' || true
+          git config --global --unset-regexp '^include(if)?\.' || true
+          git config --global --unset-all core.attributesfile || true
+          sudo "$git_bin" config --system --unset-regexp '^filter\.' || true
+          sudo "$git_bin" config --system --unset-regexp '^lfs\.' || true
+          sudo "$git_bin" config --system --unset-regexp '^include(if)?\.' || true
+          sudo "$git_bin" config --system --unset-all core.attributesfile || true
+          git config --show-origin --show-scope --includes --list \
+            > runner-evidence/git-config-after.txt
+          if git config --show-origin --show-scope --includes \
+            --get-regexp '^(filter|lfs|include(if)?)\.|^core\.attributesfile$'; then
+            echo 'Unsupported Git configuration remains' >&2
+            exit 1
+          fi
+          system_attributes="$(git var GIT_ATTR_SYSTEM)"
+          global_attributes="$(git var GIT_ATTR_GLOBAL)"
+          printf 'system=%s\nglobal=%s\n' "$system_attributes" "$global_attributes" \
+            > runner-evidence/git-attributes-paths.txt
+          test ! -e "$system_attributes"
+          test ! -e "$global_attributes"
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
           components: rustfmt, clippy

@@ -784,12 +784,7 @@ fn vws_command(home: &Path, args: Vec<OsString>) -> Command {
             command.env_remove(name);
         }
     }
-    command
-        .args(args)
-        .env("HOME", home)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_ATTR_NOSYSTEM", "1");
+    command.args(args).env("HOME", home);
     command
 }
 

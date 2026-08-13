@@ -936,7 +936,9 @@ impl<R: Read + AsRawFd> Pipe<R> {
                     let available = limit.saturating_sub(self.retained.len());
                     let accepted = available.min(count);
                     self.retained.extend_from_slice(&buffer[..accepted]);
-                    return Ok(accepted != count);
+                    if accepted != count {
+                        return Ok(true);
+                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
