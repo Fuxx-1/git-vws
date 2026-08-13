@@ -54,13 +54,15 @@ jobs:
           git_bin="$(command -v git)"
           git config --show-origin --show-scope --includes --list \
             > runner-evidence/git-config-before.txt
-          git config --global --unset-regexp '^filter\.' || true
-          git config --global --unset-regexp '^lfs\.' || true
-          git config --global --unset-regexp '^include(if)?\.' || true
+          while IFS= read -r key; do
+            test -z "$key" || git config --global --unset-all "$key"
+          done < <(git config --global --name-only \
+            --get-regexp '^(filter|lfs|include(if)?)\.' || true)
           git config --global --unset-all core.attributesfile || true
-          sudo "$git_bin" config --system --unset-regexp '^filter\.' || true
-          sudo "$git_bin" config --system --unset-regexp '^lfs\.' || true
-          sudo "$git_bin" config --system --unset-regexp '^include(if)?\.' || true
+          while IFS= read -r key; do
+            test -z "$key" || sudo "$git_bin" config --system --unset-all "$key"
+          done < <("$git_bin" config --system --name-only \
+            --get-regexp '^(filter|lfs|include(if)?)\.' || true)
           sudo "$git_bin" config --system --unset-all core.attributesfile || true
           git config --show-origin --show-scope --includes --list \
             > runner-evidence/git-config-after.txt
@@ -124,13 +126,15 @@ jobs:
           git_bin="$(command -v git)"
           git config --show-origin --show-scope --includes --list \
             > runner-evidence/git-config-before.txt
-          git config --global --unset-regexp '^filter\.' || true
-          git config --global --unset-regexp '^lfs\.' || true
-          git config --global --unset-regexp '^include(if)?\.' || true
+          while IFS= read -r key; do
+            test -z "$key" || git config --global --unset-all "$key"
+          done < <(git config --global --name-only \
+            --get-regexp '^(filter|lfs|include(if)?)\.' || true)
           git config --global --unset-all core.attributesfile || true
-          sudo "$git_bin" config --system --unset-regexp '^filter\.' || true
-          sudo "$git_bin" config --system --unset-regexp '^lfs\.' || true
-          sudo "$git_bin" config --system --unset-regexp '^include(if)?\.' || true
+          while IFS= read -r key; do
+            test -z "$key" || sudo "$git_bin" config --system --unset-all "$key"
+          done < <("$git_bin" config --system --name-only \
+            --get-regexp '^(filter|lfs|include(if)?)\.' || true)
           sudo "$git_bin" config --system --unset-all core.attributesfile || true
           git config --show-origin --show-scope --includes --list \
             > runner-evidence/git-config-after.txt
