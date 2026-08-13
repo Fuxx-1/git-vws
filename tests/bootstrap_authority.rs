@@ -303,13 +303,7 @@ fn init(home: &Path, authority: &Path) -> Output {
 
 fn init_command(home: &Path, authority: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_git-vws"));
-    command
-        .arg("init")
-        .arg(authority)
-        .env("HOME", home)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_ATTR_NOSYSTEM", "1");
+    command.arg("init").arg(authority).env("HOME", home);
     for name in [
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -1718,21 +1712,35 @@ fn output_limit_terminates_and_reaps_direct_probe_without_state() {
     let authority = bare(&sandbox, "authority.git");
     let wrapper = sandbox.path("output-limit-wrapper");
     let direct_pid = sandbox.path("output-limit-direct.pid");
+    let release = sandbox.path("output-limit.release");
     fs::create_dir(&wrapper).expect("wrapper directory");
     let script = wrapper.join("git");
     fs::write(
         &script,
-        "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$VWS_TEST_DIRECT_PID\"\nwhile :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n'; done\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$VWS_TEST_DIRECT_PID\"\nwhile [ ! -f \"$VWS_TEST_RELEASE\" ]; do /bin/sleep 0.01; done\n/usr/bin/yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx | /usr/bin/head -c 65536\nexec /bin/sleep 30\n",
     )
     .expect("output limit wrapper");
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("wrapper mode");
     let path = format!("{}:{}", wrapper.display(), env::var("PATH").expect("PATH"));
+    let worker_home = home.clone();
+    let worker_authority = authority.clone();
+    let worker_direct_pid = direct_pid.clone();
+    let worker_release = release.clone();
+    let worker = thread::spawn(move || {
+        init_command(&worker_home, &worker_authority)
+            .env("PATH", path)
+            .env("VWS_TEST_DIRECT_PID", worker_direct_pid)
+            .env("VWS_TEST_RELEASE", worker_release)
+            .output()
+    });
+    let marker = wait_for(Duration::from_secs(2), || direct_pid.is_file());
     let started = Instant::now();
-    let output = init_command(&home, &authority)
-        .env("PATH", path)
-        .env("VWS_TEST_DIRECT_PID", &direct_pid)
-        .output()
+    fs::write(&release, b"release\n").expect("release output limit probe");
+    let output = worker
+        .join()
+        .expect("join output limit probe")
         .expect("run output limit probe");
+    marker.expect("output limit direct marker deadline");
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "output limit was unbounded"
