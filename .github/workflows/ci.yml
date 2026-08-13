@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -38,8 +39,10 @@ jobs:
         include:
           - os: macos-15
             asset: aarch64-apple-darwin
+            arch: arm64
           - os: macos-15-intel
             asset: x86_64-apple-darwin
+            arch: x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -49,6 +52,7 @@ jobs:
       - name: Record host identity
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p runner-evidence
           {
             sw_vers
@@ -58,6 +62,8 @@ jobs:
             git --version
             diskutil info / | grep -E 'File System Personality|Device Node|Volume Name'
           } > runner-evidence/host.txt
+          test "$(uname -m)" = "${{ matrix.arch }}"
+          diskutil info / | grep -Eq 'File System Personality: +APFS'
       - name: Run full test suite
         shell: bash
         run: |
@@ -91,21 +97,23 @@ jobs:
       - name: Prepare ephemeral XFS reflink volume
         shell: bash
         run: |
+          set -euo pipefail
           image="$RUNNER_TEMP/git-vws-xfs.img"
           mountpoint="$RUNNER_TEMP/git-vws-xfs"
-          truncate -s 4G "$image"
-          sudo mkfs.xfs -f -m reflink=1 -d file,size=4g "$image"
+          echo "VWS_XFS_IMAGE=$image" >> "$GITHUB_ENV"
+          echo "VWS_XFS_MOUNT=$mountpoint" >> "$GITHUB_ENV"
+          sudo mkfs.xfs -f -m reflink=1 -d file,name="$image",size=4g
+          test -f "$image"
           sudo mkdir -p "$mountpoint"
           sudo mount -o loop "$image" "$mountpoint"
           sudo chown "$(id -u):$(id -g)" "$mountpoint"
           mkdir "$mountpoint/tmp"
           chmod 700 "$mountpoint/tmp"
-          echo "VWS_XFS_IMAGE=$image" >> "$GITHUB_ENV"
-          echo "VWS_XFS_MOUNT=$mountpoint" >> "$GITHUB_ENV"
           echo "TMPDIR=$mountpoint/tmp" >> "$GITHUB_ENV"
       - name: Record host and filesystem identity
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p runner-evidence
           {
             uname -a
@@ -115,6 +123,7 @@ jobs:
             findmnt -T "$TMPDIR" -o SOURCE,FSTYPE,OPTIONS
             sudo xfs_info "$VWS_XFS_MOUNT"
           } > runner-evidence/host.txt
+          test "$(uname -m)" = x86_64
           test "$(findmnt -T "$TMPDIR" -no FSTYPE)" = xfs
           sudo xfs_info "$VWS_XFS_MOUNT" | grep -q 'reflink=1'
       - name: Run full test suite on XFS reflink
@@ -141,7 +150,7 @@ jobs:
             test ! -e "$VWS_XFS_MOUNT"
           fi
           if [ -n "${VWS_XFS_IMAGE:-}" ]; then
-            rm -f "$VWS_XFS_IMAGE"
+            sudo rm -f -- "$VWS_XFS_IMAGE"
             test ! -e "$VWS_XFS_IMAGE"
           fi
       - uses: actions/upload-artifact@v5

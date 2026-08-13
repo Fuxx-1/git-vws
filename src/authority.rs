@@ -372,7 +372,6 @@ fn git_probe(path: &Path) -> Result<Vec<String>, Error> {
         OsString::from("--git-dir"),
         OsString::from("--git-common-dir"),
         OsString::from("--show-object-format=storage"),
-        OsString::from("--show-ref-format"),
     ]
     .into_iter()
     .collect();
@@ -388,7 +387,10 @@ fn git_probe(path: &Path) -> Result<Vec<String>, Error> {
     let body = text
         .strip_suffix('\n')
         .ok_or_else(|| Error::new("GIT_PROBE_FAILED", "Git probe lacked a final newline"))?;
-    let fields: Vec<String> = body.split('\n').map(ToOwned::to_owned).collect();
+    let mut fields: Vec<String> = body.split('\n').map(ToOwned::to_owned).collect();
+    if fields.len() == 4 {
+        fields.push(detect_ref_format(path)?);
+    }
     if fields.len() != 5
         || fields
             .iter()
@@ -397,6 +399,41 @@ fn git_probe(path: &Path) -> Result<Vec<String>, Error> {
         return Err(Error::probe_failed("Git probe output was ambiguous"));
     }
     Ok(fields)
+}
+
+fn detect_ref_format(path: &Path) -> Result<String, Error> {
+    let refs = path.join("refs");
+    let reftable = path.join("reftable");
+    let refs_is_dir = real_directory(&refs, "refs")?;
+    let reftable_is_dir = real_directory(&reftable, "reftable")?;
+    match (refs_is_dir, reftable_is_dir) {
+        (true, false) => Ok("files".to_owned()),
+        (false, true) => Ok("reftable".to_owned()),
+        _ => Err(Error::new(
+            "FORMAT_UNSUPPORTED",
+            "bare repository ref storage layout is ambiguous",
+        )),
+    }
+}
+
+fn real_directory(path: &Path, label: &str) -> Result<bool, Error> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::new(
+            "AUTHORITY_STORAGE_INVALID",
+            format!("{label} is a symlink"),
+        )),
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(Error::new(
+            "AUTHORITY_STORAGE_INVALID",
+            format!("{label} is not a directory"),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(Error::io(
+            "AUTHORITY_INVALID",
+            &format!("cannot inspect {label}"),
+            error,
+        )),
+    }
 }
 
 fn from_git_error(error: git::Error) -> Error {

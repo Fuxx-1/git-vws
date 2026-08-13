@@ -48,12 +48,16 @@ struct Node {
 
 impl Node {
     fn from_stat(stat: &libc::stat) -> Self {
+        #[cfg(target_os = "linux")]
+        let (dev, mode) = (stat.st_dev, stat.st_mode);
+        #[cfg(target_os = "macos")]
+        let (dev, mode) = (stat.st_dev as u64, stat.st_mode as u32);
         Self {
-            dev: stat.st_dev as u64,
+            dev,
             ino: stat.st_ino,
             uid: stat.st_uid,
-            mode: stat.st_mode as u32 & 0o7777,
-            kind: stat.st_mode as u32 & FILE_TYPE_MASK,
+            mode: mode & 0o7777,
+            kind: mode & FILE_TYPE_MASK,
         }
     }
 }
@@ -950,11 +954,16 @@ fn native_cow_available() -> bool {
         .success()
 }
 
+fn require_native_cow() {
+    if !native_cow_available() {
+        let output = NATIVE_COW_PROBE.get().expect("native COW probe output");
+        panic!("NOT_EXECUTED: native COW unavailable: {output:?}");
+    }
+}
+
 #[test]
 fn create_seals_raw_tree_reuses_ready_receipt_and_isolates_cow() {
-    if !native_cow_available() {
-        return;
-    }
+    require_native_cow();
     let mut sandbox = Sandbox::new();
     let bare = fixture_repo(&sandbox, false);
     let home = home(&sandbox);
@@ -1107,9 +1116,7 @@ fn unsupported_filter_config_rejects_create_without_authority_write() {
 
 #[test]
 fn create_cleans_known_status_failure_and_retains_unknown_git_failure() {
-    if !native_cow_available() {
-        return;
-    }
+    require_native_cow();
     for (mode, expected_record, expected_root, code) in [
         ("dirty", false, false, "SESSION_DIRTY"),
         ("gitfail", true, true, "SESSION_IO_FAILED"),
@@ -1273,10 +1280,7 @@ fn replace_payload(record: &[u8], payload: &str) -> Vec<u8> {
 
 #[test]
 fn template_crash_prefix_recovery_table_keeps_exact_receipts() {
-    if !native_cow_available() {
-        let output = NATIVE_COW_PROBE.get().expect("native COW probe output");
-        panic!("NOT_EXECUTED: native COW unavailable: {output:?}");
-    }
+    require_native_cow();
     for (checkpoint, stage, expected) in [
         ("post-mkdir", "PREPARED", "READY"),
         ("post-seal", "MATERIALIZING", "TEMPLATE_INCOMPLETE"),
@@ -1432,10 +1436,7 @@ fn template_crash_prefix_recovery_table_keeps_exact_receipts() {
 
 #[test]
 fn session_record_outbound_gate_rejects_invalid_names_without_state() {
-    if !native_cow_available() {
-        let output = NATIVE_COW_PROBE.get().expect("native COW probe output");
-        panic!("NOT_EXECUTED: native COW unavailable: {output:?}");
-    }
+    require_native_cow();
     let mut sandbox = Sandbox::new();
     let bare = fixture_repo(&sandbox, false);
     let home = home(&sandbox);
