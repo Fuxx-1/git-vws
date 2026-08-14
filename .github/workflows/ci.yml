@@ -24,6 +24,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          set-safe-directory: false
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
           components: rustfmt, clippy
@@ -36,6 +39,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          set-safe-directory: false
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
           targets: x86_64-unknown-linux-musl
@@ -65,37 +71,71 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-      - name: Prepare clean Git capability host
+        with:
+          persist-credentials: false
+          set-safe-directory: false
+      - name: Record Git isolation evidence
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p runner-evidence
-          git_bin="$(command -v git)"
-          git config --show-origin --show-scope --includes --list \
-            > runner-evidence/git-config-before.txt
-          while IFS= read -r key; do
-            test -z "$key" || git config --global --unset-all "$key"
-          done < <(git config --global --name-only \
-            --get-regexp '^(filter|lfs|include(if)?)\.' || true)
-          git config --global --unset-all core.attributesfile || true
-          while IFS= read -r key; do
-            test -z "$key" || sudo "$git_bin" config --system --unset-all "$key"
-          done < <("$git_bin" config --system --name-only \
-            --get-regexp '^(filter|lfs|include(if)?)\.' || true)
-          sudo "$git_bin" config --system --unset-all core.attributesfile || true
-          git config --show-origin --show-scope --includes --list \
-            > runner-evidence/git-config-after.txt
-          if git config --show-origin --show-scope --includes \
-            --get-regexp '^(filter|lfs|include(if)?)\.|^core\.attributesfile$'; then
-            echo 'Unsupported Git configuration remains' >&2
+          relevant_config='^(filter|lfs|include(if)?)\.|^core\.attributesfile$'
+          record_scope() {
+            local scope="$1"
+            local output="$2"
+            local status
+            if git config "$scope" --includes --name-only \
+              --get-regexp "$relevant_config" > "$output"; then
+              return 0
+            else
+              status=$?
+            fi
+            if [ "$status" -ne 1 ]; then
+              return "$status"
+            fi
+            return 0
+          }
+          record_scope --global runner-evidence/git-config-global-relevant.txt
+          record_scope --system runner-evidence/git-config-system-relevant.txt
+          isolated_xdg="$RUNNER_TEMP/git-vws-empty-xdg"
+          mkdir -p "$isolated_xdg"
+          test -z "$(find "$isolated_xdg" -mindepth 1 -maxdepth 1 -print -quit)"
+          export GIT_CONFIG_NOSYSTEM=1
+          export GIT_CONFIG_GLOBAL=/dev/null
+          export GIT_ATTR_NOSYSTEM=1
+          export XDG_CONFIG_HOME="$isolated_xdg"
+          test "$GIT_CONFIG_NOSYSTEM" = 1
+          test "$GIT_CONFIG_GLOBAL" = /dev/null
+          test "$GIT_ATTR_NOSYSTEM" = 1
+          {
+            printf 'GIT_CONFIG_NOSYSTEM=%s\n' "$GIT_CONFIG_NOSYSTEM"
+            printf 'GIT_CONFIG_GLOBAL=%s\n' "$GIT_CONFIG_GLOBAL"
+            printf 'GIT_ATTR_NOSYSTEM=%s\n' "$GIT_ATTR_NOSYSTEM"
+            printf 'XDG_CONFIG_HOME=%s\n' "$XDG_CONFIG_HOME"
+          } > runner-evidence/git-isolation-env.txt
+          {
+            printf 'GIT_CONFIG_NOSYSTEM=%s\n' "$GIT_CONFIG_NOSYSTEM"
+            printf 'GIT_CONFIG_GLOBAL=%s\n' "$GIT_CONFIG_GLOBAL"
+            printf 'GIT_ATTR_NOSYSTEM=%s\n' "$GIT_ATTR_NOSYSTEM"
+            printf 'XDG_CONFIG_HOME=%s\n' "$XDG_CONFIG_HOME"
+          } >> "$GITHUB_ENV"
+          if git config --includes --name-only --get-regexp "$relevant_config" \
+            > runner-evidence/git-config-isolated-unsupported.txt; then
+            cat runner-evidence/git-config-isolated-unsupported.txt
             exit 1
+          else
+            status=$?
           fi
-          system_attributes="$(git var GIT_ATTR_SYSTEM)"
+          test "$status" -eq 1
+          printf 'no unsupported config keys in isolated view\n' \
+            >> runner-evidence/git-config-isolated-unsupported.txt
           global_attributes="$(git var GIT_ATTR_GLOBAL)"
-          printf 'system=%s\nglobal=%s\n' "$system_attributes" "$global_attributes" \
-            > runner-evidence/git-attributes-paths.txt
-          test ! -e "$system_attributes"
+          printf '%s\n' "$global_attributes" \
+            > runner-evidence/git-attributes-global-isolated.txt
+          test "$global_attributes" = "$XDG_CONFIG_HOME/git/attributes"
           test ! -e "$global_attributes"
+          printf 'GIT_ATTR_NOSYSTEM=1; system attributes disabled in isolated view\n' \
+            > runner-evidence/git-attributes-system-isolated.txt
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
           components: rustfmt, clippy
@@ -114,17 +154,98 @@ jobs:
           } > runner-evidence/host.txt
           test "$(uname -m)" = "${{ matrix.arch }}"
           diskutil info / | grep -Eq 'File System Personality: +APFS'
+      - name: Record frozen M4 source contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_m4_sha='f6c40e79c8efb2620e9561fb972589a76eb37cc6c9da5b83728dccb30d0dbaf8'
+          test -n "${GITHUB_SHA:-}"
+          head_sha="$(git rev-parse HEAD)"
+          actual_m4_sha="$(shasum -a 256 tests/m4_git_parity.rs | awk '{print $1}')"
+          {
+            printf 'GITHUB_SHA=%s\n' "$GITHUB_SHA"
+            printf 'HEAD=%s\n' "$head_sha"
+            printf 'tests/m4_git_parity.rs SHA-256=%s\n' "$actual_m4_sha"
+          } > runner-evidence/m4-source-contract.log
+          test "$head_sha" = "$GITHUB_SHA"
+          test "$actual_m4_sha" = "$expected_m4_sha"
       - name: Run full test suite
         shell: bash
         run: |
-          set -o pipefail
-          cargo test --locked --all-targets -- --test-threads=1 2>&1 | tee runner-evidence/tests.log
-      - run: cargo build --locked --release
+          set -euo pipefail
+          cargo test --locked --all-targets -- --test-threads=1 --nocapture 2>&1 | tee runner-evidence/tests.log
+      - name: Verify M4 APFS evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > runner-evidence/m4-gates.log
+          grep -Fx 'M4 template crash checkpoints=24' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
+          grep -Fx 'M4 create crash checkpoints=28' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
+          grep -Fx 'M4 remove crash checkpoints=10' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
+          grep -Fx 'M4 crash-prefix targets exercised=62' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
+          grep -E '^M4 APFS COW dev=' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
+          grep -F 'M4 macOS raw checkout exit=' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
+          : > runner-evidence/m4-tests.log
+          grep -F 'test checkpoint_protocol_and_all_reachable_crash_prefixes_are_safe ...' runner-evidence/tests.log | tee -a runner-evidence/m4-tests.log
+          grep -F 'test exec_preserves_direct_contract_and_n3_sessions_are_isolated_and_leased ...' runner-evidence/tests.log | tee -a runner-evidence/m4-tests.log
+          grep -F 'test native_cow_evidence_uses_the_host_storage_oracle ...' runner-evidence/tests.log | tee -a runner-evidence/m4-tests.log
+          grep -F 'test ordinary_worktree_and_vws_have_git_parity_for_history_conflicts_and_paths ...' runner-evidence/tests.log | tee -a runner-evidence/m4-tests.log
+          test "$(wc -l < runner-evidence/m4-tests.log | tr -d ' ')" = 4
+          m4_summary='^test result: ok\. 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in .*$'
+          awk -v expected="$m4_summary" '
+            /Running .*tests\/m4_git_parity\.rs/ {
+              runs += 1
+              in_m4 = 1
+              next
+            }
+            in_m4 && /^test result:/ {
+              summaries += 1
+              if ($0 ~ expected) {
+                print
+                matches += 1
+              }
+              in_m4 = 0
+            }
+            END {
+              exit !(runs == 1 && summaries == 1 && matches == 1)
+            }
+          ' runner-evidence/tests.log | tee -a runner-evidence/m4-tests.log
+          if grep -nF 'NOT_EXECUTED' runner-evidence/tests.log > runner-evidence/m4-not-executed.log; then
+            cat runner-evidence/m4-not-executed.log
+            exit 1
+          fi
+          printf 'no NOT_EXECUTED\n' >> runner-evidence/m4-not-executed.log
+      - name: Build and scan release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > runner-evidence/release-rustflags-cleared.log
+          for name in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS; do
+            printf '%s\n' "$name" >> runner-evidence/release-rustflags-cleared.log
+            unset "$name"
+          done
+          while IFS= read -r name; do
+            printf '%s\n' "$name" >> runner-evidence/release-rustflags-cleared.log
+            unset "$name"
+          done < <(compgen -e | grep -E '^CARGO_TARGET_.*_RUSTFLAGS$' || true)
+          cargo build --locked --release --all-features --bin git-vws 2>&1 | tee runner-evidence/release-build.log
+          release_binary=target/release/git-vws
+          test -x "$release_binary"
+          command -v strings | tee runner-evidence/release-tools.log
+          command -v nm | tee -a runner-evidence/release-tools.log
+          strings "$release_binary" 2>&1 | tee runner-evidence/release-strings.log
+          nm -a "$release_binary" 2>&1 | tee runner-evidence/release-nm.log
+          if grep -F -e 'M4CP/1' -e 'GIT_VWS_M4_CONTROL_FD' -e 'GIT_VWS_M4_NONCE' -e 'GIT_VWS_M4_TARGET' -e 'm4_checkpoint' runner-evidence/release-strings.log runner-evidence/release-nm.log > runner-evidence/release-m4-matches.log; then
+            cat runner-evidence/release-m4-matches.log
+            exit 1
+          fi
+          printf 'release M4 marker scan: no matches\n' >> runner-evidence/release-m4-matches.log
       - name: Verify Git extension entry point
         shell: bash
         run: |
-          target/release/git-vws --version
-          PATH="$PWD/target/release:$PATH" git vws -h
+          set -euo pipefail
+          target/release/git-vws --version 2>&1 | tee runner-evidence/release-cli-version.log
+          PATH="$PWD/target/release:$PATH" git vws -h 2>&1 | tee runner-evidence/release-cli-help.log
       - uses: actions/upload-artifact@v5
         if: always()
         with:
@@ -137,37 +258,71 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Prepare clean Git capability host
+        with:
+          persist-credentials: false
+          set-safe-directory: false
+      - name: Record Git isolation evidence
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p runner-evidence
-          git_bin="$(command -v git)"
-          git config --show-origin --show-scope --includes --list \
-            > runner-evidence/git-config-before.txt
-          while IFS= read -r key; do
-            test -z "$key" || git config --global --unset-all "$key"
-          done < <(git config --global --name-only \
-            --get-regexp '^(filter|lfs|include(if)?)\.' || true)
-          git config --global --unset-all core.attributesfile || true
-          while IFS= read -r key; do
-            test -z "$key" || sudo "$git_bin" config --system --unset-all "$key"
-          done < <("$git_bin" config --system --name-only \
-            --get-regexp '^(filter|lfs|include(if)?)\.' || true)
-          sudo "$git_bin" config --system --unset-all core.attributesfile || true
-          git config --show-origin --show-scope --includes --list \
-            > runner-evidence/git-config-after.txt
-          if git config --show-origin --show-scope --includes \
-            --get-regexp '^(filter|lfs|include(if)?)\.|^core\.attributesfile$'; then
-            echo 'Unsupported Git configuration remains' >&2
+          relevant_config='^(filter|lfs|include(if)?)\.|^core\.attributesfile$'
+          record_scope() {
+            local scope="$1"
+            local output="$2"
+            local status
+            if git config "$scope" --includes --name-only \
+              --get-regexp "$relevant_config" > "$output"; then
+              return 0
+            else
+              status=$?
+            fi
+            if [ "$status" -ne 1 ]; then
+              return "$status"
+            fi
+            return 0
+          }
+          record_scope --global runner-evidence/git-config-global-relevant.txt
+          record_scope --system runner-evidence/git-config-system-relevant.txt
+          isolated_xdg="$RUNNER_TEMP/git-vws-empty-xdg"
+          mkdir -p "$isolated_xdg"
+          test -z "$(find "$isolated_xdg" -mindepth 1 -maxdepth 1 -print -quit)"
+          export GIT_CONFIG_NOSYSTEM=1
+          export GIT_CONFIG_GLOBAL=/dev/null
+          export GIT_ATTR_NOSYSTEM=1
+          export XDG_CONFIG_HOME="$isolated_xdg"
+          test "$GIT_CONFIG_NOSYSTEM" = 1
+          test "$GIT_CONFIG_GLOBAL" = /dev/null
+          test "$GIT_ATTR_NOSYSTEM" = 1
+          {
+            printf 'GIT_CONFIG_NOSYSTEM=%s\n' "$GIT_CONFIG_NOSYSTEM"
+            printf 'GIT_CONFIG_GLOBAL=%s\n' "$GIT_CONFIG_GLOBAL"
+            printf 'GIT_ATTR_NOSYSTEM=%s\n' "$GIT_ATTR_NOSYSTEM"
+            printf 'XDG_CONFIG_HOME=%s\n' "$XDG_CONFIG_HOME"
+          } > runner-evidence/git-isolation-env.txt
+          {
+            printf 'GIT_CONFIG_NOSYSTEM=%s\n' "$GIT_CONFIG_NOSYSTEM"
+            printf 'GIT_CONFIG_GLOBAL=%s\n' "$GIT_CONFIG_GLOBAL"
+            printf 'GIT_ATTR_NOSYSTEM=%s\n' "$GIT_ATTR_NOSYSTEM"
+            printf 'XDG_CONFIG_HOME=%s\n' "$XDG_CONFIG_HOME"
+          } >> "$GITHUB_ENV"
+          if git config --includes --name-only --get-regexp "$relevant_config" \
+            > runner-evidence/git-config-isolated-unsupported.txt; then
+            cat runner-evidence/git-config-isolated-unsupported.txt
             exit 1
+          else
+            status=$?
           fi
-          system_attributes="$(git var GIT_ATTR_SYSTEM)"
+          test "$status" -eq 1
+          printf 'no unsupported config keys in isolated view\n' \
+            >> runner-evidence/git-config-isolated-unsupported.txt
           global_attributes="$(git var GIT_ATTR_GLOBAL)"
-          printf 'system=%s\nglobal=%s\n' "$system_attributes" "$global_attributes" \
-            > runner-evidence/git-attributes-paths.txt
-          test ! -e "$system_attributes"
+          printf '%s\n' "$global_attributes" \
+            > runner-evidence/git-attributes-global-isolated.txt
+          test "$global_attributes" = "$XDG_CONFIG_HOME/git/attributes"
           test ! -e "$global_attributes"
+          printf 'GIT_ATTR_NOSYSTEM=1; system attributes disabled in isolated view\n' \
+            > runner-evidence/git-attributes-system-isolated.txt
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
           components: rustfmt, clippy
@@ -204,20 +359,105 @@ jobs:
             findmnt -T "$TMPDIR" -o SOURCE,FSTYPE,OPTIONS
             sudo xfs_info "$VWS_XFS_MOUNT"
           } > runner-evidence/host.txt
+          test "$(uname -s)" = Linux
           test "$(uname -m)" = x86_64
           test "$(findmnt -T "$TMPDIR" -no FSTYPE)" = xfs
           sudo xfs_info "$VWS_XFS_MOUNT" | grep -q 'reflink=1'
+      - name: Record frozen M4 source contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_m4_sha='f6c40e79c8efb2620e9561fb972589a76eb37cc6c9da5b83728dccb30d0dbaf8'
+          test -n "${GITHUB_SHA:-}"
+          head_sha="$(git rev-parse HEAD)"
+          actual_m4_sha="$(shasum -a 256 tests/m4_git_parity.rs | awk '{print $1}')"
+          {
+            printf 'GITHUB_SHA=%s\n' "$GITHUB_SHA"
+            printf 'HEAD=%s\n' "$head_sha"
+            printf 'tests/m4_git_parity.rs SHA-256=%s\n' "$actual_m4_sha"
+          } > runner-evidence/m4-source-contract.log
+          test "$head_sha" = "$GITHUB_SHA"
+          test "$actual_m4_sha" = "$expected_m4_sha"
       - name: Run full test suite on XFS reflink
         shell: bash
         run: |
-          set -o pipefail
-          cargo test --locked --all-targets -- --test-threads=1 2>&1 | tee runner-evidence/tests.log
-      - run: cargo build --locked --release
+          set -euo pipefail
+          cargo test --locked --all-targets -- --test-threads=1 --nocapture 2>&1 | tee runner-evidence/tests.log
+      - name: Verify M4 XFS evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > runner-evidence/m4-gates.log
+          grep -Fx 'M4 template crash checkpoints=23' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
+          grep -Fx 'M4 create crash checkpoints=28' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
+          grep -Fx 'M4 remove crash checkpoints=10' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
+          grep -Fx 'M4 crash-prefix targets exercised=61' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
+          grep -E '^M4 XFS COW dev=' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
+          : > runner-evidence/m4-tests.log
+          grep -F 'test checkpoint_protocol_and_all_reachable_crash_prefixes_are_safe ...' runner-evidence/tests.log | tee -a runner-evidence/m4-tests.log
+          grep -F 'test exec_preserves_direct_contract_and_n3_sessions_are_isolated_and_leased ...' runner-evidence/tests.log | tee -a runner-evidence/m4-tests.log
+          grep -F 'test native_cow_evidence_uses_the_host_storage_oracle ...' runner-evidence/tests.log | tee -a runner-evidence/m4-tests.log
+          grep -F 'test ordinary_worktree_and_vws_have_git_parity_for_history_conflicts_and_paths ...' runner-evidence/tests.log | tee -a runner-evidence/m4-tests.log
+          test "$(wc -l < runner-evidence/m4-tests.log | tr -d ' ')" = 4
+          m4_summary='^test result: ok\. 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in .*$'
+          awk -v expected="$m4_summary" '
+            /Running .*tests\/m4_git_parity\.rs/ {
+              runs += 1
+              in_m4 = 1
+              next
+            }
+            in_m4 && /^test result:/ {
+              summaries += 1
+              if ($0 ~ expected) {
+                print
+                matches += 1
+              }
+              in_m4 = 0
+            }
+            END {
+              exit !(runs == 1 && summaries == 1 && matches == 1)
+            }
+          ' runner-evidence/tests.log | tee -a runner-evidence/m4-tests.log
+          if grep -nF 'NOT_EXECUTED' runner-evidence/tests.log > runner-evidence/m4-not-executed.log; then
+            cat runner-evidence/m4-not-executed.log
+            exit 1
+          fi
+          printf 'no NOT_EXECUTED\n' >> runner-evidence/m4-not-executed.log
+          raw_attestation='M4 Linux raw-name positive parity attestation: uname=Linux; tests/m4_git_parity.rs SHA-256=f6c40e79c8efb2620e9561fb972589a76eb37cc6c9da5b83728dccb30d0dbaf8; ordinary_worktree_and_vws_have_git_parity_for_history_conflicts_and_paths observed; M4 summary=4 passed, 0 failed, 0 ignored, 0 filtered out'
+          printf '%s\n' "$raw_attestation" > runner-evidence/m4-linux-raw-parity-attestation.log
+          grep -Fx "$raw_attestation" runner-evidence/m4-linux-raw-parity-attestation.log
+          test "$(wc -l < runner-evidence/m4-linux-raw-parity-attestation.log | tr -d ' ')" = 1
+      - name: Build and scan release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > runner-evidence/release-rustflags-cleared.log
+          for name in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS; do
+            printf '%s\n' "$name" >> runner-evidence/release-rustflags-cleared.log
+            unset "$name"
+          done
+          while IFS= read -r name; do
+            printf '%s\n' "$name" >> runner-evidence/release-rustflags-cleared.log
+            unset "$name"
+          done < <(compgen -e | grep -E '^CARGO_TARGET_.*_RUSTFLAGS$' || true)
+          cargo build --locked --release --all-features --bin git-vws 2>&1 | tee runner-evidence/release-build.log
+          release_binary=target/release/git-vws
+          test -x "$release_binary"
+          command -v strings | tee runner-evidence/release-tools.log
+          command -v nm | tee -a runner-evidence/release-tools.log
+          strings "$release_binary" 2>&1 | tee runner-evidence/release-strings.log
+          nm -a "$release_binary" 2>&1 | tee runner-evidence/release-nm.log
+          if grep -F -e 'M4CP/1' -e 'GIT_VWS_M4_CONTROL_FD' -e 'GIT_VWS_M4_NONCE' -e 'GIT_VWS_M4_TARGET' -e 'm4_checkpoint' runner-evidence/release-strings.log runner-evidence/release-nm.log > runner-evidence/release-m4-matches.log; then
+            cat runner-evidence/release-m4-matches.log
+            exit 1
+          fi
+          printf 'release M4 marker scan: no matches\n' >> runner-evidence/release-m4-matches.log
       - name: Verify Git extension entry point
         shell: bash
         run: |
-          target/release/git-vws --version
-          PATH="$PWD/target/release:$PATH" git vws -h
+          set -euo pipefail
+          target/release/git-vws --version 2>&1 | tee runner-evidence/release-cli-version.log
+          PATH="$PWD/target/release:$PATH" git vws -h 2>&1 | tee runner-evidence/release-cli-help.log
       - name: Unmount and remove ephemeral volume
         if: always()
         shell: bash

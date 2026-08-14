@@ -269,34 +269,6 @@ fn verify_tree(root: &File, expected: &SealedTreeReceipt, walk: Walk<'_>) -> Res
     }
 }
 
-pub(crate) fn verify_worktree(root: &File, expected: &CowReceipt) -> Result<(), Error> {
-    let root_identity = Identity::from_file(root)?;
-    if !stable_directory_node(root_identity, expected.destination)
-        || !worktree_directory(root_identity)
-        || volume_id(root)? != expected.source.volume
-        || !valid_digest(&expected.source.manifest.digest)
-        || !valid_digest(&expected.source.content_digest)
-        || !linked_worktree_entry(root, c".git")?
-    {
-        return Err(Error::new(
-            "STORAGE_UNSUPPORTED",
-            "cloned worktree no longer matches its durable receipt",
-        ));
-    }
-    let mut hasher = content_hasher();
-    let mut entries = 0;
-    walk_tree(root, &[], Walk::Worktree, &mut hasher, &mut entries)?;
-    if entries != expected.source.manifest.entries
-        || authority::hex(&hasher.finalize()) != expected.source.content_digest
-    {
-        return Err(Error::new(
-            "STORAGE_UNSUPPORTED",
-            "cloned worktree content no longer matches its sealed template receipt",
-        ));
-    }
-    Ok(())
-}
-
 pub(crate) fn volume_id(directory: &File) -> Result<String, Error> {
     let identity = Identity::from_file(directory)?;
     if !identity.directory() || identity.uid != current_uid() {
@@ -584,7 +556,6 @@ enum Walk<'a> {
     Verify,
     Publishing,
     Clone(&'a File),
-    Worktree,
 }
 
 fn walk_tree(
@@ -596,14 +567,11 @@ fn walk_tree(
 ) -> Result<(), Error> {
     let source_identity = Identity::from_file(source)?;
     let source_is_private = matches!(walk, Walk::Seal);
-    let worktree = matches!(walk, Walk::Worktree);
     let publishing_root = matches!(walk, Walk::Publishing) && prefix.is_empty();
     let valid_source = if publishing_root {
         publishing_directory(source_identity)
     } else if source_is_private {
         private_directory(source_identity)
-    } else if worktree {
-        worktree_directory(source_identity)
     } else {
         sealed_directory(source_identity)
     };
@@ -615,7 +583,7 @@ fn walk_tree(
     }
     let destination = match walk {
         Walk::Clone(destination) => Some(destination),
-        Walk::Seal | Walk::Verify | Walk::Publishing | Walk::Worktree => None,
+        Walk::Seal | Walk::Verify | Walk::Publishing => None,
     };
     if let Some(destination) = destination {
         if !clone_destination_directory(Identity::from_file(destination)?)
@@ -627,16 +595,7 @@ fn walk_tree(
             ));
         }
     }
-    if worktree && prefix.is_empty() && !linked_worktree_entry(source, c".git")? {
-        return Err(Error::new(
-            "STORAGE_UNSUPPORTED",
-            "cloned worktree is missing its private linked-worktree metadata",
-        ));
-    }
     for bytes in directory_names(source.as_raw_fd())? {
-        if worktree && prefix.is_empty() && bytes == b".git" {
-            continue;
-        }
         validate_basename(&bytes)?;
         let name = cstring(&bytes)?;
         let stat = stat_at(source.as_raw_fd(), &name)?;
@@ -656,8 +615,6 @@ fn walk_tree(
             kind if kind == DIRECTORY_TYPE => {
                 let valid_directory = if source_is_private {
                     private_directory(entry)
-                } else if worktree {
-                    worktree_directory(entry)
                 } else {
                     sealed_directory(entry)
                 };
@@ -709,11 +666,7 @@ fn walk_tree(
                 }
             }
             kind if kind == REGULAR_TYPE => {
-                if !(if worktree {
-                    worktree_regular(entry)
-                } else {
-                    sealed_regular(entry)
-                }) {
+                if !sealed_regular(entry) {
                     return Err(Error::new(
                         "STORAGE_UNSUPPORTED",
                         "sealed-tree regular file is invalid",
@@ -726,17 +679,7 @@ fn walk_tree(
                         "sealed-tree regular file binding or metadata changed",
                     ));
                 }
-                hash_regular(
-                    &file,
-                    entry,
-                    if worktree {
-                        sealed_mode(entry.mode)
-                    } else {
-                        entry.mode
-                    },
-                    &path,
-                    hasher,
-                )?;
+                hash_regular(&file, entry, entry.mode, &path, hasher)?;
                 if let Some(destination) = destination {
                     clone_regular(
                         source.as_raw_fd(),
@@ -809,8 +752,6 @@ fn walk_tree(
     let final_identity = Identity::from_file(source)?;
     let valid_final = if publishing_root {
         publishing_directory(final_identity)
-    } else if worktree {
-        worktree_directory(final_identity)
     } else {
         sealed_directory(final_identity)
     };
@@ -1216,21 +1157,6 @@ fn worktree_directory(identity: Identity) -> bool {
         && identity.uid == current_uid()
         && identity.mode == 0o755
         && identity.nlink >= 2
-}
-
-fn worktree_regular(identity: Identity) -> bool {
-    identity.regular()
-        && identity.uid == current_uid()
-        && identity.nlink == 1
-        && matches!(identity.mode, 0o644 | 0o755)
-}
-
-fn sealed_mode(mode: u32) -> u32 {
-    if mode == 0o755 {
-        0o555
-    } else {
-        0o444
-    }
 }
 
 fn clone_destination_directory(identity: Identity) -> bool {
@@ -1659,7 +1585,14 @@ pub(crate) fn remove_owned_tree(
             "owned tree descriptor changed before cleanup",
         ));
     }
-    remove_owned_children(&root, expected.dev)?;
+    let volume = volume_id(&root)?;
+    if volume != volume_id(parent)? {
+        return Err(Error::new(
+            "STORAGE_RECOVERY_REQUIRED",
+            "owned tree moved to a different volume before cleanup",
+        ));
+    }
+    remove_owned_children(&root, expected.dev, &volume)?;
     if !stable_directory_node(identity_at(parent.as_raw_fd(), name)?, expected) {
         return Err(Error::new(
             "STORAGE_RECOVERY_REQUIRED",
@@ -1679,11 +1612,12 @@ pub(crate) fn remove_owned_tree(
     })
 }
 
-fn remove_owned_children(directory: &File, device: u64) -> Result<(), Error> {
+fn remove_owned_children(directory: &File, device: u64, volume: &str) -> Result<(), Error> {
     let directory_identity = Identity::from_file(directory)?;
     if !directory_identity.directory()
         || directory_identity.uid != current_uid()
         || directory_identity.dev != device
+        || volume_id(directory)? != volume
     {
         return Err(Error::new(
             "STORAGE_RECOVERY_REQUIRED",
@@ -1708,7 +1642,13 @@ fn remove_owned_children(directory: &File, device: u64) -> Result<(), Error> {
                         "owned tree child binding changed before cleanup",
                     ));
                 }
-                remove_owned_children(&child, device)?;
+                if volume_id(&child)? != volume {
+                    return Err(Error::new(
+                        "STORAGE_RECOVERY_REQUIRED",
+                        "owned tree child crossed a mountpoint during cleanup",
+                    ));
+                }
+                remove_owned_children(&child, device, volume)?;
                 if !stable_directory_node(identity_at(directory.as_raw_fd(), &name)?, entry) {
                     return Err(Error::new(
                         "STORAGE_RECOVERY_REQUIRED",
@@ -1724,7 +1664,7 @@ fn remove_owned_children(directory: &File, device: u64) -> Result<(), Error> {
                 }
             }
             kind if kind == REGULAR_TYPE || kind == SYMLINK_TYPE => {
-                if identity_at(directory.as_raw_fd(), &name)? != entry {
+                if entry.nlink != 1 || identity_at(directory.as_raw_fd(), &name)? != entry {
                     return Err(Error::new(
                         "STORAGE_RECOVERY_REQUIRED",
                         "owned tree entry binding changed before cleanup",
@@ -1735,10 +1675,15 @@ fn remove_owned_children(directory: &File, device: u64) -> Result<(), Error> {
                 }
             }
             _ => {
-                return Err(Error::new(
-                    "STORAGE_RECOVERY_REQUIRED",
-                    "owned tree contains a special entry during cleanup",
-                ));
+                if entry.nlink != 1 || identity_at(directory.as_raw_fd(), &name)? != entry {
+                    return Err(Error::new(
+                        "STORAGE_RECOVERY_REQUIRED",
+                        "owned tree special entry changed before cleanup",
+                    ));
+                }
+                if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                    return Err(storage_io("cannot remove owned tree special entry"));
+                }
             }
         }
     }

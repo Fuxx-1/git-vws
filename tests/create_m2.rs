@@ -1060,9 +1060,13 @@ fn create_seals_raw_tree_reuses_ready_receipt_and_isolates_cow() {
     );
     let changed = create(&home, &bare, "alpha");
     assert!(
-        !changed.status.success()
-            && String::from_utf8_lossy(&changed.stderr).contains("STORAGE_UNSUPPORTED"),
-        "READY content receipt was not revalidated: {changed:?}"
+        changed.status.success(),
+        "READY reuse rejected a native worktree mutation: {changed:?}"
+    );
+    assert_eq!(
+        fs::read(&alpha_file).expect("read preserved worktree mutation"),
+        b"session mutation\n",
+        "READY reuse reset a native worktree mutation"
     );
     assert_eq!(
         snapshot(&bare),

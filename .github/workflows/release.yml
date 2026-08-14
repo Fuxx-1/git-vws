@@ -71,7 +71,34 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Build release binary
+        shell: bash
+        run: |
+          unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS
+          for variable in "${!CARGO_TARGET_@}"; do
+            [[ "$variable" == *_RUSTFLAGS ]] && unset "$variable"
+          done
+          cargo build --locked --release --all-features --target ${{ matrix.target }} --bin git-vws
+      - name: Reject checkpoint controls
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          if ! strings_output="$(strings "$binary")"; then
+            echo "cannot inspect release binary strings" >&2
+            exit 1
+          fi
+          if grep -F -e 'M4CP/1' -e 'GIT_VWS_M4_CONTROL_FD' -e 'GIT_VWS_M4_NONCE' -e 'GIT_VWS_M4_TARGET' <<<"$strings_output"; then
+            echo "release binary retains M4 checkpoint controls" >&2
+            exit 1
+          fi
+          if ! symbols="$(nm -a "$binary")"; then
+            echo "cannot inspect release binary symbols" >&2
+            exit 1
+          fi
+          if grep -F 'm4_checkpoint' <<<"$symbols"; then
+            echo "release binary retains M4 checkpoint symbols" >&2
+            exit 1
+          fi
       - name: Verify native binary
         shell: bash
         run: |

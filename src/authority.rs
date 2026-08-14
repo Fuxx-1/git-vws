@@ -243,6 +243,10 @@ pub(crate) fn open_state() -> Result<StateRoot, Error> {
     StateRoot::open()
 }
 
+pub(crate) fn open_existing_state() -> Result<StateRoot, Error> {
+    StateRoot::open_existing()
+}
+
 pub(crate) fn authority_record_present(
     state: &StateRoot,
     authority: &Authority,
@@ -630,6 +634,62 @@ impl StateRoot {
         Ok(state)
     }
 
+    fn open_existing() -> Result<Self, Error> {
+        let root_path = state_root_path()?;
+        let home = open_home()?;
+        let home_identity = Identity::from_file(&home)?;
+        if !home_identity.directory() || home_identity.uid != current_uid() {
+            return Err(Error::new(
+                "STATE_UNAVAILABLE",
+                "HOME is not an owned directory",
+            ));
+        }
+        lock_descriptor(&home, "HOME")?;
+        let root_name = cstring(STATE_ROOT, "state root")?;
+        let mut stat = zeroed_stat();
+        if unsafe {
+            libc::fstatat(
+                home.as_raw_fd(),
+                root_name.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound {
+                return Err(Error::new("STATE_UNAVAILABLE", "state root does not exist"));
+            }
+            return Err(Error::io(
+                "STATE_UNAVAILABLE",
+                "cannot inspect state root",
+                error,
+            ));
+        }
+        let root = open_directory_at(home.as_raw_fd(), &root_name, "state root")?;
+        let identity = Identity::from_file(&root)?;
+        if !valid_state_root(identity) {
+            return Err(Error::new(
+                "STATE_UNAVAILABLE",
+                "state root is not owner-only",
+            ));
+        }
+        let state = Self {
+            home,
+            root_path,
+            root: Some(root),
+            root_name,
+            created: false,
+            identity,
+            home_locked: true,
+            root_locked: false,
+            committed: false,
+            preserve_root: false,
+        };
+        state.revalidate_root()?;
+        Ok(state)
+    }
+
     pub(crate) fn root_fd(&self) -> RawFd {
         self.root.as_ref().expect("state root open").as_raw_fd()
     }
@@ -686,6 +746,31 @@ impl StateRoot {
             ));
         }
         Ok(file)
+    }
+
+    pub(crate) fn open_container_if_present(&self, name: &[u8]) -> Result<Option<File>, Error> {
+        let name = cstring(name, "state container")?;
+        let mut stat = zeroed_stat();
+        if unsafe {
+            libc::fstatat(
+                self.root_fd(),
+                name.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(Error::io(
+                "STATE_UNAVAILABLE",
+                "cannot inspect state container",
+                error,
+            ));
+        }
+        self.open_container(name.to_bytes()).map(Some)
     }
 
     fn lock(&mut self) -> Result<(), Error> {
@@ -853,6 +938,50 @@ impl Drop for StateRoot {
     }
 }
 
+fn read_expected_old(
+    parent: &File,
+    basename: &[u8],
+    bytes: &[u8],
+    expected_old: Option<&[u8]>,
+) -> Result<Option<RecordBinding>, Error> {
+    expected_old
+        .map(|expected| {
+            let binding = read_file_binding(
+                parent.as_raw_fd(),
+                basename,
+                expected.len().max(bytes.len()),
+            )?;
+            if binding.bytes != expected {
+                return Err(Error::new(
+                    "STATE_CORRUPT",
+                    "state record bytes changed before its atomic replacement",
+                ));
+            }
+            Ok(binding)
+        })
+        .transpose()
+}
+
+fn read_bound_expected_old(
+    parent: &File,
+    basename: &[u8],
+    bytes: &[u8],
+    expected_old: &RecordBinding,
+) -> Result<RecordBinding, Error> {
+    let current = read_file_binding(
+        parent.as_raw_fd(),
+        basename,
+        expected_old.bytes.len().max(bytes.len()),
+    )?;
+    if current != *expected_old {
+        return Err(Error::new(
+            "STATE_CORRUPT",
+            "state record bytes or identity changed before its atomic replacement",
+        ));
+    }
+    Ok(expected_old.clone())
+}
+
 pub(crate) struct RecordTxn {
     parent: File,
     final_name: CString,
@@ -862,6 +991,8 @@ pub(crate) struct RecordTxn {
     expected_old: Option<RecordBinding>,
     bytes: Vec<u8>,
     armed: bool,
+    #[cfg(git_vws_m4_checkpoint)]
+    checkpoint: Option<(&'static str, String, String, &'static str)>,
 }
 
 impl RecordTxn {
@@ -871,23 +1002,100 @@ impl RecordTxn {
         bytes: &[u8],
         expected_old: Option<&[u8]>,
     ) -> Result<Self, Error> {
+        Self::begin_with_expected(
+            parent,
+            basename,
+            bytes,
+            read_expected_old(parent, basename, bytes, expected_old)?,
+            #[cfg(git_vws_m4_checkpoint)]
+            None,
+        )
+    }
+
+    #[cfg(git_vws_m4_checkpoint)]
+    pub(crate) fn begin_checkpointed(
+        parent: &File,
+        basename: &[u8],
+        bytes: &[u8],
+        expected_old: Option<&[u8]>,
+        checkpoint: (&'static str, &str, &str, &'static str),
+    ) -> Result<Self, Error> {
+        Self::begin_with_expected(
+            parent,
+            basename,
+            bytes,
+            read_expected_old(parent, basename, bytes, expected_old)?,
+            Some((
+                checkpoint.0,
+                checkpoint.1.to_owned(),
+                checkpoint.2.to_owned(),
+                checkpoint.3,
+            )),
+        )
+    }
+
+    #[cfg(not(git_vws_m4_checkpoint))]
+    pub(crate) fn begin_bound(
+        parent: &File,
+        basename: &[u8],
+        bytes: &[u8],
+        expected_old: &RecordBinding,
+    ) -> Result<Self, Error> {
+        Self::begin_with_expected(
+            parent,
+            basename,
+            bytes,
+            Some(read_bound_expected_old(
+                parent,
+                basename,
+                bytes,
+                expected_old,
+            )?),
+            #[cfg(git_vws_m4_checkpoint)]
+            None,
+        )
+    }
+
+    #[cfg(git_vws_m4_checkpoint)]
+    pub(crate) fn begin_bound_checkpointed(
+        parent: &File,
+        basename: &[u8],
+        bytes: &[u8],
+        expected_old: &RecordBinding,
+        checkpoint: (&'static str, &str, &str, &'static str),
+    ) -> Result<Self, Error> {
+        Self::begin_with_expected(
+            parent,
+            basename,
+            bytes,
+            Some(read_bound_expected_old(
+                parent,
+                basename,
+                bytes,
+                expected_old,
+            )?),
+            Some((
+                checkpoint.0,
+                checkpoint.1.to_owned(),
+                checkpoint.2.to_owned(),
+                checkpoint.3,
+            )),
+        )
+    }
+
+    fn begin_with_expected(
+        parent: &File,
+        basename: &[u8],
+        bytes: &[u8],
+        expected_old: Option<RecordBinding>,
+        #[cfg(git_vws_m4_checkpoint)] checkpoint: Option<(
+            &'static str,
+            String,
+            String,
+            &'static str,
+        )>,
+    ) -> Result<Self, Error> {
         let final_name = cstring(basename, "record")?;
-        let expected_old = expected_old
-            .map(|expected| {
-                let binding = read_file_binding(
-                    parent.as_raw_fd(),
-                    basename,
-                    expected.len().max(bytes.len()),
-                )?;
-                if binding.bytes != expected {
-                    return Err(Error::new(
-                        "STATE_CORRUPT",
-                        "state record bytes changed before its atomic replacement",
-                    ));
-                }
-                Ok(binding)
-            })
-            .transpose()?;
         let temporary_name = cstring(
             format!(
                 ".{}-{}-{}.tmp",
@@ -928,11 +1136,21 @@ impl RecordTxn {
             expected_old,
             bytes: bytes.to_vec(),
             armed: true,
+            #[cfg(git_vws_m4_checkpoint)]
+            checkpoint,
         };
         if let Err(error) = transaction.initialize() {
             return Err(transaction.abort(error));
         }
         Ok(transaction)
+    }
+
+    #[cfg(git_vws_m4_checkpoint)]
+    fn checkpoint(&self, suffix: &str) -> Result<(), Error> {
+        let Some((operation, sid, key, transition)) = &self.checkpoint else {
+            return Ok(());
+        };
+        crate::m4_checkpoint::checkpoint(operation, sid, key, &format!("{transition}-{suffix}"))
     }
 
     fn initialize(&mut self) -> Result<(), Error> {
@@ -955,19 +1173,27 @@ impl RecordTxn {
             ));
         }
         self.temporary_identity = Some(identity);
+        {
+            let file = self
+                .temporary
+                .as_mut()
+                .expect("armed temporary record descriptor");
+            file.write_all(&self.bytes)
+                .and_then(|_| file.sync_all())
+                .map_err(|error| {
+                    Error::io(
+                        "STATE_UNAVAILABLE",
+                        "cannot write temporary state record",
+                        error,
+                    )
+                })?;
+        }
+        #[cfg(git_vws_m4_checkpoint)]
+        self.checkpoint("temporary-synced")?;
         let file = self
             .temporary
-            .as_mut()
+            .as_ref()
             .expect("armed temporary record descriptor");
-        file.write_all(&self.bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|error| {
-                Error::io(
-                    "STATE_UNAVAILABLE",
-                    "cannot write temporary state record",
-                    error,
-                )
-            })?;
         if Identity::from_file(file)? != identity {
             return Err(Error::new(
                 "STATE_UNAVAILABLE",
@@ -1010,8 +1236,12 @@ impl RecordTxn {
         ) {
             Ok(()) => {
                 self.armed = false;
+                #[cfg(git_vws_m4_checkpoint)]
+                self.checkpoint("namespace-applied")?;
                 let binding = self.verify_new_binding(temporary_identity)?;
                 sync_record_parent(&self.parent)?;
+                #[cfg(git_vws_m4_checkpoint)]
+                self.checkpoint("parent-synced")?;
                 self.verify_new_binding(temporary_identity).map(|_| binding)
             }
             Err(error) if rename_result_is_unknown(&error) => {
@@ -1071,9 +1301,11 @@ impl RecordTxn {
                 error,
             )));
         }
+        self.armed = false;
+        #[cfg(git_vws_m4_checkpoint)]
+        self.checkpoint("namespace-applied")?;
         #[cfg(test)]
         exchange_after_rename(self.parent.as_raw_fd(), &self.final_name);
-        self.armed = false;
         let expected_new = RecordBinding {
             bytes: self.bytes.clone(),
             identity: temporary_identity,
@@ -1110,7 +1342,11 @@ impl RecordTxn {
                 format!("cannot remove exchanged expected-old record: {error}"),
             ));
         }
+        #[cfg(git_vws_m4_checkpoint)]
+        self.checkpoint("exchange-old-unlinked")?;
         sync_record_parent(&self.parent)?;
+        #[cfg(git_vws_m4_checkpoint)]
+        self.checkpoint("parent-synced")?;
         self.verify_new_binding(temporary_identity)
     }
 
@@ -1856,16 +2092,30 @@ pub(crate) struct RecordBinding {
     pub(crate) identity: Identity,
 }
 
-pub(crate) fn remove_record(parent: &File, basename: &[u8], expected: &[u8]) -> Result<(), Error> {
-    let binding = read_file_binding(parent.as_raw_fd(), basename, expected.len())?;
-    if binding.bytes != expected {
+pub(crate) fn remove_record_bound(
+    parent: &File,
+    basename: &[u8],
+    expected: &RecordBinding,
+    #[cfg(git_vws_m4_checkpoint)] operation: &str,
+    #[cfg(git_vws_m4_checkpoint)] sid: &str,
+    #[cfg(git_vws_m4_checkpoint)] key: &str,
+) -> Result<(), Error> {
+    let binding = read_file_binding(parent.as_raw_fd(), basename, expected.bytes.len())?;
+    if binding != *expected {
         return Err(Error::new(
             "STATE_CORRUPT",
-            "state record bytes changed before removal",
+            "state record bytes or identity changed before removal",
         ));
     }
     let name = cstring(basename, "record")?;
-    unlink_capability(parent.as_raw_fd(), &name, binding.identity)?;
+    unlink_capability(parent.as_raw_fd(), &name, expected.identity)?;
+    #[cfg(git_vws_m4_checkpoint)]
+    {
+        crate::m4_checkpoint::checkpoint(operation, sid, key, "record-deletion-unlinked")?;
+        sync_record_parent(parent)?;
+        crate::m4_checkpoint::checkpoint(operation, sid, key, "record-deletion-parent-synced")
+    }
+    #[cfg(not(git_vws_m4_checkpoint))]
     sync_record_parent(parent)
 }
 
