@@ -16,10 +16,10 @@ use std::time::{Duration, Instant};
 
 static NEXT_SANDBOX: AtomicUsize = AtomicUsize::new(0);
 
-const TYPE_MASK: u32 = libc::S_IFMT as u32;
-const DIRECTORY_TYPE: u32 = libc::S_IFDIR as u32;
-const REGULAR_TYPE: u32 = libc::S_IFREG as u32;
-const SYMLINK_TYPE: u32 = libc::S_IFLNK as u32;
+const TYPE_MASK: libc::mode_t = libc::S_IFMT;
+const DIRECTORY_TYPE: libc::mode_t = libc::S_IFDIR;
+const REGULAR_TYPE: libc::mode_t = libc::S_IFREG;
+const SYMLINK_TYPE: libc::mode_t = libc::S_IFLNK;
 const M4_CONTROL_DESTINATION_FD: RawFd = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,13 +27,13 @@ struct Node {
     dev: u64,
     ino: u64,
     uid: u32,
-    mode: u32,
-    kind: u32,
+    mode: libc::mode_t,
+    kind: libc::mode_t,
 }
 
 impl Node {
     fn from_stat(stat: &libc::stat) -> Self {
-        let mode = stat.st_mode as u32;
+        let mode = stat.st_mode;
         Self {
             dev: stat.st_dev as u64,
             ino: stat.st_ino,
