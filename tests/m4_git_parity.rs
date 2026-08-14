@@ -24,7 +24,7 @@ const M4_CONTROL_DESTINATION_FD: RawFd = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Node {
-    dev: u64,
+    dev: libc::dev_t,
     ino: u64,
     uid: u32,
     mode: libc::mode_t,
@@ -35,7 +35,7 @@ impl Node {
     fn from_stat(stat: &libc::stat) -> Self {
         let mode = stat.st_mode;
         Self {
-            dev: stat.st_dev as u64,
+            dev: stat.st_dev,
             ino: stat.st_ino,
             uid: stat.st_uid,
             mode: mode & 0o7777,
@@ -196,7 +196,7 @@ fn directory_names(fd: RawFd) -> io::Result<Vec<Vec<u8>>> {
     Ok(names)
 }
 
-fn clear_owned(parent: RawFd, device: u64) -> io::Result<()> {
+fn clear_owned(parent: RawFd, device: libc::dev_t) -> io::Result<()> {
     for bytes in directory_names(parent)? {
         let name = CString::new(bytes).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
         let before = stat_at(parent, &name)?;
@@ -538,7 +538,12 @@ fn snapshot_entry(root: &Path, path: &Path, output: &mut Vec<u8>, omit_git: bool
     );
     output.push(0);
     output.extend_from_slice(&metadata.mode().to_be_bytes());
-    output.extend_from_slice(&metadata.nlink().to_be_bytes());
+    let nlink = if omit_git && path == root {
+        0
+    } else {
+        metadata.nlink()
+    };
+    output.extend_from_slice(&nlink.to_be_bytes());
     if metadata.is_dir() {
         let mut entries: Vec<_> = fs::read_dir(path)
             .expect("read snapshot directory")
@@ -1495,23 +1500,39 @@ fn process_identity(pid: libc::pid_t) -> io::Result<ProcessIdentity> {
 }
 
 fn process_group_members(pgid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
-    let output = Command::new(find_executable("ps"))
-        .args(["-o", "pid=", "-g", &pgid.to_string()])
-        .output()?;
+    let mut command = Command::new(find_executable("ps"));
+    #[cfg(target_os = "macos")]
+    command.args(["-ax", "-o", "pid=", "-o", "pgid="]);
+    #[cfg(target_os = "linux")]
+    command.args(["-e", "-o", "pid=", "-o", "pgid="]);
+    let output = command.output()?;
     if !output.status.success() {
         return Err(io::Error::from(io::ErrorKind::Other));
     }
-    output
-        .stdout
-        .split(|byte| byte.is_ascii_whitespace())
-        .filter(|value| !value.is_empty())
-        .map(|value| {
+    let mut members = Vec::new();
+    for line in output.stdout.split(|byte| *byte == b'\n') {
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        let fields: Vec<_> = line
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|value| !value.is_empty())
+            .collect();
+        if fields.len() != 2 {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+        let parse = |value: &[u8]| {
             std::str::from_utf8(value)
                 .ok()
                 .and_then(|value| value.parse::<libc::pid_t>().ok())
                 .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))
-        })
-        .collect()
+        };
+        let pid = parse(fields[0])?;
+        if parse(fields[1])? == pgid {
+            members.push(pid);
+        }
+    }
+    Ok(members)
 }
 
 fn wait_for_group_gone(pgid: libc::pid_t) {
@@ -2086,6 +2107,7 @@ fn ordinary_worktree_and_vws_have_git_parity_for_history_conflicts_and_paths() {
         &fixture.sandbox.path,
         &[
             OsString::from("clone"),
+            OsString::from("--no-hardlinks"),
             fixture.authority.as_os_str().to_os_string(),
             native.as_os_str().to_os_string(),
         ],
