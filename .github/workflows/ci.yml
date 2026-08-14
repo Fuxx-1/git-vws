@@ -233,7 +233,7 @@ jobs:
           test "$(wc -l < runner-evidence/filter-config-gate.log | tr -d ' ')" = 1
           m4_summary='^test result: ok\. 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in .*$'
           awk -v expected="$m4_summary" '
-            /Running .*tests\/m4_git_parity\.rs/ {
+            /Running.*tests\/m4_git_parity\.rs/ {
               runs += 1
               in_m4 = 1
               next
@@ -513,7 +513,7 @@ jobs:
           test "$(wc -l < runner-evidence/filter-config-gate.log | tr -d ' ')" = 1
           m4_summary='^test result: ok\. 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in .*$'
           awk -v expected="$m4_summary" '
-            /Running .*tests\/m4_git_parity\.rs/ {
+            /Running.*tests\/m4_git_parity\.rs/ {
               runs += 1
               in_m4 = 1
               next
