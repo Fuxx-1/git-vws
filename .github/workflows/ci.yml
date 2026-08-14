@@ -195,7 +195,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          expected_m4_sha='9ce8beb6f1327afd12bb97eb0de605d81446ea5508c2cd4e2a8fb1561f3993c6'
+          expected_m4_sha='8586ea1f031499eaf838ac7bc8c1ca6d8967889588ad5da55efc550c78a4aabb'
           test -n "${GITHUB_SHA:-}"
           head_sha="$(git rev-parse HEAD)"
           actual_m4_sha="$(shasum -a 256 tests/m4_git_parity.rs | awk '{print $1}')"
@@ -476,7 +476,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          expected_m4_sha='9ce8beb6f1327afd12bb97eb0de605d81446ea5508c2cd4e2a8fb1561f3993c6'
+          expected_m4_sha='8586ea1f031499eaf838ac7bc8c1ca6d8967889588ad5da55efc550c78a4aabb'
           test -n "${GITHUB_SHA:-}"
           head_sha="$(git rev-parse HEAD)"
           actual_m4_sha="$(shasum -a 256 tests/m4_git_parity.rs | awk '{print $1}')"
@@ -535,7 +535,7 @@ jobs:
             exit 1
           fi
           printf 'no NOT_EXECUTED\n' >> runner-evidence/m4-not-executed.log
-          raw_attestation='M4 Linux raw-name positive parity attestation: uname=Linux; tests/m4_git_parity.rs SHA-256=9ce8beb6f1327afd12bb97eb0de605d81446ea5508c2cd4e2a8fb1561f3993c6; ordinary_worktree_and_vws_have_git_parity_for_history_conflicts_and_paths observed; M4 summary=4 passed, 0 failed, 0 ignored, 0 filtered out'
+          raw_attestation='M4 Linux raw-name positive parity attestation: uname=Linux; tests/m4_git_parity.rs SHA-256=8586ea1f031499eaf838ac7bc8c1ca6d8967889588ad5da55efc550c78a4aabb; ordinary_worktree_and_vws_have_git_parity_for_history_conflicts_and_paths observed; M4 summary=4 passed, 0 failed, 0 ignored, 0 filtered out'
           printf '%s\n' "$raw_attestation" > runner-evidence/m4-linux-raw-parity-attestation.log
           grep -Fx "$raw_attestation" runner-evidence/m4-linux-raw-parity-attestation.log
           test "$(wc -l < runner-evidence/m4-linux-raw-parity-attestation.log | tr -d ' ')" = 1
