@@ -216,11 +216,11 @@ jobs:
         run: |
           set -euo pipefail
           : > runner-evidence/m4-gates.log
-          grep -Fx 'M4 template crash checkpoints=24' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
+          grep -F 'M4 template crash checkpoints=24' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
           grep -Fx 'M4 create crash checkpoints=28' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
           grep -Fx 'M4 remove crash checkpoints=10' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
           grep -Fx 'M4 crash-prefix targets exercised=62' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
-          grep -E '^M4 APFS COW dev=' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
+          grep -F 'M4 APFS COW dev=' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
           grep -F 'M4 macOS raw checkout exit=' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
           : > runner-evidence/m4-tests.log
           grep -F 'test checkpoint_protocol_and_all_reachable_crash_prefixes_are_safe ...' runner-evidence/tests.log | tee -a runner-evidence/m4-tests.log
@@ -497,11 +497,11 @@ jobs:
         run: |
           set -euo pipefail
           : > runner-evidence/m4-gates.log
-          grep -Fx 'M4 template crash checkpoints=23' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
+          grep -F 'M4 template crash checkpoints=23' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
           grep -Fx 'M4 create crash checkpoints=28' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
           grep -Fx 'M4 remove crash checkpoints=10' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
           grep -Fx 'M4 crash-prefix targets exercised=61' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
-          grep -E '^M4 XFS COW dev=' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
+          grep -F 'M4 XFS COW dev=' runner-evidence/tests.log | tee -a runner-evidence/m4-gates.log
           : > runner-evidence/m4-tests.log
           grep -F 'test checkpoint_protocol_and_all_reachable_crash_prefixes_are_safe ...' runner-evidence/tests.log | tee -a runner-evidence/m4-tests.log
           grep -F 'test exec_preserves_direct_contract_and_n3_sessions_are_isolated_and_leased ...' runner-evidence/tests.log | tee -a runner-evidence/m4-tests.log
