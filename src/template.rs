@@ -142,7 +142,14 @@ pub(crate) fn acquire(
         payload: TemplatePayload::Prepared { building_name },
     };
     let prepared_bytes = encode_record(&prepared)?;
-    authority::RecordTxn::begin(&container, &name, &prepared_bytes, None)?.commit()?;
+    commit_template_record(
+        &container,
+        &name,
+        &prepared_bytes,
+        None,
+        &key,
+        "prepared-record",
+    )?;
     advance_prepared(&container, &name, prepared, authority, tree)
 }
 
@@ -192,12 +199,18 @@ fn advance_prepared(
     };
     let building_name = building_name.clone();
     let ready_name = root_name(&record.key);
+    #[cfg(git_vws_m4_checkpoint)]
+    let m4_key = record.key.clone();
+    #[cfg(git_vws_m4_checkpoint)]
+    let m4 = |stage| crate::m4_checkpoint::checkpoint("template", "-", &m4_key, stage);
     let (root, root_identity) = match (
         named_identity(container, &building_name)?,
         named_identity(container, &ready_name)?,
     ) {
         (None, None) => {
             create_directory(container, &building_name)?;
+            #[cfg(git_vws_m4_checkpoint)]
+            m4("root-created")?;
             private_root(container, &building_name, &record.volume, None, true)?
         }
         (Some(_), None) => private_root(container, &building_name, &record.volume, None, true)?,
@@ -208,7 +221,7 @@ fn advance_prepared(
             ))
         }
     };
-    sync_prepared_root(container, &building_name, &root, root_identity)?;
+    sync_prepared_root(container, &building_name, &root, root_identity, &record.key)?;
     let prepared_bytes = encode_record(&record)?;
     let mut materializing = record;
     materializing.payload = TemplatePayload::Materializing {
@@ -216,13 +229,14 @@ fn advance_prepared(
         root_identity,
     };
     let materializing_bytes = encode_record(&materializing)?;
-    authority::RecordTxn::begin(
+    commit_template_record(
         container,
         record_name,
         &materializing_bytes,
         Some(&prepared_bytes),
-    )?
-    .commit()?;
+        &materializing.key,
+        "materializing-record",
+    )?;
     let second = materialize(&root, root_identity, authority, tree)?;
     if second != materializing.manifest {
         return Err(Error::new(
@@ -231,6 +245,8 @@ fn advance_prepared(
         ));
     }
     let sealed = storage::seal_tree(&root, materializing.manifest.clone())?;
+    #[cfg(git_vws_m4_checkpoint)]
+    m4("tree-sealed")?;
     if !storage::sealed_directory(sealed.root) {
         return Err(Error::new(
             "TEMPLATE_CORRUPT",
@@ -244,13 +260,14 @@ fn advance_prepared(
         sealed,
     };
     let publishing_bytes = encode_record(&publishing)?;
-    authority::RecordTxn::begin(
+    commit_template_record(
         container,
         record_name,
         &publishing_bytes,
         Some(&materializing_bytes),
-    )?
-    .commit()?;
+        &publishing.key,
+        "publishing-record",
+    )?;
     publish_template(container, record_name, publishing)
 }
 
@@ -304,6 +321,9 @@ fn publish_template(
             "template record is not PUBLISHING",
         ));
     };
+    let key = record.key.clone();
+    #[cfg(git_vws_m4_checkpoint)]
+    let m4 = |stage| crate::m4_checkpoint::checkpoint("template", "-", &key, stage);
     match (
         named_identity(container, &building_name)?,
         named_identity(container, &ready_name)?,
@@ -317,6 +337,7 @@ fn publish_template(
                 &root,
                 &sealed,
                 &record.volume,
+                &record.key,
             ) {
                 if error.code != "TEMPLATE_IO_FAILED" {
                     return Err(error);
@@ -343,7 +364,7 @@ fn publish_template(
         }
         (None, Some(_)) => {
             let root = publishing_root(container, &ready_name, &sealed, &record.volume)?;
-            seal_publishing_root(&root, sealed.root)?;
+            seal_publishing_root(&root, sealed.root, &key, true)?;
             sealed_root(container, &ready_name, &sealed, &record.volume)?;
         }
         _ => {
@@ -354,20 +375,22 @@ fn publish_template(
         }
     }
     let publishing_bytes = encode_record(&record)?;
-    let key = record.key.clone();
     let mut ready = record;
     ready.payload = TemplatePayload::Ready {
         root_name: ready_name,
         sealed: sealed.clone(),
     };
     let ready_bytes = encode_record(&ready)?;
-    authority::RecordTxn::begin(
+    commit_template_record(
         container,
         record_name,
         &ready_bytes,
         Some(&publishing_bytes),
-    )?
-    .commit()?;
+        &key,
+        "ready-record",
+    )?;
+    #[cfg(git_vws_m4_checkpoint)]
+    m4("ready-return")?;
     Ok(Template {
         key,
         sealed: sealed.clone(),
@@ -443,7 +466,10 @@ fn sync_prepared_root(
     name: &str,
     root: &File,
     expected: Identity,
+    _key: &str,
 ) -> Result<(), Error> {
+    #[cfg(git_vws_m4_checkpoint)]
+    let m4 = |stage| crate::m4_checkpoint::checkpoint("template", "-", _key, stage);
     root.sync_all().map_err(|error| {
         Error::io(
             "TEMPLATE_IO_FAILED",
@@ -451,6 +477,8 @@ fn sync_prepared_root(
             error,
         )
     })?;
+    #[cfg(git_vws_m4_checkpoint)]
+    m4("root-synced")?;
     container.sync_all().map_err(|error| {
         Error::io(
             "TEMPLATE_IO_FAILED",
@@ -458,6 +486,8 @@ fn sync_prepared_root(
             error,
         )
     })?;
+    #[cfg(git_vws_m4_checkpoint)]
+    m4("container-synced")?;
     if Identity::from_file(root)? != expected || named_identity(container, name)? != Some(expected)
     {
         return Err(Error::new(
@@ -520,7 +550,13 @@ fn publishing_root(
     Ok(root)
 }
 
-fn set_publishing_root_mode(root: &File, expected: Identity, mode: u32) -> Result<(), Error> {
+fn set_publishing_root_mode(
+    root: &File,
+    expected: Identity,
+    mode: u32,
+    _key: &str,
+    _stage: Option<&'static str>,
+) -> Result<(), Error> {
     if !matches!(mode, 0o555 | 0o755)
         || !storage::publishing_binding(Identity::from_file(root)?, expected)
     {
@@ -543,6 +579,10 @@ fn set_publishing_root_mode(root: &File, expected: Identity, mode: u32) -> Resul
             error,
         )
     })?;
+    #[cfg(git_vws_m4_checkpoint)]
+    if let Some(stage) = _stage {
+        crate::m4_checkpoint::checkpoint("template", "-", _key, stage)?;
+    }
     let current = Identity::from_file(root)?;
     if current.mode != mode || !storage::publishing_binding(current, expected) {
         return Err(Error::new(
@@ -553,17 +593,28 @@ fn set_publishing_root_mode(root: &File, expected: Identity, mode: u32) -> Resul
     Ok(())
 }
 
-fn seal_publishing_root(root: &File, expected: Identity) -> Result<(), Error> {
-    set_publishing_root_mode(root, expected, 0o555)
+fn seal_publishing_root(
+    root: &File,
+    expected: Identity,
+    _key: &str,
+    _checkpoint: bool,
+) -> Result<(), Error> {
+    set_publishing_root_mode(
+        root,
+        expected,
+        0o555,
+        _key,
+        _checkpoint.then_some("root-resealed-sync"),
+    )
 }
 
 #[cfg(target_os = "macos")]
-fn prepare_publishing_root(root: &File, expected: Identity) -> Result<(), Error> {
-    set_publishing_root_mode(root, expected, 0o755)
+fn prepare_publishing_root(root: &File, expected: Identity, _key: &str) -> Result<(), Error> {
+    set_publishing_root_mode(root, expected, 0o755, _key, Some("macos-unsealed-sync"))
 }
 
 #[cfg(target_os = "linux")]
-fn prepare_publishing_root(root: &File, expected: Identity) -> Result<(), Error> {
+fn prepare_publishing_root(root: &File, expected: Identity, _key: &str) -> Result<(), Error> {
     if storage::publishing_binding(Identity::from_file(root)?, expected) {
         Ok(())
     } else {
@@ -1352,7 +1403,10 @@ fn rename_ready(
     root: &File,
     sealed: &storage::SealedTreeReceipt,
     volume: &str,
+    _key: &str,
 ) -> Result<(), Error> {
+    #[cfg(git_vws_m4_checkpoint)]
+    let m4 = |stage| crate::m4_checkpoint::checkpoint("template", "-", _key, stage);
     let building = cstring(building.as_bytes(), "building root")?;
     let ready = cstring(ready.as_bytes(), "ready root")?;
     if !storage::publishing_binding(
@@ -1364,9 +1418,12 @@ fn rename_ready(
             "template root changed before READY rename",
         ));
     }
-    prepare_publishing_root(root, sealed.root)?;
+    prepare_publishing_root(root, sealed.root, _key)?;
     match authority::rename_no_replace(parent.as_raw_fd(), &building, &ready) {
-        Ok(()) => {}
+        Ok(()) => {
+            #[cfg(git_vws_m4_checkpoint)]
+            m4("root-renamed")?;
+        }
         Err(error) if error.kind() == io::ErrorKind::Interrupted => {
             return Err(Error::io(
                 "TEMPLATE_RECOVERY_REQUIRED",
@@ -1375,7 +1432,7 @@ fn rename_ready(
             ))
         }
         Err(error) => {
-            seal_publishing_root(root, sealed.root)?;
+            seal_publishing_root(root, sealed.root, _key, false)?;
             return Err(Error::io(
                 "TEMPLATE_IO_FAILED",
                 "cannot publish READY template root",
@@ -1383,7 +1440,7 @@ fn rename_ready(
             ));
         }
     }
-    seal_publishing_root(root, sealed.root)?;
+    seal_publishing_root(root, sealed.root, _key, true)?;
     if storage::identity_at(parent.as_raw_fd(), &ready)? != sealed.root {
         return Err(Error::new(
             "TEMPLATE_RECOVERY_REQUIRED",
@@ -1397,6 +1454,8 @@ fn rename_ready(
             error,
         )
     })?;
+    #[cfg(git_vws_m4_checkpoint)]
+    m4("rename-parent-synced")?;
     if storage::identity_at(parent.as_raw_fd(), &ready)? != sealed.root {
         return Err(Error::new(
             "TEMPLATE_RECOVERY_REQUIRED",
@@ -1406,6 +1465,29 @@ fn rename_ready(
     let ready_name = std::str::from_utf8(ready.to_bytes())
         .map_err(|_| Error::new("TEMPLATE_CORRUPT", "READY root name is not UTF-8"))?;
     sealed_root(parent, ready_name, sealed, volume)?;
+    Ok(())
+}
+
+fn commit_template_record(
+    container: &File,
+    name: &[u8],
+    bytes: &[u8],
+    expected: Option<&[u8]>,
+    _key: &str,
+    _stage: &'static str,
+) -> Result<(), Error> {
+    #[cfg(not(git_vws_m4_checkpoint))]
+    let transaction = authority::RecordTxn::begin(container, name, bytes, expected)?;
+    #[cfg(git_vws_m4_checkpoint)]
+    let transaction = authority::RecordTxn::begin_checkpointed(
+        container,
+        name,
+        bytes,
+        expected,
+        ("template", "-", _key, _stage),
+    )?;
+    let mut transaction = transaction;
+    transaction.commit()?;
     Ok(())
 }
 

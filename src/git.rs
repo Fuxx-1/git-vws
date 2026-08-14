@@ -60,6 +60,7 @@ pub(crate) struct GitChild {
     child: Child,
     wait_capability: Option<u32>,
     process_group: Option<u32>,
+    direct: bool,
     exit_observed: bool,
     status: Option<ExitStatus>,
     stdout: Option<Pipe<std::process::ChildStdout>>,
@@ -85,6 +86,60 @@ impl GitChild {
         timeout: Duration,
     ) -> Result<Self, Error> {
         Self::spawn_with_env_for(args, cwd, &[], false, timeout, AuditConfig::Authority)
+    }
+
+    pub(crate) fn spawn_direct(
+        program: &OsStr,
+        args: &[OsString],
+        cwd: &Path,
+        lease_fd: RawFd,
+    ) -> Result<Self, Error> {
+        require_waitable_sigchld()?;
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .current_dir(cwd)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        for (name, _) in env::vars_os() {
+            if name.as_bytes().starts_with(b"GIT_") {
+                command.env_remove(name);
+            }
+        }
+        unsafe {
+            command.pre_exec(move || {
+                let inherited = libc::fcntl(lease_fd, libc::F_DUPFD, 3);
+                if inherited < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let flags = libc::fcntl(inherited, libc::F_GETFD);
+                if flags < 0
+                    || libc::fcntl(inherited, libc::F_SETFD, flags & !libc::FD_CLOEXEC) != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command
+            .spawn()
+            .map_err(|error| Error::io("EXEC_FAILED", "cannot execute session program", error))?;
+        let pid = child.id();
+        Ok(Self {
+            child,
+            wait_capability: Some(pid),
+            process_group: None,
+            direct: true,
+            exit_observed: false,
+            status: None,
+            stdout: None,
+            stderr: None,
+            stdin: None,
+            stdout_pending: Vec::new(),
+            deadline: Instant::now() + CLEANUP_TIMEOUT,
+            settled: false,
+        })
     }
 
     pub(crate) fn spawn_with_env_for(
@@ -168,6 +223,7 @@ impl GitChild {
             child,
             wait_capability: Some(pid),
             process_group: Some(pid),
+            direct: false,
             exit_observed: false,
             status: None,
             stdout: None,
@@ -233,6 +289,37 @@ impl GitChild {
             };
         }
         Ok(spawned)
+    }
+
+    pub(crate) fn wait_direct(mut self) -> Result<ExitStatus, Error> {
+        if !self.direct {
+            return Err(Error::new(
+                "EXEC_FAILED",
+                "direct wait was requested for a captured child",
+            ));
+        }
+        match self.child.wait() {
+            Ok(status) => {
+                self.wait_capability = None;
+                self.exit_observed = true;
+                self.status = Some(status);
+                self.settled = true;
+                Ok(status)
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                self.wait_capability = None;
+                self.process_group = None;
+                self.settled = true;
+                Err(Error::new(
+                    "EXEC_CLEANUP_FAILED",
+                    "lost ownership of session program",
+                ))
+            }
+            Err(error) => Err(self.cleanup(
+                Error::io("EXEC_FAILED", "cannot wait for session program", error),
+                "EXEC_CLEANUP_FAILED",
+            )),
+        }
     }
 
     pub(crate) fn capture(mut self, limit: usize) -> Result<Output, Error> {
@@ -819,6 +906,9 @@ impl GitChild {
     }
 
     fn terminate(&mut self) -> io::Result<()> {
+        if self.direct {
+            return self.child.kill();
+        }
         let Some(process_group) = self.process_group else {
             return Ok(());
         };
