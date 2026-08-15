@@ -1,9 +1,10 @@
 #[path = "support/checkpoint.rs"]
 mod checkpoint;
 
+#[cfg(target_os = "macos")]
+use checkpoint::lower_hex;
 use checkpoint::{
-    lower_hex, ArmReply, CheckpointController, CheckpointTarget, ProtocolFault,
-    M4_CONTROL_DESTINATION_FD,
+    ArmReply, CheckpointController, CheckpointTarget, ProtocolFault, M4_CONTROL_DESTINATION_FD,
 };
 use serde_json::Value;
 use std::env;

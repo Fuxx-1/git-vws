@@ -195,7 +195,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          expected_m4_sha='7444b18a0ade904f45f3b3ec4d663831017a5027a66eb146247737bcf424dd0d'
+          expected_m4_sha='c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c'
           expected_m5_sha='a9060708aa46f5a83b43321489741ca4bfd08fed84506db0e8741ed1d6105c1f'
           expected_checkpoint_sha='b57825c247b2bb0b0ae69db44efe9c682561e08224aa081d4d788b1a8beaf549'
           expected_main_sha='16758b5ad9d809b98e1d685b0a2b8eae97b04fccdc73376e90db71ffb7bf7208'
@@ -542,7 +542,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          expected_m4_sha='7444b18a0ade904f45f3b3ec4d663831017a5027a66eb146247737bcf424dd0d'
+          expected_m4_sha='c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c'
           expected_m5_sha='a9060708aa46f5a83b43321489741ca4bfd08fed84506db0e8741ed1d6105c1f'
           expected_checkpoint_sha='b57825c247b2bb0b0ae69db44efe9c682561e08224aa081d4d788b1a8beaf549'
           expected_main_sha='16758b5ad9d809b98e1d685b0a2b8eae97b04fccdc73376e90db71ffb7bf7208'
@@ -621,7 +621,7 @@ jobs:
             exit 1
           fi
           printf 'no NOT_EXECUTED\n' >> runner-evidence/m4-not-executed.log
-          raw_attestation='M4 Linux raw-name positive parity attestation: uname=Linux; tests/m4_git_parity.rs SHA-256=7444b18a0ade904f45f3b3ec4d663831017a5027a66eb146247737bcf424dd0d; ordinary_worktree_and_vws_have_git_parity_for_history_conflicts_and_paths observed; M4 summary=4 passed, 0 failed, 0 ignored, 0 filtered out'
+          raw_attestation='M4 Linux raw-name positive parity attestation: uname=Linux; tests/m4_git_parity.rs SHA-256=c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c; ordinary_worktree_and_vws_have_git_parity_for_history_conflicts_and_paths observed; M4 summary=4 passed, 0 failed, 0 ignored, 0 filtered out'
           printf '%s\n' "$raw_attestation" > runner-evidence/m4-linux-raw-parity-attestation.log
           grep -Fx "$raw_attestation" runner-evidence/m4-linux-raw-parity-attestation.log
           test "$(wc -l < runner-evidence/m4-linux-raw-parity-attestation.log | tr -d ' ')" = 1
