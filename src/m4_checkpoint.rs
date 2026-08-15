@@ -30,7 +30,7 @@ pub(crate) fn arm() -> Result<(), Error> {
     let Some((operation, stage)) = target.split_once('/') else {
         return Err(fail("checkpoint target is invalid"));
     };
-    if !matches!(operation, "template" | "create" | "remove") || !token(stage) {
+    if !matches!(operation, "template" | "create" | "remove" | "publish") || !token(stage) {
         return Err(fail("checkpoint target is invalid"));
     }
     validate_socket(fd)?;
@@ -74,7 +74,7 @@ pub(crate) fn checkpoint(operation: &str, sid: &str, key: &str, stage: &str) -> 
     let control = CONTROL
         .get()
         .ok_or_else(|| fail("checkpoint control was not armed"))?;
-    if !matches!(operation, "template" | "create" | "remove")
+    if !matches!(operation, "template" | "create" | "remove" | "publish")
         || !(sid == "-" || lower_hex(sid, 64))
         || !(key == "-" || lower_hex(key, 64))
         || !token(stage)

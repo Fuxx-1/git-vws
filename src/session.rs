@@ -65,6 +65,92 @@ enum SessionPayload {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum PublishJournal {
+    Idle,
+    Prepared {
+        txid: String,
+        new: String,
+        expected_old: Option<String>,
+        config_fingerprint: String,
+    },
+    ObjectsImported {
+        txid: String,
+        new: String,
+        expected_old: Option<String>,
+        config_fingerprint: String,
+    },
+    CasAttempted {
+        txid: String,
+        new: String,
+        expected_old: Option<String>,
+        config_fingerprint: String,
+    },
+    CasCommitted {
+        txid: String,
+        new: String,
+        expected_old: Option<String>,
+        config_fingerprint: String,
+    },
+}
+
+impl Default for PublishJournal {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+impl PublishJournal {
+    fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle)
+    }
+
+    fn state(&self) -> &'static str {
+        match self {
+            Self::Idle => "IDLE",
+            Self::Prepared { .. } => "PREPARED",
+            Self::ObjectsImported { .. } => "OBJECTS_IMPORTED",
+            Self::CasAttempted { .. } => "CAS_ATTEMPTED",
+            Self::CasCommitted { .. } => "CAS_COMMITTED",
+        }
+    }
+
+    fn fields(&self) -> Option<(&str, &str, Option<&str>, &str)> {
+        match self {
+            Self::Idle => None,
+            Self::Prepared {
+                txid,
+                new,
+                expected_old,
+                config_fingerprint,
+            }
+            | Self::ObjectsImported {
+                txid,
+                new,
+                expected_old,
+                config_fingerprint,
+            }
+            | Self::CasAttempted {
+                txid,
+                new,
+                expected_old,
+                config_fingerprint,
+            }
+            | Self::CasCommitted {
+                txid,
+                new,
+                expected_old,
+                config_fingerprint,
+            } => Some((txid, new, expected_old.as_deref(), config_fingerprint)),
+        }
+    }
+}
+
+fn publish_journal_is_idle(journal: &PublishJournal) -> bool {
+    journal.is_idle()
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct GitMetadataReceipt {
     dot_git: String,
     head: String,
@@ -89,6 +175,8 @@ struct SessionRecord {
     container_identity: Identity,
     volume: String,
     payload: SessionPayload,
+    #[serde(default, skip_serializing_if = "publish_journal_is_idle")]
+    journal: PublishJournal,
 }
 
 #[derive(Clone)]
@@ -105,6 +193,7 @@ struct ListRecord {
     authority_identity: Identity,
     name_hex: String,
     state: &'static str,
+    publish_state: &'static str,
     base: String,
     target_hex: String,
     managed_path_hex: String,
@@ -326,6 +415,7 @@ pub(crate) fn exec(
     let sid = session_id(&context.authority, &name);
     let record_name = record_name(&sid);
     let capability = required_record(&context.sessions, &record_name, &context.authority)?;
+    ensure_publish_idle(&capability.record)?;
     let ready = load_ready_capability(
         &context.sessions,
         &context.sessions_path,
@@ -343,6 +433,221 @@ pub(crate) fn exec(
     .map_err(git_error)?
     .wait_direct()
     .map_err(git_error)
+}
+
+pub(crate) fn publish(
+    repository: &Path,
+    raw_name: Option<OsString>,
+    name_hex: Option<String>,
+) -> Result<String, Error> {
+    let name = selected_name(raw_name, name_hex)?;
+    let context = session_context(repository)?;
+    let sid = session_id(&context.authority, &name);
+    let record_name = record_name(&sid);
+    let capability = required_record(&context.sessions, &record_name, &context.authority)?;
+    let ready = load_ready_capability(
+        &context.sessions,
+        &context.sessions_path,
+        &context.authority,
+        &capability,
+    )?;
+    acquire_lease(&ready.root, true)?;
+    let capability = revalidate_ready_lease(&context, &capability, &ready)?;
+    let target = publish_target(&capability.record)?;
+    match &capability.record.journal {
+        PublishJournal::CasAttempted { .. } => {
+            let _ = frozen_publish_fields(&context.authority, &capability.record, &target)?;
+            return Err(Error::new(
+                "PUBLISH_RECOVERY_REQUIRED",
+                "a publish compare-and-swap was attempted and cannot be replayed",
+            ));
+        }
+        PublishJournal::CasCommitted { .. } => {
+            return finalize_committed_publish(&context, capability, &target);
+        }
+        PublishJournal::Idle
+        | PublishJournal::Prepared { .. }
+        | PublishJournal::ObjectsImported { .. } => {}
+    }
+    let common_path = ready.root_path.join("common.git");
+    match capability.record.journal.clone() {
+        PublishJournal::Idle => {
+            let config_fingerprint = audit_authority_config(&context.authority)?;
+            validate_publish_target(&context.authority, &target)?;
+            let expected_old = authority_target_commit(&context.authority, &target)?;
+            let new =
+                private_target_commit(&common_path, &target, &context.authority.object_format)?;
+            ensure_publish_relation(&common_path, expected_old.as_deref(), &new)?;
+            let txid = publish_txid(
+                &context.authority,
+                &capability.record,
+                &target,
+                expected_old.as_deref(),
+                &new,
+                &config_fingerprint,
+            );
+            if expected_old.as_deref() == Some(new.as_str()) {
+                verify_authority_closure(&context.authority, &new)?;
+                let current_config = audit_authority_config(&context.authority)?;
+                ensure_authority_config(&current_config, &config_fingerprint)?;
+                validate_publish_target(&context.authority, &target)?;
+                ensure_private_target(
+                    &common_path,
+                    &target,
+                    &context.authority.object_format,
+                    &new,
+                )?;
+                ensure_authority_expected_old(&context.authority, &target, Some(&new))?;
+                #[cfg(git_vws_m4_checkpoint)]
+                publish_checkpoint(&capability.record.sid, &txid, "same-return")
+                    .map_err(publish_recovery)?;
+                return Ok(publish_success(&capability.record, &new));
+            }
+            ensure_authority_expected_old(&context.authority, &target, expected_old.as_deref())?;
+            let prepared = replace_publish_journal(
+                &context.sessions,
+                &capability,
+                PublishJournal::Prepared {
+                    txid: txid.clone(),
+                    new,
+                    expected_old,
+                    config_fingerprint,
+                },
+                &txid,
+                "prepared",
+            )
+            .map_err(publish_recovery)?;
+            publish_prepared(&context, &ready, prepared, &target, &common_path)
+        }
+        PublishJournal::Prepared { .. } => {
+            publish_prepared(&context, &ready, capability, &target, &common_path)
+        }
+        PublishJournal::ObjectsImported { .. } => {
+            publish_objects_imported(&context, &ready, capability, &target, &common_path)
+        }
+        PublishJournal::CasAttempted { .. } | PublishJournal::CasCommitted { .. } => {
+            unreachable!("publish journal state was handled before target access")
+        }
+    }
+}
+
+fn publish_prepared(
+    context: &SessionContext,
+    ready: &ReadySession,
+    capability: RecordCapability,
+    target: &OsStr,
+    common_path: &Path,
+) -> Result<String, Error> {
+    let (txid, new, expected_old, config_fingerprint) =
+        frozen_publish_fields(&context.authority, &capability.record, target)?;
+    let current_config = audit_authority_config(&context.authority)?;
+    ensure_authority_config(&current_config, &config_fingerprint)?;
+    validate_publish_target(&context.authority, target)?;
+    ensure_private_target(common_path, target, &context.authority.object_format, &new)?;
+    ensure_publish_relation(common_path, expected_old.as_deref(), &new)?;
+    if authority_target_commit(&context.authority, target)?.as_deref() != expected_old.as_deref() {
+        return abort_publish_conflict(&context.sessions, &capability, &txid);
+    }
+    import_publish_objects(&context.authority, common_path, &new)?;
+    #[cfg(git_vws_m4_checkpoint)]
+    publish_checkpoint(&capability.record.sid, &txid, "object-fetch-returned")
+        .map_err(publish_recovery)?;
+    let current_config = audit_authority_config(&context.authority)?;
+    ensure_authority_config(&current_config, &config_fingerprint)?;
+    ensure_private_target(common_path, target, &context.authority.object_format, &new)?;
+    verify_authority_closure(&context.authority, &new)?;
+    let objects_imported = replace_publish_journal(
+        &context.sessions,
+        &capability,
+        PublishJournal::ObjectsImported {
+            txid: txid.clone(),
+            new,
+            expected_old,
+            config_fingerprint,
+        },
+        &txid,
+        "objects-imported",
+    )
+    .map_err(publish_recovery)?;
+    publish_objects_imported(context, ready, objects_imported, target, common_path)
+}
+
+fn publish_objects_imported(
+    context: &SessionContext,
+    _ready: &ReadySession,
+    capability: RecordCapability,
+    target: &OsStr,
+    common_path: &Path,
+) -> Result<String, Error> {
+    let (txid, new, expected_old, config_fingerprint) =
+        frozen_publish_fields(&context.authority, &capability.record, target)?;
+    let current_config = audit_authority_config(&context.authority)?;
+    ensure_authority_config(&current_config, &config_fingerprint)?;
+    validate_publish_target(&context.authority, target)?;
+    ensure_private_target(common_path, target, &context.authority.object_format, &new)?;
+    ensure_publish_relation(common_path, expected_old.as_deref(), &new)?;
+    verify_authority_closure(&context.authority, &new)?;
+    if authority_target_commit(&context.authority, target)?.as_deref() != expected_old.as_deref() {
+        return abort_publish_conflict(&context.sessions, &capability, &txid);
+    }
+    let attempted = replace_publish_journal(
+        &context.sessions,
+        &capability,
+        PublishJournal::CasAttempted {
+            txid: txid.clone(),
+            new: new.clone(),
+            expected_old: expected_old.clone(),
+            config_fingerprint: config_fingerprint.clone(),
+        },
+        &txid,
+        "cas-attempted",
+    )
+    .map_err(publish_recovery)?;
+    let update = update_publish_ref(&context.authority, target, &new, expected_old.as_deref())
+        .map_err(publish_recovery)?;
+    if update.status.success() {
+        #[cfg(git_vws_m4_checkpoint)]
+        publish_checkpoint(&attempted.record.sid, &txid, "cas-child-returned-success")
+            .map_err(publish_recovery)?;
+        let committed = replace_publish_journal(
+            &context.sessions,
+            &attempted,
+            PublishJournal::CasCommitted {
+                txid: txid.clone(),
+                new: new.clone(),
+                expected_old,
+                config_fingerprint,
+            },
+            &txid,
+            "cas-committed",
+        )
+        .map_err(publish_committed_recovery)?;
+        return finalize_committed_publish(context, committed, target);
+    }
+    #[cfg(git_vws_m4_checkpoint)]
+    publish_checkpoint(&attempted.record.sid, &txid, "cas-child-returned-nonzero")
+        .map_err(publish_recovery)?;
+    Err(Error::new(
+        "PUBLISH_RECOVERY_REQUIRED",
+        "authority rejected the publish compare-and-swap and it cannot be replayed",
+    ))
+}
+
+fn finalize_committed_publish(
+    context: &SessionContext,
+    capability: RecordCapability,
+    target: &OsStr,
+) -> Result<String, Error> {
+    let (txid, new, _, _) = frozen_publish_fields(&context.authority, &capability.record, target)?;
+    let record = finish_publish_journal(&context.sessions, &capability, &txid, Some(new.clone()))
+        .map_err(publish_committed_recovery)?;
+    #[cfg(git_vws_m4_checkpoint)]
+    publish_checkpoint(&record.record.sid, &txid, "return").map_err(publish_committed_recovery)?;
+    Ok(publish_success(&record.record, &new))
+}
+
+fn publish_success(record: &SessionRecord, new: &str) -> String {
+    format!("published {} {new}", record.target)
 }
 
 pub(crate) fn remove(
@@ -375,6 +680,7 @@ pub(crate) fn remove(
             return remove_event(&context.authority, &name);
         }
     };
+    ensure_publish_idle(&capability.record)?;
     let tombstoned = match &capability.record.payload {
         SessionPayload::Tombstoned { .. } => capability,
         SessionPayload::Ready { .. } => {
@@ -484,8 +790,10 @@ pub(crate) fn create(repository: &Path, request: CreateRequest) -> Result<PathBu
         payload: SessionPayload::Prepared {
             root_name: root_name.clone(),
         },
+        journal: PublishJournal::Idle,
     };
     if let Some(existing) = optional_record(&sessions, &record_name, &authority)? {
+        ensure_publish_idle(&existing.record)?;
         if existing.record == prepared {
             return Err(Error::new(
                 "SESSION_INCOMPLETE",
@@ -577,6 +885,7 @@ fn materialize_session(
         transaction.capability(),
         &materializing_bytes,
         "create",
+        &transaction.capability().record.template_key,
         "materializing-record",
     )?;
     transaction.replace_capability(capability);
@@ -731,6 +1040,7 @@ fn materialize_session(
         transaction.capability(),
         &ready_bytes,
         "create",
+        &transaction.capability().record.template_key,
         "ready-record",
     )?;
     transaction.replace_capability(capability);
@@ -806,6 +1116,7 @@ fn list_record(record: &SessionRecord, sessions_path: &Path) -> ListRecord {
         authority_identity: record.authority_identity,
         name_hex: record.name.clone(),
         state,
+        publish_state: record.journal.state(),
         base: record.base.clone(),
         target_hex: record.target.clone(),
         managed_path_hex: authority::hex(sessions_path.join(root).as_os_str().as_bytes()),
@@ -836,6 +1147,175 @@ fn selected_name(raw_name: Option<OsString>, name_hex: Option<String>) -> Result
             "select exactly one of NAME or --name-hex",
         )),
     }
+}
+
+fn ensure_publish_idle(record: &SessionRecord) -> Result<(), Error> {
+    if record.journal.is_idle() {
+        return Ok(());
+    }
+    let code = match &record.journal {
+        PublishJournal::CasCommitted { .. } => "PUBLISH_COMMITTED_RECOVERY_REQUIRED",
+        _ => "PUBLISH_RECOVERY_REQUIRED",
+    };
+    Err(Error::new(
+        code,
+        "session publish journal must be recovered before another lifecycle operation",
+    ))
+}
+
+fn frozen_publish_fields(
+    authority: &Authority,
+    record: &SessionRecord,
+    target: &OsStr,
+) -> Result<(String, String, Option<String>, String), Error> {
+    let (txid, new, expected_old, config_fingerprint) =
+        record.journal.fields().ok_or_else(|| {
+            Error::new(
+                "SESSION_CORRUPT",
+                "session record has no frozen publish journal fields",
+            )
+        })?;
+    if txid
+        != publish_txid(
+            authority,
+            record,
+            target,
+            expected_old,
+            new,
+            config_fingerprint,
+        )
+    {
+        return Err(Error::new(
+            "SESSION_CORRUPT",
+            "publish journal transaction does not match its record binding",
+        ));
+    }
+    Ok((
+        txid.to_owned(),
+        new.to_owned(),
+        expected_old.map(str::to_owned),
+        config_fingerprint.to_owned(),
+    ))
+}
+
+fn publish_target(record: &SessionRecord) -> Result<OsString, Error> {
+    let target = decode_hex(&record.target)?;
+    if target.is_empty() || target.contains(&0) {
+        return Err(Error::new(
+            "SESSION_CORRUPT",
+            "session record target is not a usable Git reference name",
+        ));
+    }
+    Ok(OsString::from_vec(target))
+}
+
+fn publish_txid(
+    authority: &Authority,
+    record: &SessionRecord,
+    target: &OsStr,
+    expected_old: Option<&str>,
+    new: &str,
+    config_fingerprint: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    let expected_old = expected_old.unwrap_or("-");
+    for field in [
+        b"git-vws/publish-id/v1".as_slice(),
+        authority.canonical.as_os_str().as_bytes(),
+        &authority.identity.dev.to_be_bytes(),
+        &authority.identity.ino.to_be_bytes(),
+        &authority.identity.uid.to_be_bytes(),
+        &authority.identity.mode.to_be_bytes(),
+        &authority.identity.kind.to_be_bytes(),
+        &authority.identity.nlink.to_be_bytes(),
+        record.sid.as_bytes(),
+        record.template_key.as_bytes(),
+        target.as_bytes(),
+        expected_old.as_bytes(),
+        new.as_bytes(),
+        config_fingerprint.as_bytes(),
+    ] {
+        lp(&mut hasher, field);
+    }
+    authority::hex(&hasher.finalize())
+}
+
+fn replace_publish_journal(
+    sessions: &File,
+    expected: &RecordCapability,
+    journal: PublishJournal,
+    txid: &str,
+    stage: &'static str,
+) -> Result<RecordCapability, Error> {
+    let mut record = expected.record.clone();
+    record.journal = journal;
+    let bytes = encode_record(&record)?;
+    replace_record_capability(sessions, expected, &bytes, "publish", txid, stage)
+}
+
+fn abort_publish_conflict<T>(
+    sessions: &File,
+    expected: &RecordCapability,
+    txid: &str,
+) -> Result<T, Error> {
+    #[cfg(git_vws_m4_checkpoint)]
+    let sid = expected.record.sid.clone();
+    replace_publish_journal(
+        sessions,
+        expected,
+        PublishJournal::Idle,
+        txid,
+        "conflict-aborted",
+    )
+    .map_err(publish_recovery)?;
+    #[cfg(git_vws_m4_checkpoint)]
+    publish_checkpoint(&sid, txid, "conflict-return").map_err(publish_recovery)?;
+    Err(Error::new(
+        "PUBLISH_CONFLICT",
+        "authority target changed before the publish compare-and-swap",
+    ))
+}
+
+fn finish_publish_journal(
+    sessions: &File,
+    expected: &RecordCapability,
+    txid: &str,
+    expected_old: Option<String>,
+) -> Result<RecordCapability, Error> {
+    let mut record = expected.record.clone();
+    record.expected_old = expected_old;
+    record.journal = PublishJournal::Idle;
+    let bytes = encode_record(&record)?;
+    replace_record_capability(
+        sessions,
+        expected,
+        &bytes,
+        "publish",
+        txid,
+        "idle-finalized",
+    )
+}
+
+fn publish_recovery(error: Error) -> Error {
+    Error::new(
+        "PUBLISH_RECOVERY_REQUIRED",
+        format!(
+            "publish journal outcome requires recovery: {}",
+            error.detail
+        ),
+    )
+}
+
+fn publish_committed_recovery(error: Error) -> Error {
+    Error::new(
+        "PUBLISH_COMMITTED_RECOVERY_REQUIRED",
+        format!("publish commit outcome requires recovery: {}", error.detail),
+    )
+}
+
+#[cfg(git_vws_m4_checkpoint)]
+fn publish_checkpoint(sid: &str, txid: &str, stage: &str) -> Result<(), Error> {
+    crate::m4_checkpoint::checkpoint("publish", sid, txid, stage)
 }
 
 fn valid_session_name(bytes: &[u8]) -> bool {
@@ -962,6 +1442,7 @@ fn replace_record_capability(
     expected: &RecordCapability,
     bytes: &[u8],
     _operation: &'static str,
+    _checkpoint_key: &str,
     _stage: &'static str,
 ) -> Result<RecordCapability, Error> {
     #[cfg(not(git_vws_m4_checkpoint))]
@@ -974,12 +1455,7 @@ fn replace_record_capability(
         &expected.basename,
         bytes,
         &expected.binding,
-        (
-            _operation,
-            &expected.record.sid,
-            &expected.record.template_key,
-            _stage,
-        ),
+        (_operation, &expected.record.sid, _checkpoint_key, _stage),
     )
     .map_err(|error| bound_record_error(error, "cannot begin record replacement"))?;
     let mut transaction = transaction;
@@ -1216,7 +1692,14 @@ fn transition_tombstone(
         root_identity,
     };
     let bytes = encode_record(&tombstoned)?;
-    replace_record_capability(sessions, expected, &bytes, "remove", "tombstoned-record")
+    replace_record_capability(
+        sessions,
+        expected,
+        &bytes,
+        "remove",
+        &expected.record.template_key,
+        "tombstoned-record",
+    )
 }
 
 fn complete_tombstone(context: &SessionContext, expected: &RecordCapability) -> Result<(), Error> {
@@ -2074,6 +2557,405 @@ fn validate_branch(authority: &Authority, target: &OsStr) -> Result<(), Error> {
     }
 }
 
+fn validate_publish_target(authority: &Authority, target: &OsStr) -> Result<(), Error> {
+    let args = [
+        OsString::from("-C"),
+        authority.canonical.as_os_str().to_os_string(),
+        OsString::from("check-ref-format"),
+        OsString::from("--branch"),
+        target.to_os_string(),
+    ];
+    let output = git::capture(&args, None, GIT_TIMEOUT, AuditConfig::Authority)
+        .map_err(|_| Error::new("PUBLISH_VERIFY_FAILED", "cannot validate publish target"))?;
+    if output.status.success() && output.stderr.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "PUBLISH_VERIFY_FAILED",
+            "session target is not a valid direct branch name",
+        ))
+    }
+}
+
+fn audit_authority_config(authority: &Authority) -> Result<String, Error> {
+    let args = [
+        OsString::from("-C"),
+        authority.canonical.as_os_str().to_os_string(),
+        OsString::from("config"),
+        OsString::from("--null"),
+        OsString::from("--show-origin"),
+        OsString::from("--show-scope"),
+        OsString::from("--includes"),
+        OsString::from("--list"),
+    ];
+    let output = git::capture(&args, None, GIT_TIMEOUT, AuditConfig::Authority)
+        .map_err(|_| Error::new("PUBLISH_VERIFY_FAILED", "cannot audit authority config"))?;
+    if !output.status.success()
+        || !output.stderr.is_empty()
+        || !authority_config_is_safe(&output.stdout)
+    {
+        return Err(Error::new(
+            "PUBLISH_VERIFY_FAILED",
+            "authority config is not safe for fixed-object publish",
+        ));
+    }
+    Ok(hash_bytes(&output.stdout))
+}
+
+fn ensure_authority_config(current: &str, expected: &str) -> Result<(), Error> {
+    if current == expected {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "PUBLISH_VERIFY_FAILED",
+            "authority config changed during the publish transaction",
+        ))
+    }
+}
+
+fn authority_config_is_safe(raw: &[u8]) -> bool {
+    if raw.is_empty() {
+        return true;
+    }
+    let Some(raw) = raw.strip_suffix(b"\0") else {
+        return false;
+    };
+    let mut fields = raw.split(|byte| *byte == 0);
+    loop {
+        let Some(scope) = fields.next() else {
+            return true;
+        };
+        let (Some(origin), Some(entry)) = (fields.next(), fields.next()) else {
+            return false;
+        };
+        if !authority_config_entry_is_safe(scope, origin, entry) {
+            return false;
+        }
+    }
+}
+
+fn authority_config_entry_is_safe(scope: &[u8], origin: &[u8], entry: &[u8]) -> bool {
+    if !matches!(scope, b"system" | b"global" | b"local" | b"worktree")
+        || !origin.starts_with(b"file:")
+    {
+        return false;
+    }
+    let Some(separator) = entry.iter().position(|byte| *byte == b'\n') else {
+        return false;
+    };
+    let key = entry[..separator]
+        .iter()
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    !key.starts_with(b"include.")
+        && !key.starts_with(b"includeif.")
+        && !key.starts_with(b"filter.")
+        && !key.starts_with(b"fsck.")
+        && !key.starts_with(b"url.")
+        && !bytes_include(&key, b"alternaterefscommand")
+        && !(key.starts_with(b"remote.")
+            && (key.ends_with(b".uploadpack") || key.ends_with(b".vcs")))
+        && !bytes_include(&key, b"promisor")
+        && !bytes_include(&key, b"partialclone")
+}
+
+fn bytes_include(bytes: &[u8], needle: &[u8]) -> bool {
+    bytes
+        .windows(needle.len())
+        .any(|candidate| candidate == needle)
+}
+
+fn private_target_commit(
+    common_path: &Path,
+    target: &OsStr,
+    object_format: &str,
+) -> Result<String, Error> {
+    target_commit(
+        common_path,
+        target,
+        object_format,
+        AuditConfig::Isolated,
+        false,
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            "PUBLISH_VERIFY_FAILED",
+            "private target is absent or not a direct commit",
+        )
+    })
+}
+
+fn authority_target_commit(authority: &Authority, target: &OsStr) -> Result<Option<String>, Error> {
+    target_commit(
+        &authority.canonical,
+        target,
+        &authority.object_format,
+        AuditConfig::Authority,
+        true,
+    )
+}
+
+fn target_commit(
+    repository: &Path,
+    target: &OsStr,
+    object_format: &str,
+    audit: AuditConfig,
+    authority_command: bool,
+) -> Result<Option<String>, Error> {
+    let mut reference = OsString::from("refs/heads/");
+    reference.push(target);
+    let mut args = Vec::new();
+    if authority_command {
+        args.push(OsString::from("-C"));
+        args.push(repository.as_os_str().to_os_string());
+    }
+    args.extend([
+        OsString::from("for-each-ref"),
+        OsString::from("--format=%(refname) %(objectname) %(objecttype) %(symref)"),
+        reference.clone(),
+    ]);
+    let cwd = (!authority_command).then_some(repository);
+    let output = git::capture(&args, cwd, GIT_TIMEOUT, audit)
+        .map_err(|_| Error::new("PUBLISH_VERIFY_FAILED", "cannot read publish target"))?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(Error::new(
+            "PUBLISH_VERIFY_FAILED",
+            "cannot read publish target",
+        ));
+    }
+    parse_target_commit_output(
+        &output.stdout,
+        reference.as_os_str().as_bytes(),
+        object_format,
+    )
+}
+
+fn parse_target_commit_output(
+    output: &[u8],
+    expected_ref: &[u8],
+    object_format: &str,
+) -> Result<Option<String>, Error> {
+    if output.is_empty() {
+        return Ok(None);
+    }
+    let body = output
+        .strip_suffix(b"\n")
+        .filter(|body| !body.contains(&b'\n'))
+        .ok_or_else(|| {
+            Error::new(
+                "PUBLISH_VERIFY_FAILED",
+                "publish target output was ambiguous",
+            )
+        })?;
+    let mut fields = body.splitn(4, |byte| *byte == b' ');
+    let (Some(reference), Some(oid), Some(kind), Some(symref)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return Err(Error::new(
+            "PUBLISH_VERIFY_FAILED",
+            "publish target output was malformed",
+        ));
+    };
+    if reference != expected_ref || kind != b"commit" || !symref.is_empty() {
+        return Err(Error::new(
+            "PUBLISH_VERIFY_FAILED",
+            "publish target is not one direct commit reference",
+        ));
+    }
+    parse_publish_oid(oid, object_format).map(Some)
+}
+
+fn parse_publish_oid(output: &[u8], object_format: &str) -> Result<String, Error> {
+    let oid = std::str::from_utf8(output).map_err(|_| {
+        Error::new(
+            "PUBLISH_VERIFY_FAILED",
+            "publish target object ID was not ASCII",
+        )
+    })?;
+    if oid_matches_format(oid, object_format) {
+        Ok(oid.to_owned())
+    } else {
+        Err(Error::new(
+            "PUBLISH_VERIFY_FAILED",
+            "publish target object ID did not match the authority format",
+        ))
+    }
+}
+
+fn oid_matches_format(oid: &str, object_format: &str) -> bool {
+    let width = match object_format {
+        "sha1" => 40,
+        "sha256" => 64,
+        _ => return false,
+    };
+    oid.len() == width
+        && oid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn ensure_private_target(
+    common_path: &Path,
+    target: &OsStr,
+    object_format: &str,
+    expected: &str,
+) -> Result<(), Error> {
+    if private_target_commit(common_path, target, object_format)? == expected {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "PUBLISH_VERIFY_FAILED",
+            "private target changed after the publish journal was prepared",
+        ))
+    }
+}
+
+fn ensure_publish_relation(
+    common_path: &Path,
+    expected_old: Option<&str>,
+    new: &str,
+) -> Result<(), Error> {
+    let Some(expected_old) = expected_old else {
+        return Ok(());
+    };
+    if expected_old == new {
+        return Ok(());
+    }
+    let args = [
+        OsString::from("merge-base"),
+        OsString::from("--is-ancestor"),
+        OsString::from(expected_old),
+        OsString::from(new),
+    ];
+    let output = git::capture(&args, Some(common_path), GIT_TIMEOUT, AuditConfig::Isolated)
+        .map_err(|_| Error::new("PUBLISH_VERIFY_FAILED", "cannot verify publish ancestry"))?;
+    if output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
+        return Ok(());
+    }
+    if output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() {
+        return Err(Error::new(
+            "PUBLISH_NON_FAST_FORWARD",
+            "private target is not a fast-forward of the frozen authority target",
+        ));
+    }
+    Err(Error::new(
+        "PUBLISH_VERIFY_FAILED",
+        "cannot prove the publish ancestry relation",
+    ))
+}
+
+fn ensure_authority_expected_old(
+    authority: &Authority,
+    target: &OsStr,
+    expected_old: Option<&str>,
+) -> Result<(), Error> {
+    if authority_target_commit(authority, target)?.as_deref() == expected_old {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "PUBLISH_CONFLICT",
+            "authority target no longer matches the frozen expected-old",
+        ))
+    }
+}
+
+fn import_publish_objects(
+    authority: &Authority,
+    common_path: &Path,
+    new: &str,
+) -> Result<(), Error> {
+    let args = [
+        OsString::from("-C"),
+        authority.canonical.as_os_str().to_os_string(),
+        OsString::from("fetch"),
+        OsString::from("--quiet"),
+        OsString::from("--no-write-fetch-head"),
+        OsString::from("--no-tags"),
+        OsString::from("--no-auto-maintenance"),
+        OsString::from("--no-write-commit-graph"),
+        OsString::from("--recurse-submodules=no"),
+        common_path.as_os_str().to_os_string(),
+        OsString::from(new),
+    ];
+    let output = git::capture(&args, None, GIT_TIMEOUT, AuditConfig::Authority)
+        .map_err(|_| Error::new("PUBLISH_IMPORT_FAILED", "cannot import private objects"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "PUBLISH_IMPORT_FAILED",
+            "Git rejected the fixed-object import",
+        ))
+    }
+}
+
+fn verify_authority_closure(authority: &Authority, new: &str) -> Result<(), Error> {
+    let expression = OsString::from(format!("{new}^{{commit}}"));
+    let cat_file = [
+        OsString::from("-C"),
+        authority.canonical.as_os_str().to_os_string(),
+        OsString::from("cat-file"),
+        OsString::from("-e"),
+        expression.clone(),
+    ];
+    let output = git::capture(&cat_file, None, GIT_TIMEOUT, AuditConfig::Authority)
+        .map_err(|_| Error::new("PUBLISH_VERIFY_FAILED", "cannot verify imported commit"))?;
+    if !output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty() {
+        return Err(Error::new(
+            "PUBLISH_VERIFY_FAILED",
+            "authority does not contain the imported commit",
+        ));
+    }
+    let fsck = [
+        OsString::from("-C"),
+        authority.canonical.as_os_str().to_os_string(),
+        OsString::from("fsck"),
+        OsString::from("--connectivity-only"),
+        OsString::from("--no-reflogs"),
+        OsString::from("--no-dangling"),
+        OsString::from("--no-progress"),
+        expression,
+    ];
+    let output = git::capture(&fsck, None, GIT_TIMEOUT, AuditConfig::Authority)
+        .map_err(|_| Error::new("PUBLISH_VERIFY_FAILED", "cannot verify imported closure"))?;
+    if output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "PUBLISH_VERIFY_FAILED",
+            "authority does not prove the imported commit closure",
+        ))
+    }
+}
+
+fn update_publish_ref(
+    authority: &Authority,
+    target: &OsStr,
+    new: &str,
+    expected_old: Option<&str>,
+) -> Result<Output, Error> {
+    let mut reference = OsString::from("refs/heads/");
+    reference.push(target);
+    let old = expected_old.map(str::to_owned).unwrap_or_else(|| {
+        "0".repeat(if authority.object_format == "sha1" {
+            40
+        } else {
+            64
+        })
+    });
+    let args = [
+        OsString::from("-C"),
+        authority.canonical.as_os_str().to_os_string(),
+        OsString::from("update-ref"),
+        OsString::from("--no-deref"),
+        reference,
+        OsString::from(new),
+        OsString::from(old),
+    ];
+    git::capture(&args, None, GIT_TIMEOUT, AuditConfig::Authority)
+        .map_err(|_| Error::new("PUBLISH_RECOVERY_REQUIRED", "publish CAS result is unknown"))
+}
+
 fn init_private_common(
     authority: &Authority,
     common: &Path,
@@ -2475,6 +3357,7 @@ fn validate_record(record: &SessionRecord) -> Result<(), Error> {
             .expected_old
             .as_deref()
             .is_some_and(|oid| !valid_oid(oid))
+        || !valid_publish_journal(record)
     {
         return Err(Error::new(
             "SESSION_CORRUPT",
@@ -2540,6 +3423,17 @@ fn validate_record(record: &SessionRecord) -> Result<(), Error> {
             "session stage bindings are invalid",
         ))
     }
+}
+
+fn valid_publish_journal(record: &SessionRecord) -> bool {
+    let Some((txid, new, expected_old, config_fingerprint)) = record.journal.fields() else {
+        return true;
+    };
+    matches!(&record.payload, SessionPayload::Ready { .. })
+        && valid_lower_hash(txid)
+        && valid_lower_oid(new)
+        && expected_old.is_none_or(valid_lower_oid)
+        && valid_lower_hash(config_fingerprint)
 }
 
 fn sync_tree(directory: &File) -> Result<(), Error> {
@@ -2747,6 +3641,13 @@ fn valid_hash(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn valid_lower_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 fn valid_hex(value: &str) -> bool {
     valid_lower_hex(value)
 }
@@ -2781,6 +3682,13 @@ fn hex_digit(byte: u8) -> Option<u8> {
 
 fn valid_oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_lower_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn cstring(bytes: &[u8], label: &str) -> Result<CString, Error> {
@@ -2844,6 +3752,7 @@ mod tests {
             payload: SessionPayload::Prepared {
                 root_name: root_name(&sid),
             },
+            journal: PublishJournal::Idle,
         }
     }
 

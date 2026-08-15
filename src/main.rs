@@ -67,6 +67,16 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    Publish {
+        #[arg(
+            value_name = "NAME",
+            required_unless_present = "name_hex",
+            conflicts_with = "name_hex"
+        )]
+        name: Option<OsString>,
+        #[arg(long, value_name = "HEX")]
+        name_hex: Option<String>,
+    },
 }
 
 enum CommandOutput {
@@ -132,6 +142,9 @@ fn main() -> ExitCode {
             force,
         } => repository(repo)
             .and_then(|repository| session::remove(&repository, name, name_hex, force))
+            .map(CommandOutput::Text),
+        Command::Publish { name, name_hex } => repository(repo)
+            .and_then(|repository| session::publish(&repository, name, name_hex))
             .map(CommandOutput::Text),
     };
     match result {
