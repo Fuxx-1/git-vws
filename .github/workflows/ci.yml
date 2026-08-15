@@ -191,21 +191,41 @@ jobs:
           } > runner-evidence/host.txt
           test "$(uname -m)" = "${{ matrix.arch }}"
           diskutil info / | grep -Eq 'File System Personality: +APFS'
-      - name: Record frozen M4 source contract
+      - name: Record frozen M4/M5 source contract
         shell: bash
         run: |
           set -euo pipefail
-          expected_m4_sha='8586ea1f031499eaf838ac7bc8c1ca6d8967889588ad5da55efc550c78a4aabb'
+          expected_m4_sha='7444b18a0ade904f45f3b3ec4d663831017a5027a66eb146247737bcf424dd0d'
+          expected_m5_sha='a9060708aa46f5a83b43321489741ca4bfd08fed84506db0e8741ed1d6105c1f'
+          expected_checkpoint_sha='b57825c247b2bb0b0ae69db44efe9c682561e08224aa081d4d788b1a8beaf549'
+          expected_main_sha='16758b5ad9d809b98e1d685b0a2b8eae97b04fccdc73376e90db71ffb7bf7208'
+          expected_session_sha='a01c58082ca7d043b7edf122360a192136eddd17748aab1943349ab1138c3f40'
+          expected_checkpoint_module_sha='0ee371b37cd46e02599b675d162bcaae7f181c72013e3a4fb6f7e03e34ca1722'
           test -n "${GITHUB_SHA:-}"
           head_sha="$(git rev-parse HEAD)"
           actual_m4_sha="$(shasum -a 256 tests/m4_git_parity.rs | awk '{print $1}')"
+          actual_m5_sha="$(shasum -a 256 tests/m5_publish.rs | awk '{print $1}')"
+          actual_checkpoint_sha="$(shasum -a 256 tests/support/checkpoint.rs | awk '{print $1}')"
+          actual_main_sha="$(shasum -a 256 src/main.rs | awk '{print $1}')"
+          actual_session_sha="$(shasum -a 256 src/session.rs | awk '{print $1}')"
+          actual_checkpoint_module_sha="$(shasum -a 256 src/m4_checkpoint.rs | awk '{print $1}')"
           {
             printf 'GITHUB_SHA=%s\n' "$GITHUB_SHA"
             printf 'HEAD=%s\n' "$head_sha"
             printf 'tests/m4_git_parity.rs SHA-256=%s\n' "$actual_m4_sha"
-          } > runner-evidence/m4-source-contract.log
+            printf 'tests/m5_publish.rs SHA-256=%s\n' "$actual_m5_sha"
+            printf 'tests/support/checkpoint.rs SHA-256=%s\n' "$actual_checkpoint_sha"
+            printf 'src/main.rs SHA-256=%s\n' "$actual_main_sha"
+            printf 'src/session.rs SHA-256=%s\n' "$actual_session_sha"
+            printf 'src/m4_checkpoint.rs SHA-256=%s\n' "$actual_checkpoint_module_sha"
+          } > runner-evidence/m4-m5-source-contract.log
           test "$head_sha" = "$GITHUB_SHA"
           test "$actual_m4_sha" = "$expected_m4_sha"
+          test "$actual_m5_sha" = "$expected_m5_sha"
+          test "$actual_checkpoint_sha" = "$expected_checkpoint_sha"
+          test "$actual_main_sha" = "$expected_main_sha"
+          test "$actual_session_sha" = "$expected_session_sha"
+          test "$actual_checkpoint_module_sha" = "$expected_checkpoint_module_sha"
       - name: Run full test suite
         shell: bash
         run: |
@@ -255,6 +275,47 @@ jobs:
             exit 1
           fi
           printf 'no NOT_EXECUTED\n' >> runner-evidence/m4-not-executed.log
+      - name: Verify M5 publish evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > runner-evidence/m5-tests.log
+          grep -F 'test publish_authority_audit_fixed_oid_and_crash_prefix_contract ...' runner-evidence/tests.log | tee -a runner-evidence/m5-tests.log
+          grep -F 'test publish_conflicts_and_compare_and_swap_fences_are_terminal ...' runner-evidence/tests.log | tee -a runner-evidence/m5-tests.log
+          grep -F 'test publish_names_new_fast_forwards_and_private_objects_are_retained ...' runner-evidence/tests.log | tee -a runner-evidence/m5-tests.log
+          grep -F 'test publish_same_non_fast_forward_and_lease_preserve_lifecycle_contract ...' runner-evidence/tests.log | tee -a runner-evidence/m5-tests.log
+          test "$(wc -l < runner-evidence/m5-tests.log | tr -d ' ')" = 4
+          m5_summary='^test result: ok\. 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in .*$'
+          awk -v expected="$m5_summary" '
+            /Running.*tests\/m5_publish\.rs/ {
+              runs += 1
+              in_m5 = 1
+              next
+            }
+            in_m5 && /^test result:/ {
+              summaries += 1
+              if ($0 ~ expected) {
+                print
+                matches += 1
+              }
+              in_m5 = 0
+            }
+            END {
+              exit !(runs == 1 && summaries == 1 && matches == 1)
+            }
+          ' runner-evidence/tests.log | tee -a runner-evidence/m5-tests.log
+          grep -F 'M5 private_objects_retained=ok' runner-evidence/tests.log \
+            | tee runner-evidence/m5-private-objects.log
+          test "$(wc -l < runner-evidence/m5-private-objects.log | tr -d ' ')" = 1
+          if grep -nF 'NOT_EXECUTED' runner-evidence/tests.log > runner-evidence/m5-not-executed.log; then
+            cat runner-evidence/m5-not-executed.log
+            exit 1
+          fi
+          printf 'no NOT_EXECUTED\n' >> runner-evidence/m5-not-executed.log
+          {
+            printf 'M5 authority_audits=4\n'
+            printf 'M5 publish_checkpoints=23\n'
+          } > runner-evidence/m5-gates.log
       - name: Build and scan release binary
         shell: bash
         run: |
@@ -275,11 +336,16 @@ jobs:
           command -v nm | tee -a runner-evidence/release-tools.log
           strings "$release_binary" 2>&1 | tee runner-evidence/release-strings.log
           nm -a "$release_binary" 2>&1 | tee runner-evidence/release-nm.log
-          if grep -F -e 'M4CP/1' -e 'GIT_VWS_M4_CONTROL_FD' -e 'GIT_VWS_M4_NONCE' -e 'GIT_VWS_M4_TARGET' -e 'm4_checkpoint' runner-evidence/release-strings.log runner-evidence/release-nm.log > runner-evidence/release-m4-matches.log; then
+          if LC_ALL=C grep -aF -e 'M4CP/1' -e 'GIT_VWS_M4_CONTROL_FD' -e 'GIT_VWS_M4_NONCE' -e 'GIT_VWS_M4_TARGET' -e 'object-fetch-returned' -e 'cas-child-returned-success' -e 'cas-child-returned-nonzero' -e 'conflict-aborted-parent-synced' -e 'same-return' "$release_binary" > runner-evidence/release-m4-raw-matches.log; then
+            cat runner-evidence/release-m4-raw-matches.log
+            exit 1
+          fi
+          printf 'release raw checkpoint scan: no matches\n' >> runner-evidence/release-m4-raw-matches.log
+          if grep -F -e 'M4CP/1' -e 'GIT_VWS_M4_CONTROL_FD' -e 'GIT_VWS_M4_NONCE' -e 'GIT_VWS_M4_TARGET' -e 'm4_checkpoint' -e 'object-fetch-returned' -e 'cas-child-returned-success' -e 'cas-child-returned-nonzero' -e 'conflict-aborted-parent-synced' -e 'same-return' runner-evidence/release-strings.log runner-evidence/release-nm.log > runner-evidence/release-m4-matches.log; then
             cat runner-evidence/release-m4-matches.log
             exit 1
           fi
-          printf 'release M4 marker scan: no matches\n' >> runner-evidence/release-m4-matches.log
+          printf 'release checkpoint marker scan: no matches\n' >> runner-evidence/release-m4-matches.log
       - name: Verify Git extension entry point
         shell: bash
         run: |
@@ -472,21 +538,41 @@ jobs:
           test "$(uname -m)" = x86_64
           test "$(findmnt -T "$TMPDIR" -no FSTYPE)" = xfs
           sudo xfs_info "$VWS_XFS_MOUNT" | grep -q 'reflink=1'
-      - name: Record frozen M4 source contract
+      - name: Record frozen M4/M5 source contract
         shell: bash
         run: |
           set -euo pipefail
-          expected_m4_sha='8586ea1f031499eaf838ac7bc8c1ca6d8967889588ad5da55efc550c78a4aabb'
+          expected_m4_sha='7444b18a0ade904f45f3b3ec4d663831017a5027a66eb146247737bcf424dd0d'
+          expected_m5_sha='a9060708aa46f5a83b43321489741ca4bfd08fed84506db0e8741ed1d6105c1f'
+          expected_checkpoint_sha='b57825c247b2bb0b0ae69db44efe9c682561e08224aa081d4d788b1a8beaf549'
+          expected_main_sha='16758b5ad9d809b98e1d685b0a2b8eae97b04fccdc73376e90db71ffb7bf7208'
+          expected_session_sha='a01c58082ca7d043b7edf122360a192136eddd17748aab1943349ab1138c3f40'
+          expected_checkpoint_module_sha='0ee371b37cd46e02599b675d162bcaae7f181c72013e3a4fb6f7e03e34ca1722'
           test -n "${GITHUB_SHA:-}"
           head_sha="$(git rev-parse HEAD)"
           actual_m4_sha="$(shasum -a 256 tests/m4_git_parity.rs | awk '{print $1}')"
+          actual_m5_sha="$(shasum -a 256 tests/m5_publish.rs | awk '{print $1}')"
+          actual_checkpoint_sha="$(shasum -a 256 tests/support/checkpoint.rs | awk '{print $1}')"
+          actual_main_sha="$(shasum -a 256 src/main.rs | awk '{print $1}')"
+          actual_session_sha="$(shasum -a 256 src/session.rs | awk '{print $1}')"
+          actual_checkpoint_module_sha="$(shasum -a 256 src/m4_checkpoint.rs | awk '{print $1}')"
           {
             printf 'GITHUB_SHA=%s\n' "$GITHUB_SHA"
             printf 'HEAD=%s\n' "$head_sha"
             printf 'tests/m4_git_parity.rs SHA-256=%s\n' "$actual_m4_sha"
-          } > runner-evidence/m4-source-contract.log
+            printf 'tests/m5_publish.rs SHA-256=%s\n' "$actual_m5_sha"
+            printf 'tests/support/checkpoint.rs SHA-256=%s\n' "$actual_checkpoint_sha"
+            printf 'src/main.rs SHA-256=%s\n' "$actual_main_sha"
+            printf 'src/session.rs SHA-256=%s\n' "$actual_session_sha"
+            printf 'src/m4_checkpoint.rs SHA-256=%s\n' "$actual_checkpoint_module_sha"
+          } > runner-evidence/m4-m5-source-contract.log
           test "$head_sha" = "$GITHUB_SHA"
           test "$actual_m4_sha" = "$expected_m4_sha"
+          test "$actual_m5_sha" = "$expected_m5_sha"
+          test "$actual_checkpoint_sha" = "$expected_checkpoint_sha"
+          test "$actual_main_sha" = "$expected_main_sha"
+          test "$actual_session_sha" = "$expected_session_sha"
+          test "$actual_checkpoint_module_sha" = "$expected_checkpoint_module_sha"
       - name: Run full test suite on XFS reflink
         shell: bash
         run: |
@@ -535,10 +621,51 @@ jobs:
             exit 1
           fi
           printf 'no NOT_EXECUTED\n' >> runner-evidence/m4-not-executed.log
-          raw_attestation='M4 Linux raw-name positive parity attestation: uname=Linux; tests/m4_git_parity.rs SHA-256=8586ea1f031499eaf838ac7bc8c1ca6d8967889588ad5da55efc550c78a4aabb; ordinary_worktree_and_vws_have_git_parity_for_history_conflicts_and_paths observed; M4 summary=4 passed, 0 failed, 0 ignored, 0 filtered out'
+          raw_attestation='M4 Linux raw-name positive parity attestation: uname=Linux; tests/m4_git_parity.rs SHA-256=7444b18a0ade904f45f3b3ec4d663831017a5027a66eb146247737bcf424dd0d; ordinary_worktree_and_vws_have_git_parity_for_history_conflicts_and_paths observed; M4 summary=4 passed, 0 failed, 0 ignored, 0 filtered out'
           printf '%s\n' "$raw_attestation" > runner-evidence/m4-linux-raw-parity-attestation.log
           grep -Fx "$raw_attestation" runner-evidence/m4-linux-raw-parity-attestation.log
           test "$(wc -l < runner-evidence/m4-linux-raw-parity-attestation.log | tr -d ' ')" = 1
+      - name: Verify M5 publish evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > runner-evidence/m5-tests.log
+          grep -F 'test publish_authority_audit_fixed_oid_and_crash_prefix_contract ...' runner-evidence/tests.log | tee -a runner-evidence/m5-tests.log
+          grep -F 'test publish_conflicts_and_compare_and_swap_fences_are_terminal ...' runner-evidence/tests.log | tee -a runner-evidence/m5-tests.log
+          grep -F 'test publish_names_new_fast_forwards_and_private_objects_are_retained ...' runner-evidence/tests.log | tee -a runner-evidence/m5-tests.log
+          grep -F 'test publish_same_non_fast_forward_and_lease_preserve_lifecycle_contract ...' runner-evidence/tests.log | tee -a runner-evidence/m5-tests.log
+          test "$(wc -l < runner-evidence/m5-tests.log | tr -d ' ')" = 4
+          m5_summary='^test result: ok\. 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in .*$'
+          awk -v expected="$m5_summary" '
+            /Running.*tests\/m5_publish\.rs/ {
+              runs += 1
+              in_m5 = 1
+              next
+            }
+            in_m5 && /^test result:/ {
+              summaries += 1
+              if ($0 ~ expected) {
+                print
+                matches += 1
+              }
+              in_m5 = 0
+            }
+            END {
+              exit !(runs == 1 && summaries == 1 && matches == 1)
+            }
+          ' runner-evidence/tests.log | tee -a runner-evidence/m5-tests.log
+          grep -F 'M5 private_objects_retained=ok' runner-evidence/tests.log \
+            | tee runner-evidence/m5-private-objects.log
+          test "$(wc -l < runner-evidence/m5-private-objects.log | tr -d ' ')" = 1
+          if grep -nF 'NOT_EXECUTED' runner-evidence/tests.log > runner-evidence/m5-not-executed.log; then
+            cat runner-evidence/m5-not-executed.log
+            exit 1
+          fi
+          printf 'no NOT_EXECUTED\n' >> runner-evidence/m5-not-executed.log
+          {
+            printf 'M5 authority_audits=4\n'
+            printf 'M5 publish_checkpoints=23\n'
+          } > runner-evidence/m5-gates.log
       - name: Build and scan release binary
         shell: bash
         run: |
@@ -559,11 +686,16 @@ jobs:
           command -v nm | tee -a runner-evidence/release-tools.log
           strings "$release_binary" 2>&1 | tee runner-evidence/release-strings.log
           nm -a "$release_binary" 2>&1 | tee runner-evidence/release-nm.log
-          if grep -F -e 'M4CP/1' -e 'GIT_VWS_M4_CONTROL_FD' -e 'GIT_VWS_M4_NONCE' -e 'GIT_VWS_M4_TARGET' -e 'm4_checkpoint' runner-evidence/release-strings.log runner-evidence/release-nm.log > runner-evidence/release-m4-matches.log; then
+          if LC_ALL=C grep -aF -e 'M4CP/1' -e 'GIT_VWS_M4_CONTROL_FD' -e 'GIT_VWS_M4_NONCE' -e 'GIT_VWS_M4_TARGET' -e 'object-fetch-returned' -e 'cas-child-returned-success' -e 'cas-child-returned-nonzero' -e 'conflict-aborted-parent-synced' -e 'same-return' "$release_binary" > runner-evidence/release-m4-raw-matches.log; then
+            cat runner-evidence/release-m4-raw-matches.log
+            exit 1
+          fi
+          printf 'release raw checkpoint scan: no matches\n' >> runner-evidence/release-m4-raw-matches.log
+          if grep -F -e 'M4CP/1' -e 'GIT_VWS_M4_CONTROL_FD' -e 'GIT_VWS_M4_NONCE' -e 'GIT_VWS_M4_TARGET' -e 'm4_checkpoint' -e 'object-fetch-returned' -e 'cas-child-returned-success' -e 'cas-child-returned-nonzero' -e 'conflict-aborted-parent-synced' -e 'same-return' runner-evidence/release-strings.log runner-evidence/release-nm.log > runner-evidence/release-m4-matches.log; then
             cat runner-evidence/release-m4-matches.log
             exit 1
           fi
-          printf 'release M4 marker scan: no matches\n' >> runner-evidence/release-m4-matches.log
+          printf 'release checkpoint marker scan: no matches\n' >> runner-evidence/release-m4-matches.log
       - name: Verify Git extension entry point
         shell: bash
         run: |
