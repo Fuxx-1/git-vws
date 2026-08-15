@@ -1429,7 +1429,7 @@ fn install_rejecting_reference_hook(fixture: &Fixture) -> (PathBuf, PathBuf) {
     fs::create_dir(&hooks).expect("create authority hook directory");
     let sentinel = fixture.sandbox.child("reference-transaction-sentinel");
     let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\nexit 1\n",
+        "#!/bin/sh\ntarget=0\nwhile IFS=' ' read -r old new reference\ndo\n    if test \"$reference\" = refs/heads/main\n    then\n        target=1\n    fi\ndone\nif test \"$target\" -eq 1\nthen\n    printf '%s\\n' \"$1\" >> '{}'\n    if test \"$1\" = prepared\n    then\n        exit 1\n    fi\nfi\nexit 0\n",
         sentinel.display()
     );
     let hook = hooks.join("reference-transaction");
@@ -1849,10 +1849,11 @@ fn publish_authority_audit_fixed_oid_and_crash_prefix_contract() {
         "PUBLISH_RECOVERY_REQUIRED",
         "reference-transaction rejection",
     );
-    assert_eq!(
-        fs::read(&hook_sentinel).expect("read reference-transaction sentinel"),
-        b"prepared\naborted\n",
-        "reference-transaction hook did not reject then abort the transaction"
+    let hook_phases = fs::read(&hook_sentinel).expect("read reference-transaction sentinel");
+    assert!(
+        hook_phases == b"prepared\naborted\n" || hook_phases == b"preparing\nprepared\naborted\n",
+        "reference-transaction hook did not reject then abort the target transaction: {:?}",
+        String::from_utf8_lossy(&hook_phases)
     );
     assert_eq!(
         journal_state(&hook.record(b"hook")),

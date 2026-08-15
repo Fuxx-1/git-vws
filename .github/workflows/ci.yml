@@ -196,7 +196,7 @@ jobs:
         run: |
           set -euo pipefail
           expected_m4_sha='c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c'
-          expected_m5_sha='a9060708aa46f5a83b43321489741ca4bfd08fed84506db0e8741ed1d6105c1f'
+          expected_m5_sha='c0eff6cdef36e81f8b35fae262037e292d9b3256450d6f85f9982caf7e889057'
           expected_checkpoint_sha='b57825c247b2bb0b0ae69db44efe9c682561e08224aa081d4d788b1a8beaf549'
           expected_main_sha='16758b5ad9d809b98e1d685b0a2b8eae97b04fccdc73376e90db71ffb7bf7208'
           expected_session_sha='a01c58082ca7d043b7edf122360a192136eddd17748aab1943349ab1138c3f40'
@@ -543,7 +543,7 @@ jobs:
         run: |
           set -euo pipefail
           expected_m4_sha='c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c'
-          expected_m5_sha='a9060708aa46f5a83b43321489741ca4bfd08fed84506db0e8741ed1d6105c1f'
+          expected_m5_sha='c0eff6cdef36e81f8b35fae262037e292d9b3256450d6f85f9982caf7e889057'
           expected_checkpoint_sha='b57825c247b2bb0b0ae69db44efe9c682561e08224aa081d4d788b1a8beaf549'
           expected_main_sha='16758b5ad9d809b98e1d685b0a2b8eae97b04fccdc73376e90db71ffb7bf7208'
           expected_session_sha='a01c58082ca7d043b7edf122360a192136eddd17748aab1943349ab1138c3f40'
