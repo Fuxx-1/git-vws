@@ -1,0 +1,560 @@
+name: Release signer
+
+on:
+  workflow_call:
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+jobs:
+  sign:
+    name: Sign release provenance
+    runs-on: ubuntu-latest
+    environment: release-signing
+    env:
+      RELEASE_AWS_REGION: ${{ vars.RELEASE_AWS_REGION }}
+      RELEASE_AWS_ROLE_ARN: ${{ vars.RELEASE_AWS_ROLE_ARN }}
+      RELEASE_KMS_KEY_URI: ${{ vars.RELEASE_KMS_KEY_URI }}
+      RELEASE_TSA_URL: https://timestamp.sigstore.dev/api/v1/timestamp
+      RELEASE_TSA_START_TIME: 2025-07-04T00:00:00Z
+      RELEASE_TSA_OPERATOR: sigstore.dev
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          name: release-assembly
+          path: sign-input
+      - uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad
+        with:
+          cosign-release: v3.0.6
+      - name: Validate fixed inputs and construct statement
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_REPOSITORY: Fuxx-1/git-vws
+          EXPECTED_SIGNER_WORKFLOW: .github/workflows/release-sign.yml
+          EXPECTED_RELEASE_WORKFLOW: .github/workflows/release.yml
+          EXPECTED_CI_WORKFLOW: .github/workflows/ci.yml
+          EXPECTED_TSA_ROOT_SHA256: 90722cc723e7900555dee86a320acbf843933f49cb6636d33a18b76b62388138
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "$EXPECTED_REPOSITORY"
+          test "$GITHUB_EVENT_NAME" = push
+          test "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF"
+          test -n "$RELEASE_AWS_REGION"
+          test -n "$RELEASE_AWS_ROLE_ARN"
+          test -n "$RELEASE_KMS_KEY_URI"
+          case "$RELEASE_KMS_KEY_URI" in
+            awskms://*) ;;
+            *) exit 1 ;;
+          esac
+          test "$(find sign-input -mindepth 1 -maxdepth 1 -type d -print | sort)" = $'sign-input/assets\nsign-input/trust'
+          test -z "$(find sign-input -mindepth 1 -maxdepth 1 ! -type d -print -quit)"
+          test "$(find sign-input/trust -mindepth 1 -maxdepth 1 -type f -print | sort)" = $'sign-input/trust/kms-v1.pem\nsign-input/trust/tsa-trusted-root-v1.json'
+          test -z "$(find sign-input/trust -mindepth 1 -maxdepth 1 ! -type f -print -quit)"
+          test "$(sha256sum sign-input/trust/tsa-trusted-root-v1.json | awk '{print $1}')" = "$EXPECTED_TSA_ROOT_SHA256"
+
+          tag_name="$GITHUB_REF_NAME"
+          version="${tag_name#v}"
+          case "$version" in
+            *-*) ;;
+            *) exit 1 ;;
+          esac
+          tag_ref_json="$RUNNER_TEMP/tag-ref.json"
+          tag_json="$RUNNER_TEMP/tag.json"
+          repository_json="$RUNNER_TEMP/repository.json"
+          gh api "repos/$GITHUB_REPOSITORY" > "$repository_json"
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag_name" > "$tag_ref_json"
+          test "$(jq -r '.object.type' "$tag_ref_json")" = tag
+          tag_object_sha="$(jq -er '.object.sha' "$tag_ref_json")"
+          gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object_sha" > "$tag_json"
+          test "$(jq -r '.object.type' "$tag_json")" = commit
+          test "$(jq -er '.object.sha' "$tag_json")" = "$GITHUB_SHA"
+          pretag_run_id="$(jq -er '[.message | split("\n")[] | select(startswith("pretag_run_id="))] | if length == 1 then .[0] | split("=")[1] else error("pretag run id") end' "$tag_json")"
+          pretag_run_attempt="$(jq -er '[.message | split("\n")[] | select(startswith("pretag_run_attempt="))] | if length == 1 then .[0] | split("=")[1] else error("pretag run attempt") end' "$tag_json")"
+          case "$pretag_run_id" in
+            *[!0-9]*|'') exit 1 ;;
+          esac
+          case "$pretag_run_attempt" in
+            *[!0-9]*|'') exit 1 ;;
+          esac
+          expected_annotation="$(printf 'git-vws release\nversion=v%s\nsource_commit=%s\npretag_run_id=%s\npretag_run_attempt=%s' "$version" "$GITHUB_SHA" "$pretag_run_id" "$pretag_run_attempt")"
+          test "$(jq -er .message "$tag_json")" = "$expected_annotation"
+
+          pretag_run="$RUNNER_TEMP/pretag-run.json"
+          pretag_jobs="$RUNNER_TEMP/pretag-jobs.json"
+          posttag_run="$RUNNER_TEMP/posttag-run.json"
+          posttag_jobs="$RUNNER_TEMP/posttag-jobs.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$pretag_run_id/attempts/$pretag_run_attempt" > "$pretag_run"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$pretag_run_id/attempts/$pretag_run_attempt/jobs?per_page=100" > "$pretag_jobs"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" > "$posttag_run"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" > "$posttag_jobs"
+          jq -e --arg sha "$GITHUB_SHA" --arg attempt "$pretag_run_attempt" '
+            .path == ".github/workflows/ci.yml"
+            and .head_sha == $sha
+            and .head_branch == "main"
+            and .event == "push"
+            and .conclusion == "success"
+            and (.run_attempt | tostring) == $attempt
+          ' "$pretag_run" > /dev/null
+          jq -e --arg sha "$GITHUB_SHA" --arg branch "$GITHUB_REF_NAME" --arg attempt "$GITHUB_RUN_ATTEMPT" '
+            .path == ".github/workflows/release.yml"
+            and .head_sha == $sha
+            and .event == "push"
+            and .head_branch == $branch
+            and (.run_attempt | tostring) == $attempt
+          ' "$posttag_run" > /dev/null
+
+          release_workflow="$RUNNER_TEMP/release.yml"
+          gh api "repos/$GITHUB_REPOSITORY/contents/$EXPECTED_RELEASE_WORKFLOW?ref=$GITHUB_SHA" --jq .content | tr -d '\n' | base64 --decode > "$release_workflow"
+          workflow_digest="$(sha256sum "$release_workflow" | awk '{print $1}')"
+          signer_anchor="$(sed -nE 's|^[[:space:]]*uses:[[:space:]]*Fuxx-1/git-vws/\.github/workflows/release-sign\.yml@([0-9a-f]{40})[[:space:]]*$|\1|p' "$release_workflow")"
+          test "${#signer_anchor}" -eq 40
+          test "$(grep -Ec '^[[:space:]]*uses:[[:space:]]*Fuxx-1/git-vws/\.github/workflows/release-sign\.yml@' "$release_workflow")" -eq 1
+
+          oidc_response="$RUNNER_TEMP/oidc.json"
+          oidc_url="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com"
+          curl --fail --silent --show-error -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$oidc_url" > "$oidc_response"
+          oidc_token="$(jq -er .value "$oidc_response")"
+          env OIDC_TOKEN="$oidc_token" EXPECTED_REPOSITORY_ID="$(jq -r '.id | tostring' "$repository_json")" EXPECTED_SIGNER_SHA="$signer_anchor" EXPECTED_WORKFLOW_REF="$GITHUB_REPOSITORY/$EXPECTED_RELEASE_WORKFLOW@$GITHUB_REF" python3 - "$RUNNER_TEMP/oidc-claims.json" <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          import sys
+
+          token = os.environ["OIDC_TOKEN"]
+          parts = token.split(".")
+          if len(parts) != 3:
+              raise SystemExit("invalid GitHub OIDC token")
+          payload = parts[1] + "=" * (-len(parts[1]) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          required = [
+              "aud",
+              "sub",
+              "repository_id",
+              "ref",
+              "event_name",
+              "environment",
+              "runner_environment",
+              "actor_id",
+              "workflow_ref",
+              "workflow_sha",
+              "job_workflow_ref",
+              "job_workflow_sha",
+          ]
+          if any(not claims.get(key) for key in required):
+              raise SystemExit("GitHub OIDC token omitted a required claim")
+          if claims["aud"] != "sts.amazonaws.com":
+              raise SystemExit("GitHub OIDC audience is invalid")
+          if claims["repository_id"] != os.environ["EXPECTED_REPOSITORY_ID"]:
+              raise SystemExit("GitHub OIDC repository id is invalid")
+          if claims["ref"] != os.environ["GITHUB_REF"] or claims["event_name"] != "push":
+              raise SystemExit("GitHub OIDC tag identity is invalid")
+          if claims["environment"] != "release-signing":
+              raise SystemExit("GitHub OIDC environment identity is invalid")
+          if claims["runner_environment"] != "github-hosted":
+              raise SystemExit("GitHub OIDC runner identity is invalid")
+          if claims["actor_id"] != os.environ["GITHUB_ACTOR_ID"]:
+              raise SystemExit("GitHub OIDC actor identity is invalid")
+          if claims["workflow_ref"] != os.environ["EXPECTED_WORKFLOW_REF"]:
+              raise SystemExit("GitHub OIDC caller workflow ref is invalid")
+          if claims["workflow_sha"] != os.environ["GITHUB_SHA"]:
+              raise SystemExit("GitHub OIDC caller workflow SHA is invalid")
+          expected_signer_sha = os.environ["EXPECTED_SIGNER_SHA"]
+          if not re.fullmatch(r"[0-9a-f]{40}", expected_signer_sha):
+              raise SystemExit("release signer anchor is invalid")
+          if claims["job_workflow_sha"] != expected_signer_sha:
+              raise SystemExit("GitHub OIDC signer workflow SHA is invalid")
+          signer_ref = (
+              f"{os.environ['GITHUB_REPOSITORY']}/.github/workflows/"
+              f"release-sign.yml@{expected_signer_sha}"
+          )
+          if claims["job_workflow_ref"] != signer_ref:
+              raise SystemExit("GitHub OIDC reusable signer ref is invalid")
+          expected_sub = ":".join(
+              [
+                  f"repository_id:{claims['repository_id']}",
+                  f"ref:{claims['ref']}",
+                  f"event_name:{claims['event_name']}",
+                  f"environment:{claims['environment']}",
+                  f"runner_environment:{claims['runner_environment']}",
+                  f"actor_id:{claims['actor_id']}",
+                  f"workflow_ref:{claims['workflow_ref']}",
+                  f"workflow_sha:{claims['workflow_sha']}",
+                  f"job_workflow_ref:{claims['job_workflow_ref']}",
+                  f"job_workflow_sha:{claims['job_workflow_sha']}",
+              ]
+          )
+          if claims["sub"] != expected_sub:
+              raise SystemExit("GitHub OIDC subject claim order is invalid")
+          with open(sys.argv[1], "w", encoding="utf-8") as output:
+              json.dump(
+                  {
+                      "signerWorkflowSha": claims["job_workflow_sha"],
+                      "subject": claims["sub"],
+                  },
+                  output,
+                  sort_keys=True,
+              )
+          PY
+          unset oidc_token OIDC_TOKEN
+          signer_sha="$(jq -er .signerWorkflowSha "$RUNNER_TEMP/oidc-claims.json")"
+
+          jq -n --slurpfile run "$pretag_run" --slurpfile jobs "$pretag_jobs" --arg run_id "$pretag_run_id" --arg attempt "$pretag_run_attempt" '
+              def one($name):
+                [$jobs[0].jobs[] | select(.name == $name or (.name | endswith("/ " + $name)))] as $matches
+                | if $matches | length == 1 then
+                    $matches[0] as $job
+                    | {
+                        name: $name,
+                        id: ($job.id | tostring),
+                        conclusion: $job.conclusion,
+                        startedAt: $job.started_at,
+                        completedAt: $job.completed_at,
+                        runnerLabels: $job.labels
+                      }
+                  else error("missing or duplicate CI job " + $name)
+                  end;
+              {
+                workflowPath: ".github/workflows/ci.yml",
+                run: {
+                  id: $run_id,
+                  attempt: $attempt,
+                  headSha: $run[0].head_sha,
+                  event: $run[0].event,
+                  ref: ("refs/heads/" + $run[0].head_branch),
+                  conclusion: $run[0].conclusion
+                },
+                jobs: [
+                  "Quality",
+                  "Linux musl release build",
+                  "macOS APFS (aarch64-apple-darwin)",
+                  "macOS APFS (x86_64-apple-darwin)",
+                  "Linux XFS FICLONE/FIEMAP"
+                ] | map(one(.))
+              }
+            ' > "$RUNNER_TEMP/pretag-evidence.json"
+          jq -n --slurpfile run "$posttag_run" --slurpfile jobs "$posttag_jobs" --arg run_id "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" --arg tag_ref "$GITHUB_REF" '
+              def one($name):
+                [$jobs[0].jobs[] | select(.name == $name or (.name | endswith("/ " + $name)))] as $matches
+                | if $matches | length == 1 then
+                    $matches[0] as $job
+                    | {
+                        name: $name,
+                        id: ($job.id | tostring),
+                        conclusion: $job.conclusion,
+                        startedAt: $job.started_at,
+                        completedAt: $job.completed_at,
+                        runnerLabels: $job.labels
+                      }
+                  else error("missing or duplicate CI job " + $name)
+                  end;
+              {
+                workflowPath: ".github/workflows/ci.yml",
+                run: {
+                  id: $run_id,
+                  attempt: $attempt,
+                  headSha: $run[0].head_sha,
+                  event: $run[0].event,
+                  ref: $tag_ref
+                },
+                jobs: [
+                  "Quality",
+                  "Linux musl release build",
+                  "macOS APFS (aarch64-apple-darwin)",
+                  "macOS APFS (x86_64-apple-darwin)",
+                  "Linux XFS FICLONE/FIEMAP"
+                ] | map(one(.))
+              }
+            ' > "$RUNNER_TEMP/posttag-evidence.json"
+          jq -n --slurpfile pretag "$RUNNER_TEMP/pretag-evidence.json" --slurpfile posttag "$RUNNER_TEMP/posttag-evidence.json" --arg source_sha "$GITHUB_SHA" --arg tag_ref "$GITHUB_REF" --arg run_id "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" --arg signer_sha "$signer_sha" '{
+              schema: 1,
+              preTag: $pretag[0],
+              release: {
+                workflowPath: ".github/workflows/release.yml",
+                run: {
+                  id: $run_id,
+                  attempt: $attempt,
+                  headSha: $source_sha,
+                  event: "push",
+                  ref: $tag_ref
+                },
+                signer: {
+                  job: "sign",
+                  workflowPath: ".github/workflows/release-sign.yml",
+                  workflowSha: $signer_sha,
+                  runId: $run_id,
+                  attempt: $attempt,
+                  runnerEnvironment: "github-hosted"
+                },
+                postTagCi: $posttag[0]
+              }
+            }' > "$RUNNER_TEMP/release-evidence.json"
+
+          env TAG_OBJECT_SHA="$tag_object_sha" VERSION="$version" WORKFLOW_DIGEST="$workflow_digest" EVIDENCE_PATH="$RUNNER_TEMP/release-evidence.json" TRUSTED_ROOT_SHA256="$EXPECTED_TSA_ROOT_SHA256" python3 - sign-input/assets sign-input/trust/kms-v1.pem sign-input/trust/tsa-trusted-root-v1.json sign-input/PROVENANCE.intoto.json <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          assets = Path(sys.argv[1])
+          public_key = Path(sys.argv[2])
+          trusted_root = Path(sys.argv[3])
+          statement_path = Path(sys.argv[4])
+          version = os.environ["VERSION"]
+          source_sha = os.environ["GITHUB_SHA"]
+          tag_ref = os.environ["GITHUB_REF"]
+          tag_object = os.environ["TAG_OBJECT_SHA"]
+          workflow_digest = os.environ["WORKFLOW_DIGEST"]
+          evidence = json.load(open(os.environ["EVIDENCE_PATH"], encoding="utf-8"))
+          targets = [
+              "aarch64-apple-darwin",
+              "x86_64-apple-darwin",
+              "x86_64-unknown-linux-musl",
+          ]
+          prefix = f"git-vws-v{version}"
+          archives = {f"{prefix}-{target}.tar.gz" for target in targets}
+          expected = archives | {f"{name}.sha256" for name in archives} | {
+              "SHA256SUMS",
+              f"{prefix}.spdx.json",
+              "THIRD-PARTY-LICENSES.txt",
+              "BUILD-METADATA.json",
+          }
+          actual = {path.name for path in assets.iterdir()}
+          if actual != expected or any(
+              not path.is_file() or path.is_symlink() for path in assets.iterdir()
+          ):
+              raise SystemExit("unsigned release asset closure is invalid")
+
+          def sha256(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          manifest_members = sorted(expected - {"SHA256SUMS"})
+          manifest = "".join(
+              f"{sha256(assets / name)}  {name}\n" for name in manifest_members
+          )
+          if (assets / "SHA256SUMS").read_text(encoding="ascii") != manifest:
+              raise SystemExit("unsigned checksum manifest is invalid")
+          for archive in archives:
+              expected_line = f"{sha256(assets / archive)}  {archive}\n"
+              if (assets / f"{archive}.sha256").read_text(
+                  encoding="ascii"
+              ) != expected_line:
+                  raise SystemExit("per-archive checksum is invalid")
+
+          public_key_text = public_key.read_text(encoding="ascii")
+          if (
+              "\r" in public_key_text
+              or "PRIVATE KEY" in public_key_text
+              or not public_key_text.startswith("-----BEGIN PUBLIC KEY-----\n")
+              or not public_key_text.endswith("-----END PUBLIC KEY-----\n")
+          ):
+              raise SystemExit("KMS public key is invalid")
+          public_key_digest = sha256(public_key)
+          trusted_root_digest = sha256(trusted_root)
+          if trusted_root_digest != os.environ["TRUSTED_ROOT_SHA256"]:
+              raise SystemExit("RFC3161 TrustedRoot digest is invalid")
+          root = json.loads(trusted_root.read_text(encoding="utf-8"))
+          if set(root) != {"mediaType", "timestampAuthorities"}:
+              raise SystemExit("RFC3161 TrustedRoot envelope is invalid")
+          if (
+              root["mediaType"]
+              != "application/vnd.dev.sigstore.trustedroot+json;version=0.1"
+          ):
+              raise SystemExit("RFC3161 TrustedRoot media type is invalid")
+          authorities = root["timestampAuthorities"]
+          if not isinstance(authorities, list) or len(authorities) != 1:
+              raise SystemExit("RFC3161 TrustedRoot authority count is invalid")
+          authority = authorities[0]
+          if set(authority) != {"subject", "uri", "certChain", "validFor"}:
+              raise SystemExit("RFC3161 TrustedRoot contains unsupported material")
+          if authority["subject"] != {
+              "organization": "sigstore.dev",
+              "commonName": "sigstore-tsa-selfsigned",
+          }:
+              raise SystemExit("RFC3161 TrustedRoot subject is invalid")
+          if authority["uri"] != os.environ["RELEASE_TSA_URL"]:
+              raise SystemExit("RFC3161 TrustedRoot URI is invalid")
+          if authority["validFor"] != {"start": os.environ["RELEASE_TSA_START_TIME"]}:
+              raise SystemExit("RFC3161 TrustedRoot validity is invalid")
+          chain = authority["certChain"]
+          if set(chain) != {"certificates"} or len(chain["certificates"]) != 2:
+              raise SystemExit("RFC3161 TrustedRoot certificate chain is invalid")
+          for certificate in chain["certificates"]:
+              if set(certificate) != {"rawBytes"}:
+                  raise SystemExit("RFC3161 certificate entry is invalid")
+              if base64.b64decode(certificate["rawBytes"], validate=True)[0] != 0x30:
+                  raise SystemExit("RFC3161 certificate is not DER")
+          if not re.fullmatch(r"[0-9a-f]{64}", workflow_digest):
+              raise SystemExit("release workflow digest is invalid")
+          if not re.fullmatch(r"[0-9a-f]{40}", tag_object):
+              raise SystemExit("annotated tag object is invalid")
+
+          release = evidence["release"]
+          signer = release["signer"]
+          statement = {
+              "_type": "https://in-toto.io/Statement/v1",
+              "subject": [
+                  {"name": name, "digest": {"sha256": sha256(assets / name)}}
+                  for name in sorted(expected)
+              ],
+              "predicateType": "https://slsa.dev/provenance/v1",
+              "predicate": {
+                  "buildDefinition": {
+                      "buildType": (
+                          "https://github.com/Fuxx-1/git-vws/"
+                          ".github/workflows/release-sign.yml@v1"
+                      ),
+                      "externalParameters": {
+                          "version": version,
+                          "sourceCommit": source_sha,
+                          "sourceRef": tag_ref,
+                          "tagObject": tag_object,
+                      },
+                      "internalParameters": {
+                          "tagObject": tag_object,
+                          "workflow": {
+                              "path": ".github/workflows/release.yml",
+                              "sha256": workflow_digest,
+                          },
+                          "trust": {
+                              "publicKeyPath": ".github/release-trust/kms-v1.pem",
+                              "publicKeySha256": public_key_digest,
+                              "timestampTrustedRootPath": (
+                                  ".github/release-trust/"
+                                  "tsa-trusted-root-v1.json"
+                              ),
+                              "timestampTrustedRootSha256": trusted_root_digest,
+                          },
+                          "evidenceSchema": evidence["schema"],
+                          "preTagCi": evidence["preTag"],
+                          "release": release,
+                      },
+                      "resolvedDependencies": [
+                          {
+                              "uri": (
+                                  "git+https://github.com/Fuxx-1/git-vws@"
+                                  f"{tag_ref}"
+                              ),
+                              "digest": {"gitCommit": source_sha},
+                          }
+                      ],
+                  },
+                  "runDetails": {
+                      "builder": {
+                          "id": (
+                              "https://github.com/Fuxx-1/git-vws/"
+                              ".github/workflows/release-sign.yml@"
+                              + signer["workflowSha"]
+                          )
+                      },
+                      "metadata": {
+                          "invocationId": (
+                              "https://github.com/Fuxx-1/git-vws/actions/runs/"
+                              + release["run"]["id"]
+                              + "/attempts/"
+                              + release["run"]["attempt"]
+                          )
+                      },
+                      "byproducts": [],
+                  },
+              },
+          }
+          statement_path.write_text(
+              json.dumps(statement, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          signing_config_args=(
+            --no-default-fulcio
+            --no-default-rekor
+            --no-default-oidc
+            --no-default-tsa
+            --tsa "url=$RELEASE_TSA_URL,api-version=1,start-time=$RELEASE_TSA_START_TIME,operator=$RELEASE_TSA_OPERATOR"
+            --tsa-config EXACT:1
+            --out "$RUNNER_TEMP/signing-config.json"
+          )
+          cosign signing-config create "${signing_config_args[@]}"
+      - id: aws
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708
+        with:
+          aws-region: ${{ vars.RELEASE_AWS_REGION }}
+          role-to-assume: ${{ vars.RELEASE_AWS_ROLE_ARN }}
+          role-duration-seconds: 900
+          role-session-name: git-vws-release-${{ github.run_id }}
+          output-credentials: true
+          output-env-credentials: false
+          mask-aws-account-id: true
+      - name: Sign and verify exact release statement
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.aws.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.aws.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.aws.outputs.aws-session-token }}
+          AWS_REGION: ${{ vars.RELEASE_AWS_REGION }}
+          AWS_DEFAULT_REGION: ${{ vars.RELEASE_AWS_REGION }}
+        run: |
+          set -euo pipefail
+          signing_args=(
+            --key "$RELEASE_KMS_KEY_URI"
+            --statement sign-input/PROVENANCE.intoto.json
+            --type slsaprovenance1
+            --bundle sign-input/assets/PROVENANCE.sigstore.json
+            --signing-config "$RUNNER_TEMP/signing-config.json"
+            --yes
+          )
+          cosign attest-blob "${signing_args[@]}" sign-input/assets/SHA256SUMS
+          verification=(
+            --key sign-input/trust/kms-v1.pem
+            --bundle sign-input/assets/PROVENANCE.sigstore.json
+            --type slsaprovenance1
+            --private-infrastructure
+            --use-signed-timestamps
+            --trusted-root sign-input/trust/tsa-trusted-root-v1.json
+          )
+          for asset in sign-input/assets/*; do
+            if [ "$(basename "$asset")" = PROVENANCE.sigstore.json ]; then
+              continue
+            fi
+            cosign verify-blob-attestation "${verification[@]}" "$asset"
+          done
+          python3 - sign-input/assets/PROVENANCE.sigstore.json <<'PY'
+          import base64
+          import json
+          import sys
+
+          bundle = json.load(open(sys.argv[1], encoding="utf-8"))
+          if bundle.get("mediaType") != (
+              "application/vnd.dev.sigstore.bundle.v0.3+json"
+          ):
+              raise SystemExit("Sigstore bundle media type is invalid")
+          material = bundle.get("verificationMaterial")
+          if not isinstance(material, dict):
+              raise SystemExit("Sigstore verification material is invalid")
+          if set(material) != {"publicKey", "timestampVerificationData"}:
+              raise SystemExit("Sigstore bundle contains unsupported trust material")
+          timestamps = material["timestampVerificationData"].get(
+              "rfc3161Timestamps"
+          )
+          if not isinstance(timestamps, list) or len(timestamps) != 1:
+              raise SystemExit("Sigstore bundle timestamp count is invalid")
+          signed_timestamp = timestamps[0].get("signedTimestamp")
+          if not base64.b64decode(signed_timestamp, validate=True):
+              raise SystemExit("Sigstore bundle timestamp is invalid")
+          envelope = bundle.get("dsseEnvelope")
+          if envelope.get("payloadType") != "application/vnd.in-toto+json":
+              raise SystemExit("Sigstore bundle payload type is invalid")
+          if len(envelope.get("signatures", [])) != 1:
+              raise SystemExit("Sigstore bundle signature count is invalid")
+          PY
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        with:
+          name: release-signed
+          path: sign-input/assets
+          if-no-files-found: error
+          retention-days: 1

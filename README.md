@@ -33,7 +33,22 @@ Unsupported filesystems fail with `STORAGE_UNSUPPORTED`; `git-vws` does not sile
 
 ## Install
 
-Download the archive for your platform from the private repository's [Releases](https://github.com/Fuxx-1/git-vws/releases), verify it against `SHA256SUMS`, and place `git-vws` on `PATH`. Each release also includes per-archive checksums, an SPDX 2.3 SBOM, a third-party license inventory, build metadata, and GitHub artifact attestations.
+Download the archive for your platform from the private repository's [Releases](https://github.com/Fuxx-1/git-vws/releases), verify it against `SHA256SUMS`, and place `git-vws` on `PATH`. `SHA256SUMS` covers every unsigned release asset. Each release also includes per-archive checksums, an SPDX 2.3 SBOM, a third-party license inventory, build metadata, and `PROVENANCE.sigstore.json`.
+
+The provenance bundle is signed by a non-exportable AWS KMS P-256 key after a tag-specific GitHub Actions OIDC authorization and carries an RFC3161 timestamp. Obtain the public key and timestamp TrustedRoot from the same source tag at `.github/release-trust/kms-v1.pem` and `.github/release-trust/tsa-trusted-root-v1.json`, then verify each asset with Cosign 3.0.6 or newer:
+
+```sh
+cosign verify-blob-attestation \
+  --key kms-v1.pem \
+  --bundle PROVENANCE.sigstore.json \
+  --type slsaprovenance1 \
+  --private-infrastructure \
+  --use-signed-timestamps \
+  --trusted-root tsa-trusted-root-v1.json \
+  '<release-asset>'
+```
+
+The signed statement binds every release asset digest to the annotated tag, source commit, successful pre-tag and post-tag CI runs, immutable signer workflow revision, KMS public key, and timestamp trust root. No public identity log, public certificate service, GitHub-hosted attestation, or exportable signing key is used.
 
 After installation, Git discovers the binary as an external subcommand:
 
