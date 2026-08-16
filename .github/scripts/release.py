@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import datetime as dt
 import gzip
 import hashlib
@@ -19,6 +21,19 @@ from pathlib import Path, PurePosixPath
 
 PACKAGE = "git-vws"
 REPOSITORY = "https://github.com/Fuxx-1/git-vws"
+GITHUB_REPOSITORY = "Fuxx-1/git-vws"
+RELEASE_WORKFLOW = ".github/workflows/release.yml"
+SIGNER_WORKFLOW = ".github/workflows/release-sign.yml"
+CI_WORKFLOW = ".github/workflows/ci.yml"
+TRUST_PUBLIC_KEY = ".github/release-trust/kms-v1.pem"
+TRUST_TIMESTAMP_ROOT = ".github/release-trust/tsa-trusted-root-v1.json"
+TRUST_TIMESTAMP_ROOT_SHA256 = (
+    "90722cc723e7900555dee86a320acbf843933f49cb6636d33a18b76b62388138"
+)
+PROVENANCE_BUNDLE = "PROVENANCE.sigstore.json"
+IN_TOTO_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
+SLSA_PROVENANCE_TYPE = "https://slsa.dev/provenance/v1"
+SLSA_BUILD_TYPE = f"{REPOSITORY}/{SIGNER_WORKFLOW}@v1"
 LICENSE_FILES = ["README.md", "LICENSE", "LICENSE-MIT", "LICENSE-APACHE"]
 TARGETS = {
     "aarch64-apple-darwin": ("Darwin", "arm64"),
@@ -28,7 +43,20 @@ TARGETS = {
 VERSION_PATTERN = re.compile(
     r"[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z]+(?:[0-9A-Za-z.-]*[0-9A-Za-z])?"
 )
-SOURCE_SHA_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+SOURCE_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
+GIT_OBJECT_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+RFC3339_PATTERN = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z"
+)
+CI_JOB_NAMES = (
+    "Quality",
+    "Linux musl release build",
+    "macOS APFS (aarch64-apple-darwin)",
+    "macOS APFS (x86_64-apple-darwin)",
+    "Linux XFS FICLONE/FIEMAP",
+)
+SIGNER_PLACEHOLDER = "__" + "SIGNER_SHA" + "__"
 FORBIDDEN_MARKERS = [
     "M4CP/1",
     "GIT_VWS_M4_CONTROL_FD",
@@ -142,7 +170,7 @@ def build_fragment_name(version: str, target: str) -> str:
     return f"{package_prefix(version)}-{target}.build.json"
 
 
-def expected_release_assets(version: str) -> set[str]:
+def expected_unsigned_release_assets(version: str) -> set[str]:
     archives = {archive_name(version, target) for target in TARGETS}
     checksums = {f"{archive}.sha256" for archive in archives}
     return archives | checksums | {
@@ -151,6 +179,14 @@ def expected_release_assets(version: str) -> set[str]:
         "THIRD-PARTY-LICENSES.txt",
         "BUILD-METADATA.json",
     }
+
+
+def expected_release_assets(version: str) -> set[str]:
+    return expected_unsigned_release_assets(version) | {PROVENANCE_BUNDLE}
+
+
+def checksum_manifest_assets(version: str) -> set[str]:
+    return expected_unsigned_release_assets(version) - {"SHA256SUMS"}
 
 
 def cargo_metadata(root: Path) -> dict[str, object]:
@@ -481,6 +517,552 @@ def validate_common(directory: Path, version: str, source_sha: str) -> None:
         fail("release SBOM identity does not match the release source")
 
 
+def require_mapping(value: object, label: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        fail(f"{label} must be an object")
+    return value
+
+
+def require_string(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        fail(f"{label} must be a nonempty string")
+    return value
+
+
+def require_decimal(value: object, label: str) -> str:
+    value = require_string(value, label)
+    if not value.isdecimal() or int(value) <= 0:
+        fail(f"{label} must be a positive decimal identifier")
+    return value
+
+
+def require_sha256(value: object, label: str) -> str:
+    value = require_string(value, label)
+    if SHA256_PATTERN.fullmatch(value) is None:
+        fail(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def require_source_sha(value: object, label: str) -> str:
+    value = require_string(value, label)
+    if SOURCE_SHA_PATTERN.fullmatch(value) is None:
+        fail(f"{label} must be a Git object identifier")
+    return value
+
+
+def require_git_object_sha(value: object, label: str) -> str:
+    value = require_string(value, label)
+    if GIT_OBJECT_SHA_PATTERN.fullmatch(value) is None:
+        fail(f"{label} must be a 40-character Git object identifier")
+    return value
+
+
+def require_regular_file(path: Path, label: str) -> None:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        fail(f"{label} is absent: {path}")
+    if not stat.S_ISREG(mode):
+        fail(f"{label} is not a regular file: {path}")
+
+
+def release_files(directory: Path, label: str) -> set[str]:
+    if not directory.is_dir():
+        fail(f"{label} is not a directory: {directory}")
+    names = set()
+    for path in directory.iterdir():
+        require_regular_file(path, f"{label} member")
+        names.add(path.name)
+    return names
+
+
+def validate_pem(path: Path, label: str, marker: str) -> str:
+    require_regular_file(path, label)
+    try:
+        value = path.read_text(encoding="ascii")
+    except UnicodeDecodeError as error:
+        fail(f"{label} is not ASCII PEM: {error}")
+    if "\r" in value or "PRIVATE KEY" in value:
+        fail(f"{label} is not an allowed public trust file")
+    if not value.startswith(f"-----BEGIN {marker}-----\n") or not value.endswith(
+        f"-----END {marker}-----\n"
+    ):
+        fail(f"{label} is not canonical PEM")
+    return sha256_file(path)
+
+
+def validate_timestamp(value: object, label: str) -> dt.datetime:
+    value = require_string(value, label)
+    if RFC3339_PATTERN.fullmatch(value) is None:
+        fail(f"{label} is not a UTC RFC3339 timestamp")
+    try:
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        fail(f"{label} is not a valid timestamp: {error}")
+
+
+def validate_ci_jobs(value: object, label: str) -> list[dict[str, object]]:
+    if not isinstance(value, list) or len(value) != len(CI_JOB_NAMES):
+        fail(f"{label} must contain exactly five CI jobs")
+    by_name: dict[str, dict[str, object]] = {}
+    for item in value:
+        job = require_mapping(item, f"{label} job")
+        name = require_string(job.get("name"), f"{label} job name")
+        if name in by_name:
+            fail(f"{label} contains duplicate CI job {name}")
+        require_decimal(job.get("id"), f"{label} {name} id")
+        if job.get("conclusion") != "success":
+            fail(f"{label} {name} did not succeed")
+        started = validate_timestamp(job.get("startedAt"), f"{label} {name} start")
+        completed = validate_timestamp(job.get("completedAt"), f"{label} {name} completion")
+        if completed < started:
+            fail(f"{label} {name} completed before it started")
+        labels = job.get("runnerLabels")
+        if not isinstance(labels, list) or not labels:
+            fail(f"{label} {name} omitted runner labels")
+        if any(not isinstance(item, str) or not item for item in labels):
+            fail(f"{label} {name} has invalid runner labels")
+        if len(set(labels)) != len(labels):
+            fail(f"{label} {name} has duplicate runner labels")
+        by_name[name] = job
+    if set(by_name) != set(CI_JOB_NAMES):
+        fail(f"{label} CI job set is invalid")
+    return [by_name[name] for name in CI_JOB_NAMES]
+
+
+def validate_pretag_evidence(
+    value: object,
+    source_sha: str,
+    expected_run_id: str | None = None,
+    expected_run_attempt: str | None = None,
+) -> dict[str, object]:
+    evidence = require_mapping(value, "pre-tag CI evidence")
+    if evidence.get("workflowPath") != CI_WORKFLOW:
+        fail("pre-tag CI workflow path is invalid")
+    run = require_mapping(evidence.get("run"), "pre-tag CI run")
+    run_id = require_decimal(run.get("id"), "pre-tag CI run id")
+    run_attempt = require_decimal(run.get("attempt"), "pre-tag CI run attempt")
+    if expected_run_id is not None and run_id != expected_run_id:
+        fail("pre-tag CI run id does not match the annotated tag")
+    if expected_run_attempt is not None and run_attempt != expected_run_attempt:
+        fail("pre-tag CI attempt does not match the annotated tag")
+    if run.get("headSha") != source_sha:
+        fail("pre-tag CI source commit is invalid")
+    if run.get("event") != "push" or run.get("ref") != "refs/heads/main":
+        fail("pre-tag CI must be the main push workflow")
+    if run.get("conclusion") != "success":
+        fail("pre-tag CI workflow did not succeed")
+    return {
+        "workflowPath": CI_WORKFLOW,
+        "run": {
+            "id": run_id,
+            "attempt": run_attempt,
+            "headSha": source_sha,
+            "event": "push",
+            "ref": "refs/heads/main",
+            "conclusion": "success",
+        },
+        "jobs": validate_ci_jobs(evidence.get("jobs"), "pre-tag CI"),
+    }
+
+
+def validate_release_evidence(
+    value: object,
+    source_sha: str,
+    tag_ref: str,
+    pretag_run_id: str,
+    pretag_run_attempt: str,
+) -> dict[str, object]:
+    evidence = require_mapping(value, "release evidence")
+    if evidence.get("schema") != 1:
+        fail("release evidence schema is invalid")
+    pretag = validate_pretag_evidence(
+        evidence.get("preTag"), source_sha, pretag_run_id, pretag_run_attempt
+    )
+    release = require_mapping(evidence.get("release"), "release evidence run")
+    if release.get("workflowPath") != RELEASE_WORKFLOW:
+        fail("release workflow path is invalid")
+    run = require_mapping(release.get("run"), "release workflow run")
+    run_id = require_decimal(run.get("id"), "release workflow run id")
+    run_attempt = require_decimal(run.get("attempt"), "release workflow run attempt")
+    if run.get("headSha") != source_sha or run.get("event") != "push":
+        fail("release workflow source identity is invalid")
+    if run.get("ref") != tag_ref:
+        fail("release workflow ref is invalid")
+
+    signer = require_mapping(release.get("signer"), "release signer")
+    if signer.get("job") != "sign" or signer.get("workflowPath") != SIGNER_WORKFLOW:
+        fail("release signer identity is invalid")
+    signer_sha = require_git_object_sha(
+        signer.get("workflowSha"), "release signer workflow SHA"
+    )
+    if signer.get("runId") != run_id or signer.get("attempt") != run_attempt:
+        fail("release signer attempt is not bound to the release run")
+    if signer.get("runnerEnvironment") != "github-hosted":
+        fail("release signer is not GitHub-hosted")
+
+    posttag = require_mapping(release.get("postTagCi"), "post-tag CI evidence")
+    if posttag.get("workflowPath") != CI_WORKFLOW:
+        fail("post-tag CI workflow path is invalid")
+    posttag_run = require_mapping(posttag.get("run"), "post-tag CI run")
+    if (
+        posttag_run.get("id") != run_id
+        or posttag_run.get("attempt") != run_attempt
+        or posttag_run.get("headSha") != source_sha
+        or posttag_run.get("event") != "push"
+        or posttag_run.get("ref") != tag_ref
+    ):
+        fail("post-tag CI is not bound to the release run")
+    return {
+        "schema": 1,
+        "preTag": pretag,
+        "release": {
+            "workflowPath": RELEASE_WORKFLOW,
+            "run": {
+                "id": run_id,
+                "attempt": run_attempt,
+                "headSha": source_sha,
+                "event": "push",
+                "ref": tag_ref,
+            },
+            "signer": {
+                "job": "sign",
+                "workflowPath": SIGNER_WORKFLOW,
+                "workflowSha": signer_sha,
+                "runId": run_id,
+                "attempt": run_attempt,
+                "runnerEnvironment": "github-hosted",
+            },
+            "postTagCi": {
+                "workflowPath": CI_WORKFLOW,
+                "run": {
+                    "id": run_id,
+                    "attempt": run_attempt,
+                    "headSha": source_sha,
+                    "event": "push",
+                    "ref": tag_ref,
+                },
+                "jobs": validate_ci_jobs(posttag.get("jobs"), "post-tag CI"),
+            },
+        },
+    }
+
+
+def decode_base64_field(value: object, label: str) -> bytes:
+    if not isinstance(value, str) or not value:
+        fail(f"Sigstore bundle omitted {label}")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as error:
+        fail(f"Sigstore bundle has invalid {label}: {error}")
+    if not decoded:
+        fail(f"Sigstore bundle has empty {label}")
+    return decoded
+
+
+def validate_timestamp_trusted_root(path: Path) -> str:
+    require_regular_file(path, "RFC3161 TrustedRoot")
+    digest = sha256_file(path)
+    if digest != TRUST_TIMESTAMP_ROOT_SHA256:
+        fail("RFC3161 TrustedRoot digest is invalid")
+    root = require_mapping(read_json(path), "RFC3161 TrustedRoot")
+    if set(root) != {"mediaType", "timestampAuthorities"} or root.get(
+        "mediaType"
+    ) != "application/vnd.dev.sigstore.trustedroot+json;version=0.1":
+        fail("RFC3161 TrustedRoot envelope is invalid")
+    authorities = root.get("timestampAuthorities")
+    if not isinstance(authorities, list) or len(authorities) != 1:
+        fail("RFC3161 TrustedRoot must contain exactly one timestamp authority")
+    authority = require_mapping(authorities[0], "RFC3161 timestamp authority")
+    if set(authority) != {"subject", "uri", "certChain", "validFor"}:
+        fail("RFC3161 timestamp authority contains unsupported material")
+    if authority.get("subject") != {
+        "organization": "sigstore.dev",
+        "commonName": "sigstore-tsa-selfsigned",
+    }:
+        fail("RFC3161 timestamp authority subject is invalid")
+    if authority.get("uri") != "https://timestamp.sigstore.dev/api/v1/timestamp":
+        fail("RFC3161 timestamp authority URI is invalid")
+    if authority.get("validFor") != {"start": "2025-07-04T00:00:00Z"}:
+        fail("RFC3161 timestamp authority validity is invalid")
+    chain = require_mapping(authority.get("certChain"), "RFC3161 certificate chain")
+    if set(chain) != {"certificates"}:
+        fail("RFC3161 certificate chain is invalid")
+    certificates = chain.get("certificates")
+    if not isinstance(certificates, list) or len(certificates) != 2:
+        fail("RFC3161 TrustedRoot certificate count is invalid")
+    for index, certificate_value in enumerate(certificates):
+        certificate = require_mapping(
+            certificate_value, f"RFC3161 certificate {index}"
+        )
+        if set(certificate) != {"rawBytes"}:
+            fail("RFC3161 TrustedRoot certificate entry is invalid")
+        der = decode_base64_field(
+            certificate.get("rawBytes"), f"RFC3161 certificate {index}"
+        )
+        if der[0] != 0x30:
+            fail("RFC3161 TrustedRoot certificate is not DER")
+    return digest
+
+
+def validate_release_context(args: argparse.Namespace) -> None:
+    validate_release_identity(args.version, args.source_sha)
+    if args.tag_ref != f"refs/tags/v{args.version}":
+        fail(f"release tag ref does not match version: {args.tag_ref}")
+    require_git_object_sha(args.tag_object_sha, "annotated tag object SHA")
+    require_sha256(args.workflow_digest, "release workflow digest")
+    require_decimal(args.pretag_run_id, "annotated pre-tag run id")
+    require_decimal(args.pretag_run_attempt, "annotated pre-tag run attempt")
+
+
+def provenance_subjects(directory: Path, version: str) -> list[dict[str, object]]:
+    expected = expected_unsigned_release_assets(version)
+    actual = release_files(directory, "unsigned release asset directory")
+    if actual != expected | {PROVENANCE_BUNDLE}:
+        fail(
+            "signed release asset set mismatch while validating subjects: "
+            f"actual={sorted(actual)} expected={sorted(expected | {PROVENANCE_BUNDLE})}"
+        )
+    return [
+        {"name": name, "digest": {"sha256": sha256_file(directory / name)}}
+        for name in sorted(expected)
+    ]
+
+
+def validate_provenance_statement(
+    args: argparse.Namespace, directory: Path, statement: object
+) -> dict[str, object]:
+    statement = require_mapping(statement, "SLSA statement")
+    if statement.get("_type") != IN_TOTO_STATEMENT_TYPE:
+        fail("SLSA statement type is invalid")
+    if statement.get("predicateType") != SLSA_PROVENANCE_TYPE:
+        fail("SLSA predicate type is invalid")
+    subjects = statement.get("subject")
+    if subjects != provenance_subjects(directory, args.version):
+        fail("SLSA subjects do not match every unsigned release asset")
+
+    predicate = require_mapping(statement.get("predicate"), "SLSA predicate")
+    definition = require_mapping(predicate.get("buildDefinition"), "SLSA build definition")
+    if definition.get("buildType") != SLSA_BUILD_TYPE:
+        fail("SLSA build type is invalid")
+    expected_parameters = {
+        "version": args.version,
+        "sourceCommit": args.source_sha,
+        "sourceRef": args.tag_ref,
+        "tagObject": args.tag_object_sha,
+    }
+    if definition.get("externalParameters") != expected_parameters:
+        fail("SLSA external parameters are invalid")
+
+    public_key_path = Path(args.public_key)
+    if not public_key_path.is_file():
+        fail(
+            "HOST_SETUP_REQUIRED: provision the KMS public key at "
+            f"{TRUST_PUBLIC_KEY} before releasing"
+        )
+    public_key_digest = validate_pem(public_key_path, "KMS public key", "PUBLIC KEY")
+    timestamp_root_path = Path(args.trusted_root)
+    timestamp_root_digest = validate_timestamp_trusted_root(timestamp_root_path)
+    policy = require_mapping(definition.get("internalParameters"), "release policy")
+    if policy.get("tagObject") != args.tag_object_sha:
+        fail("release policy tag object is invalid")
+    if policy.get("workflow") != {
+        "path": RELEASE_WORKFLOW,
+        "sha256": args.workflow_digest,
+    }:
+        fail("release policy workflow digest is invalid")
+    if policy.get("trust") != {
+        "publicKeyPath": TRUST_PUBLIC_KEY,
+        "publicKeySha256": public_key_digest,
+        "timestampTrustedRootPath": TRUST_TIMESTAMP_ROOT,
+        "timestampTrustedRootSha256": timestamp_root_digest,
+    }:
+        fail("release policy trust material is invalid")
+    evidence = validate_release_evidence(
+        {
+            "schema": policy.get("evidenceSchema"),
+            "preTag": policy.get("preTagCi"),
+            "release": policy.get("release"),
+        },
+        args.source_sha,
+        args.tag_ref,
+        args.pretag_run_id,
+        args.pretag_run_attempt,
+    )
+    expected_dependencies = [
+        {
+            "uri": f"git+{REPOSITORY}@{args.tag_ref}",
+            "digest": {"gitCommit": args.source_sha},
+        }
+    ]
+    if definition.get("resolvedDependencies") != expected_dependencies:
+        fail("SLSA resolved dependency is invalid")
+
+    details = require_mapping(predicate.get("runDetails"), "SLSA run details")
+    signer = evidence["release"]["signer"]
+    assert isinstance(signer, dict)
+    expected_builder = (
+        f"https://github.com/{GITHUB_REPOSITORY}/{SIGNER_WORKFLOW}@"
+        f"{signer['workflowSha']}"
+    )
+    if details.get("builder") != {"id": expected_builder}:
+        fail("SLSA builder identity is invalid")
+    release_run = evidence["release"]["run"]
+    assert isinstance(release_run, dict)
+    expected_invocation = (
+        f"https://github.com/{GITHUB_REPOSITORY}/actions/runs/{release_run['id']}"
+        f"/attempts/{release_run['attempt']}"
+    )
+    if details.get("metadata") != {"invocationId": expected_invocation}:
+        fail("SLSA invocation identity is invalid")
+    if details.get("byproducts") != []:
+        fail("SLSA byproducts must be empty")
+    return evidence
+
+
+def validate_provenance_bundle(
+    args: argparse.Namespace, directory: Path
+) -> dict[str, object]:
+    bundle = read_json(directory / PROVENANCE_BUNDLE)
+    if not isinstance(bundle, dict) or bundle.get("mediaType") != (
+        "application/vnd.dev.sigstore.bundle.v0.3+json"
+    ):
+        fail("Sigstore provenance bundle media type is invalid")
+    material = require_mapping(bundle.get("verificationMaterial"), "Sigstore material")
+    if "certificate" in material:
+        fail("KMS provenance bundle must not contain an X.509 certificate")
+    if not isinstance(material.get("publicKey"), dict):
+        fail("KMS provenance bundle omitted public-key material")
+    if material.get("tlogEntries", []) != []:
+        fail("KMS provenance bundle must not contain transparency-log entries")
+    timestamp_data = require_mapping(
+        material.get("timestampVerificationData"), "RFC3161 timestamp data"
+    )
+    timestamps = timestamp_data.get("rfc3161Timestamps")
+    if not isinstance(timestamps, list) or len(timestamps) != 1:
+        fail("KMS provenance bundle must contain exactly one RFC3161 timestamp")
+    timestamp = require_mapping(timestamps[0], "RFC3161 timestamp")
+    decode_base64_field(timestamp.get("signedTimestamp"), "RFC3161 signed timestamp")
+
+    envelope = require_mapping(bundle.get("dsseEnvelope"), "DSSE envelope")
+    if envelope.get("payloadType") != "application/vnd.in-toto+json":
+        fail("Sigstore provenance bundle omitted in-toto DSSE envelope")
+    signatures = envelope.get("signatures")
+    if not isinstance(signatures, list) or len(signatures) != 1:
+        fail("Sigstore provenance bundle must contain exactly one DSSE signature")
+    signature = require_mapping(signatures[0], "DSSE signature")
+    decode_base64_field(signature.get("sig"), "DSSE signature")
+    payload = decode_base64_field(envelope.get("payload"), "DSSE payload")
+    try:
+        statement = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"Sigstore provenance statement is invalid: {error}")
+    return validate_provenance_statement(args, directory, statement)
+
+
+def verify_provenance(args: argparse.Namespace) -> dict[str, object]:
+    validate_release_context(args)
+    directory = Path(args.directory).resolve()
+    actual = release_files(directory, "signed release asset directory")
+    expected = expected_release_assets(args.version)
+    if actual != expected:
+        fail(
+            "release provenance asset set mismatch: "
+            f"actual={sorted(actual)} expected={sorted(expected)}"
+        )
+    return validate_provenance_bundle(args, directory)
+
+
+def signer_context(args: argparse.Namespace) -> None:
+    evidence = verify_provenance(args)
+    signer = evidence["release"]["signer"]
+    assert isinstance(signer, dict)
+    print(f"SIGNER_RUN_ID={signer['runId']}")
+    print(f"SIGNER_RUN_ATTEMPT={signer['attempt']}")
+    print(f"SIGNER_WORKFLOW_SHA={signer['workflowSha']}")
+
+
+def validate_pretag(args: argparse.Namespace) -> None:
+    validate_release_identity(args.version, args.source_sha)
+    require_decimal(args.pretag_run_id, "annotated pre-tag run id")
+    require_decimal(args.pretag_run_attempt, "annotated pre-tag run attempt")
+    canonical = validate_pretag_evidence(
+        read_json(Path(args.input)),
+        args.source_sha,
+        args.pretag_run_id,
+        args.pretag_run_attempt,
+    )
+    write_json(Path(args.output), canonical)
+
+
+def validate_tag(args: argparse.Namespace) -> None:
+    validate_release_identity(args.version, args.source_sha)
+    if args.tag_ref != f"refs/tags/v{args.version}":
+        fail(f"release tag ref does not match version: {args.tag_ref}")
+    tag_object_sha = require_git_object_sha(
+        args.tag_object_sha, "annotated tag object SHA"
+    )
+    annotation_path = Path(args.annotation)
+    require_regular_file(annotation_path, "annotated tag message")
+    try:
+        annotation = annotation_path.read_text(encoding="ascii")
+    except UnicodeDecodeError as error:
+        fail(f"annotated tag message is not ASCII: {error}")
+    if annotation.endswith("\n"):
+        annotation = annotation[:-1]
+    fields = {}
+    for line in annotation.split("\n"):
+        if "=" in line:
+            key, value = line.split("=", 1)
+            if key in fields:
+                fail(f"annotated tag duplicated {key}")
+            fields[key] = value
+    pretag_run_id = require_decimal(fields.get("pretag_run_id"), "annotated pre-tag run id")
+    pretag_run_attempt = require_decimal(
+        fields.get("pretag_run_attempt"), "annotated pre-tag run attempt"
+    )
+    expected = "\n".join(
+        [
+            "git-vws release",
+            f"version=v{args.version}",
+            f"source_commit={args.source_sha}",
+            f"pretag_run_id={pretag_run_id}",
+            f"pretag_run_attempt={pretag_run_attempt}",
+        ]
+    )
+    if annotation != expected:
+        fail("annotated tag message is not the exact release contract")
+    workflow_path = Path(args.workflow_file)
+    require_regular_file(workflow_path, "release workflow")
+    workflow = workflow_path.read_text(encoding="utf-8")
+    if workflow.count(SIGNER_PLACEHOLDER) != 0:
+        if workflow.count(SIGNER_PLACEHOLDER) != 1:
+            fail("release signer placeholder must occur exactly once")
+        fail(
+            "HOST_SETUP_REQUIRED: replace the release signer anchor placeholder "
+            "with the first immutable signer commit SHA"
+        )
+    matches = re.findall(
+        r"^\s*uses:\s*Fuxx-1/git-vws/\.github/workflows/release-sign\.yml@([^\s#]+)\s*$",
+        workflow,
+        flags=re.MULTILINE,
+    )
+    if len(matches) != 1 or GIT_OBJECT_SHA_PATTERN.fullmatch(matches[0]) is None:
+        fail("release signer workflow must be pinned to one complete commit SHA")
+    write_json(
+        Path(args.output),
+        {
+            "version": args.version,
+            "source_sha": args.source_sha,
+            "tag_ref": args.tag_ref,
+            "tag_object_sha": tag_object_sha,
+            "pretag_run_id": pretag_run_id,
+            "pretag_run_attempt": pretag_run_attempt,
+            "signer_workflow_sha": matches[0],
+        },
+    )
+
+
 def assemble(args: argparse.Namespace) -> None:
     validate_release_identity(args.version, args.source_sha)
     directory = Path(args.directory).resolve()
@@ -515,7 +1097,6 @@ def assemble(args: argparse.Namespace) -> None:
     }
     write_json(directory / "BUILD-METADATA.json", combined)
 
-    lines = []
     for target in sorted(TARGETS):
         archive = directory / archive_name(args.version, target)
         digest = sha256_file(archive)
@@ -523,12 +1104,22 @@ def assemble(args: argparse.Namespace) -> None:
         expected = f"{digest}  {archive.name}\n"
         if checksum.read_text(encoding="ascii") != expected:
             fail(f"per-archive checksum is invalid: {checksum.name}")
-        lines.append(expected.rstrip("\n"))
-    (directory / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="ascii")
     for target in TARGETS:
         (directory / build_fragment_name(args.version, target)).unlink()
     actual = {path.name for path in directory.iterdir() if path.is_file()}
-    expected = expected_release_assets(args.version)
+    checksum_assets = checksum_manifest_assets(args.version)
+    if actual != checksum_assets:
+        fail(
+            "pre-checksum asset set mismatch: "
+            f"actual={sorted(actual)} expected={sorted(checksum_assets)}"
+        )
+    lines = [
+        f"{sha256_file(directory / name)}  {name}"
+        for name in sorted(checksum_assets)
+    ]
+    (directory / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="ascii")
+    actual = {path.name for path in directory.iterdir() if path.is_file()}
+    expected = expected_unsigned_release_assets(args.version)
     if actual != expected:
         fail(f"assembled asset set mismatch: actual={sorted(actual)} expected={sorted(expected)}")
 
@@ -579,13 +1170,21 @@ def archive_entries(
 def verify_assets(args: argparse.Namespace) -> None:
     validate_release_identity(args.version, args.source_sha)
     directory = Path(args.directory).resolve()
-    actual = {path.name for path in directory.iterdir() if path.is_file()}
+    actual = release_files(directory, "signed release asset directory")
     expected = expected_release_assets(args.version)
     if actual != expected:
         fail(f"release asset set mismatch: actual={sorted(actual)} expected={sorted(expected)}")
     validate_common(directory, args.version, args.source_sha)
 
-    sums = []
+    expected_sums = [
+        f"{sha256_file(directory / name)}  {name}"
+        for name in sorted(checksum_manifest_assets(args.version))
+    ]
+    if (directory / "SHA256SUMS").read_text(encoding="ascii") != (
+        "\n".join(expected_sums) + "\n"
+    ):
+        fail("combined checksum manifest is invalid")
+
     archive_payloads: dict[str, dict[str, bytes]] = {}
     for target in sorted(TARGETS):
         archive = directory / archive_name(args.version, target)
@@ -596,7 +1195,6 @@ def verify_assets(args: argparse.Namespace) -> None:
         )
         if checksum != expected_line + "\n":
             fail(f"checksum file does not match archive: {archive.name}")
-        sums.append(expected_line)
         payloads, _ = archive_entries(archive, args.version, target)
         top = f"{package_prefix(args.version)}-{target}"
         if payloads[f"{top}/THIRD-PARTY-LICENSES.txt"] != (
@@ -608,9 +1206,6 @@ def verify_assets(args: argparse.Namespace) -> None:
         ).read_bytes():
             fail(f"archive SBOM drifted for {target}")
         archive_payloads[target] = payloads
-    if (directory / "SHA256SUMS").read_text(encoding="ascii") != "\n".join(sums) + "\n":
-        fail("combined checksum manifest is invalid")
-
     combined = read_json(directory / "BUILD-METADATA.json")
     if (
         not isinstance(combined, dict)
@@ -648,6 +1243,8 @@ def verify_assets(args: argparse.Namespace) -> None:
         ) != args.source_sha:
             fail(f"embedded build metadata drifted for {target}")
 
+    validate_provenance_bundle(args, directory)
+
     selected = args.target
     if selected not in TARGETS:
         fail(f"unsupported verification target: {selected}")
@@ -671,6 +1268,16 @@ def verify_assets(args: argparse.Namespace) -> None:
         for name in LICENSE_FILES:
             if not (root / name).is_file():
                 fail(f"release archive omitted {name}")
+
+
+def add_release_contract_arguments(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--tag-ref", required=True)
+    command.add_argument("--tag-object-sha", required=True)
+    command.add_argument("--workflow-digest", required=True)
+    command.add_argument("--pretag-run-id", required=True)
+    command.add_argument("--pretag-run-attempt", required=True)
+    command.add_argument("--public-key", required=True)
+    command.add_argument("--trusted-root", required=True)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -702,11 +1309,45 @@ def parser() -> argparse.ArgumentParser:
     assembled.add_argument("--source-sha", required=True)
     assembled.set_defaults(function=assemble)
 
+    provenance_verify = subcommands.add_parser("verify-provenance")
+    provenance_verify.add_argument("--directory", required=True)
+    provenance_verify.add_argument("--version", required=True)
+    provenance_verify.add_argument("--source-sha", required=True)
+    add_release_contract_arguments(provenance_verify)
+    provenance_verify.set_defaults(function=verify_provenance)
+
+    signer = subcommands.add_parser("signer-context")
+    signer.add_argument("--directory", required=True)
+    signer.add_argument("--version", required=True)
+    signer.add_argument("--source-sha", required=True)
+    add_release_contract_arguments(signer)
+    signer.set_defaults(function=signer_context)
+
+    pretag = subcommands.add_parser("validate-pretag")
+    pretag.add_argument("--input", required=True)
+    pretag.add_argument("--output", required=True)
+    pretag.add_argument("--version", required=True)
+    pretag.add_argument("--source-sha", required=True)
+    pretag.add_argument("--pretag-run-id", required=True)
+    pretag.add_argument("--pretag-run-attempt", required=True)
+    pretag.set_defaults(function=validate_pretag)
+
+    tag = subcommands.add_parser("validate-tag")
+    tag.add_argument("--version", required=True)
+    tag.add_argument("--source-sha", required=True)
+    tag.add_argument("--tag-ref", required=True)
+    tag.add_argument("--tag-object-sha", required=True)
+    tag.add_argument("--annotation", required=True)
+    tag.add_argument("--workflow-file", required=True)
+    tag.add_argument("--output", required=True)
+    tag.set_defaults(function=validate_tag)
+
     verify = subcommands.add_parser("verify")
     verify.add_argument("--directory", required=True)
     verify.add_argument("--version", required=True)
     verify.add_argument("--source-sha", required=True)
     verify.add_argument("--target", required=True)
+    add_release_contract_arguments(verify)
     verify.set_defaults(function=verify_assets)
     return result
 

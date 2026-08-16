@@ -6,7 +6,6 @@ on:
 
 permissions:
   contents: read
-  attestations: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -18,21 +17,30 @@ env:
 
 jobs:
   validate-tag:
-    name: Validate release tag
+    name: Validate annotated release contract
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     outputs:
-      version: ${{ steps.version.outputs.version }}
-      source-date-epoch: ${{ steps.version.outputs.source-date-epoch }}
+      version: ${{ steps.contract.outputs.version }}
+      source-date-epoch: ${{ steps.contract.outputs.source-date-epoch }}
+      tag-object-sha: ${{ steps.contract.outputs.tag-object-sha }}
+      pretag-run-id: ${{ steps.contract.outputs.pretag-run-id }}
+      pretag-run-attempt: ${{ steps.contract.outputs.pretag-run-attempt }}
+      workflow-digest: ${{ steps.contract.outputs.workflow-digest }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           fetch-depth: 0
           persist-credentials: false
           set-safe-directory: false
-      - uses: dtolnay/rust-toolchain@1.85.0
-      - id: version
-        name: Match tag, package version, and commit
+      - uses: dtolnay/rust-toolchain@bc540ba06a4ccee415bb241490e0b25ee8e7d315
+      - id: contract
+        name: Validate tag, source, signer anchor, and pre-tag CI
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           version="$(python3 -c 'import json,subprocess; data=json.loads(subprocess.check_output(["cargo","metadata","--locked","--no-deps","--format-version","1"])); print(data["packages"][0]["version"])')"
@@ -41,12 +49,85 @@ jobs:
             exit 1
           fi
           test "$GITHUB_REF_NAME" = "v$version"
-          tagged="$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")"
-          test "$tagged" = "$GITHUB_SHA"
-          epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          tag_ref="refs/tags/$GITHUB_REF_NAME"
+          test "$(git cat-file -t "$tag_ref")" = tag
+          tag_object_sha="$(git rev-parse "$tag_ref")"
+          source_sha="$(git rev-parse "$tag_ref^{commit}")"
+          test "$source_sha" = "$GITHUB_SHA"
+          epoch="$(git show -s --format=%ct "$source_sha")"
           test "$epoch" -gt 0
+          annotation="$RUNNER_TEMP/tag-annotation.txt"
+          git cat-file tag "$tag_object_sha" | sed '1,/^$/d' > "$annotation"
+          workflow_digest="$(sha256sum .github/workflows/release.yml | awk '{print $1}')"
+          python3 .github/scripts/release.py validate-tag \
+            --version "$version" \
+            --source-sha "$source_sha" \
+            --tag-ref "$tag_ref" \
+            --tag-object-sha "$tag_object_sha" \
+            --annotation "$annotation" \
+            --workflow-file .github/workflows/release.yml \
+            --output "$RUNNER_TEMP/tag-contract.json"
+          pretag_run_id="$(jq -er .pretag_run_id "$RUNNER_TEMP/tag-contract.json")"
+          pretag_run_attempt="$(jq -er .pretag_run_attempt "$RUNNER_TEMP/tag-contract.json")"
+          pretag_run="$RUNNER_TEMP/pretag-run.json"
+          pretag_jobs="$RUNNER_TEMP/pretag-jobs.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$pretag_run_id/attempts/$pretag_run_attempt" > "$pretag_run"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$pretag_run_id/attempts/$pretag_run_attempt/jobs?per_page=100" > "$pretag_jobs"
+          jq -e --arg sha "$source_sha" --arg attempt "$pretag_run_attempt" '
+            .path == ".github/workflows/ci.yml"
+            and .head_sha == $sha
+            and .head_branch == "main"
+            and .event == "push"
+            and .conclusion == "success"
+            and (.run_attempt | tostring) == $attempt
+          ' "$pretag_run" > /dev/null
+          jq -n --slurpfile run "$pretag_run" --slurpfile jobs "$pretag_jobs" --arg run_id "$pretag_run_id" --arg attempt "$pretag_run_attempt" '
+            def one($name):
+              [$jobs[0].jobs[] | select(.name == $name or (.name | endswith("/ " + $name)))] as $matches
+              | if $matches | length == 1 then
+                  $matches[0] as $job
+                  | {
+                      name: $name,
+                      id: ($job.id | tostring),
+                      conclusion: $job.conclusion,
+                      startedAt: $job.started_at,
+                      completedAt: $job.completed_at,
+                      runnerLabels: $job.labels
+                    }
+                else error("missing or duplicate CI job " + $name)
+                end;
+            {
+              workflowPath: ".github/workflows/ci.yml",
+              run: {
+                id: $run_id,
+                attempt: $attempt,
+                headSha: $run[0].head_sha,
+                event: $run[0].event,
+                ref: ("refs/heads/" + $run[0].head_branch),
+                conclusion: $run[0].conclusion
+              },
+              jobs: [
+                "Quality",
+                "Linux musl release build",
+                "macOS APFS (aarch64-apple-darwin)",
+                "macOS APFS (x86_64-apple-darwin)",
+                "Linux XFS FICLONE/FIEMAP"
+              ] | map(one(.))
+            }
+          ' > "$RUNNER_TEMP/pretag-evidence.json"
+          python3 .github/scripts/release.py validate-pretag \
+            --input "$RUNNER_TEMP/pretag-evidence.json" \
+            --output "$RUNNER_TEMP/pretag-canonical.json" \
+            --version "$version" \
+            --source-sha "$source_sha" \
+            --pretag-run-id "$pretag_run_id" \
+            --pretag-run-attempt "$pretag_run_attempt"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
           printf 'source-date-epoch=%s\n' "$epoch" >> "$GITHUB_OUTPUT"
+          printf 'tag-object-sha=%s\n' "$tag_object_sha" >> "$GITHUB_OUTPUT"
+          printf 'pretag-run-id=%s\n' "$pretag_run_id" >> "$GITHUB_OUTPUT"
+          printf 'pretag-run-attempt=%s\n' "$pretag_run_attempt" >> "$GITHUB_OUTPUT"
+          printf 'workflow-digest=%s\n' "$workflow_digest" >> "$GITHUB_OUTPUT"
 
   validation:
     name: Validate macOS/Linux on release commit
@@ -60,11 +141,11 @@ jobs:
     needs: [validate-tag, validation]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
           set-safe-directory: false
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@bc540ba06a4ccee415bb241490e0b25ee8e7d315
       - name: Generate SPDX and license inventory
         shell: bash
         run: |
@@ -74,7 +155,7 @@ jobs:
             --version '${{ needs.validate-tag.outputs.version }}' \
             --source-sha "$GITHUB_SHA" \
             --epoch '${{ needs.validate-tag.outputs.source-date-epoch }}'
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
         with:
           name: release-common
           path: release-common
@@ -96,15 +177,15 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
           set-safe-directory: false
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
         with:
           name: release-common
           path: release-common
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@bc540ba06a4ccee415bb241490e0b25ee8e7d315
         with:
           targets: ${{ matrix.target }}
       - name: Install Linux release tools
@@ -134,78 +215,153 @@ jobs:
             --epoch '${{ needs.validate-tag.outputs.source-date-epoch }}' \
             --target '${{ matrix.target }}' \
             --binary 'target/${{ matrix.target }}/release/git-vws'
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
         with:
           name: release-${{ matrix.target }}
           path: release-output
           if-no-files-found: error
           retention-days: 1
 
-  draft:
-    name: Create and attest draft release
+  assembly:
+    name: Assemble unsigned release closure
     needs: [validate-tag, validation, build]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
           set-safe-directory: false
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
         with:
-          path: release-assets
+          path: release-input
           pattern: release-*
           merge-multiple: true
-      - name: Assemble exact release asset set
+      - name: Assemble exact unsigned assets and pinned trust
         shell: bash
         run: |
           set -euo pipefail
           python3 .github/scripts/release.py assemble \
-            --directory release-assets \
+            --directory release-input \
             --version '${{ needs.validate-tag.outputs.version }}' \
             --source-sha "$GITHUB_SHA"
-      - name: Create or update draft GitHub release
+          test -f .github/release-trust/kms-v1.pem
+          test -f .github/release-trust/tsa-trusted-root-v1.json
+          test "$(sha256sum .github/release-trust/tsa-trusted-root-v1.json | awk '{print $1}')" = 90722cc723e7900555dee86a320acbf843933f49cb6636d33a18b76b62388138
+          mkdir -p release-assembly/assets release-assembly/trust
+          cp release-input/* release-assembly/assets/
+          cp .github/release-trust/kms-v1.pem release-assembly/trust/
+          cp .github/release-trust/tsa-trusted-root-v1.json release-assembly/trust/
+          test -z "$(find release-assembly -type l -print -quit)"
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        with:
+          name: release-assembly
+          path: release-assembly
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    name: Sign immutable release provenance
+    needs: [validate-tag, validation, assembly]
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    uses: Fuxx-1/git-vws/.github/workflows/release-sign.yml@__SIGNER_SHA__
+
+  draft:
+    name: Create verified draft release
+    needs: [validate-tag, validation, sign]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+          set-safe-directory: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          name: release-signed
+          path: release-assets
+      - uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad
+        with:
+          cosign-release: v3.0.6
+      - name: Verify KMS signature, RFC3161 timestamp, and signed statement
+        shell: bash
+        run: |
+          set -euo pipefail
+          verification=(
+            --key .github/release-trust/kms-v1.pem
+            --bundle release-assets/PROVENANCE.sigstore.json
+            --type slsaprovenance1
+            --private-infrastructure
+            --use-signed-timestamps
+            --trusted-root .github/release-trust/tsa-trusted-root-v1.json
+          )
+          for asset in release-assets/*; do
+            if [ "$(basename "$asset")" = PROVENANCE.sigstore.json ]; then
+              continue
+            fi
+            cosign verify-blob-attestation "${verification[@]}" "$asset"
+          done
+          python3 .github/scripts/release.py verify-provenance \
+            --directory release-assets \
+            --version '${{ needs.validate-tag.outputs.version }}' \
+            --source-sha "$GITHUB_SHA" \
+            --tag-ref "$GITHUB_REF" \
+            --tag-object-sha '${{ needs.validate-tag.outputs.tag-object-sha }}' \
+            --workflow-digest '${{ needs.validate-tag.outputs.workflow-digest }}' \
+            --pretag-run-id '${{ needs.validate-tag.outputs.pretag-run-id }}' \
+            --pretag-run-attempt '${{ needs.validate-tag.outputs.pretag-run-attempt }}' \
+            --public-key .github/release-trust/kms-v1.pem \
+            --trusted-root .github/release-trust/tsa-trusted-root-v1.json
+      - name: Replace draft assets with the exact signed closure
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.validate-tag.outputs.version }}
         run: |
           set -euo pipefail
-          notes="$(mktemp)"
+          notes="$RUNNER_TEMP/release-notes.txt"
           {
             printf 'Alpha release of git-vws %s.\n\n' "$VERSION"
             printf 'Implemented commands: init, create, list, exec, remove, publish, gc, doctor.\n'
             printf 'Supported hosts: macOS APFS and Linux filesystems that pass FICLONE/FIEMAP validation.\n'
             printf 'No FUSE, kernel extension, administrator installation, daemon, or full-copy fallback is used.\n'
             printf 'Windows remains unsupported in this release.\n\n'
-            printf 'Validation and build run: %s/%s/actions/runs/%s\n' \
-              "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            printf 'Provenance is signed by a non-exportable AWS KMS P-256 key after GitHub OIDC authorization and carries an RFC3161 timestamp.\n'
+            printf 'No public identity log, public certificate service, GitHub-hosted attestation, or exportable signing key is used.\n\n'
+            printf 'Release workflow run: %s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
           } > "$notes"
-          if gh release view "$GITHUB_REF_NAME" --json isDraft > release-view.json 2>/dev/null; then
-            test "$(jq -r .isDraft release-view.json)" = true
-            gh release edit "$GITHUB_REF_NAME" \
-              --title "git-vws $VERSION" \
-              --notes-file "$notes"
-            gh release upload "$GITHUB_REF_NAME" --clobber release-assets/*
+          if gh release view "$GITHUB_REF_NAME" --json isDraft,assets > "$RUNNER_TEMP/release-before.json" 2>/dev/null; then
+            test "$(jq -r .isDraft "$RUNNER_TEMP/release-before.json")" = true
+            while IFS= read -r asset; do
+              gh release delete-asset "$GITHUB_REF_NAME" "$asset" --yes
+            done < <(jq -r '.assets[].name' "$RUNNER_TEMP/release-before.json")
+            gh release edit "$GITHUB_REF_NAME" --title "git-vws $VERSION" --notes-file "$notes"
           else
-            gh release create "$GITHUB_REF_NAME" \
-              --verify-tag \
-              --draft \
-              --title "git-vws $VERSION" \
-              --notes-file "$notes" \
-              release-assets/*
+            gh release create "$GITHUB_REF_NAME" --verify-tag --draft --title "git-vws $VERSION" --notes-file "$notes"
           fi
-          test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = true
-      - name: Attest every release asset
-        uses: actions/attest-build-provenance@v3
-        with:
-          subject-path: release-assets/*
+          gh release upload "$GITHUB_REF_NAME" release-assets/*
+          gh release view "$GITHUB_REF_NAME" --json isDraft,assets > "$RUNNER_TEMP/release-after.json"
+          test "$(jq -r .isDraft "$RUNNER_TEMP/release-after.json")" = true
+          python3 - release-assets "$RUNNER_TEMP/release-after.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          local = sorted(path.name for path in Path(sys.argv[1]).iterdir())
+          remote = sorted(
+              asset["name"]
+              for asset in json.load(open(sys.argv[2], encoding="utf-8"))["assets"]
+          )
+          if local != remote:
+              raise SystemExit(f"draft asset set mismatch: local={local} remote={remote}")
+          PY
 
   verify:
-    name: Verify release on ${{ matrix.target }}
+    name: Verify draft on ${{ matrix.target }}
     needs: [validate-tag, draft]
     strategy:
       fail-fast: false
@@ -220,18 +376,20 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
-      attestations: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
           set-safe-directory: false
+      - uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad
+        with:
+          cosign-release: v3.0.6
       - name: Install Linux verification tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           sudo apt-get update
           sudo apt-get install -y binutils file
-      - name: Download assets from the draft release
+      - name: Download exact draft assets
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -240,30 +398,36 @@ jobs:
           test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = true
           mkdir release-download
           gh release download "$GITHUB_REF_NAME" --dir release-download
-      - name: Verify artifact attestations
+      - name: Verify provenance, archive safety, and native binary
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          verification=(
+            --key .github/release-trust/kms-v1.pem
+            --bundle release-download/PROVENANCE.sigstore.json
+            --type slsaprovenance1
+            --private-infrastructure
+            --use-signed-timestamps
+            --trusted-root .github/release-trust/tsa-trusted-root-v1.json
+          )
           for asset in release-download/*; do
-            gh attestation verify "$asset" \
-              --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-              --signer-digest "$GITHUB_SHA" \
-              --source-digest "$GITHUB_SHA" \
-              --source-ref "$GITHUB_REF" \
-              --deny-self-hosted-runners
+            if [ "$(basename "$asset")" = PROVENANCE.sigstore.json ]; then
+              continue
+            fi
+            cosign verify-blob-attestation "${verification[@]}" "$asset"
           done
-      - name: Verify exact assets, archive safety, and native binary
-        shell: bash
-        run: |
-          set -euo pipefail
           python3 .github/scripts/release.py verify \
             --directory release-download \
             --version '${{ needs.validate-tag.outputs.version }}' \
             --source-sha "$GITHUB_SHA" \
-            --target '${{ matrix.target }}'
+            --target '${{ matrix.target }}' \
+            --tag-ref "$GITHUB_REF" \
+            --tag-object-sha '${{ needs.validate-tag.outputs.tag-object-sha }}' \
+            --workflow-digest '${{ needs.validate-tag.outputs.workflow-digest }}' \
+            --pretag-run-id '${{ needs.validate-tag.outputs.pretag-run-id }}' \
+            --pretag-run-attempt '${{ needs.validate-tag.outputs.pretag-run-attempt }}' \
+            --public-key .github/release-trust/kms-v1.pem \
+            --trusted-root .github/release-trust/tsa-trusted-root-v1.json
 
   promote:
     name: Promote verified draft to prerelease
