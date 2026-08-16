@@ -2,16 +2,26 @@
 
 [![CI](https://github.com/Fuxx-1/git-vws/actions/workflows/ci.yml/badge.svg)](https://github.com/Fuxx-1/git-vws/actions/workflows/ci.yml)
 
-`git-vws` is a native copy-on-write virtual worktree prototype for bare Git repositories. It creates isolated private Git metadata and worktree directories while sharing unchanged file data through APFS clones on macOS or `FICLONE` on supported Linux filesystems.
+`git-vws` provides native copy-on-write virtual worktrees for bare Git repositories. Each session has private Git metadata, branch state, index, working changes, and build output while unchanged file data is shared through APFS clones on macOS or `FICLONE` on supported Linux filesystems.
 
-This is an alpha build. The implemented command surface is currently limited to:
+This is an alpha build. Back up important repositories and review command output before removing sessions or publishing branches.
+
+## Commands
 
 ```text
 git vws init <bare-path>
 git vws create <name> [--from <rev>] [--target <branch>] [--path <managed-path>]
+git vws list [--all]
+git vws exec <name> -- <program> [args...]
+git vws remove <name> [--force]
+git vws publish <name>
+git vws doctor
+git vws gc
 ```
 
-`list`, `exec`, `remove`, `publish`, `gc`, and `doctor` are not included yet. Do not use this alpha as the only copy of important work.
+Commands that operate on one repository use the current directory by default. Pass `--repo <bare-path>` before the subcommand to select another authority repository. `list --all`, `doctor`, and `gc` operate on the registered repository set and do not accept `--repo`.
+
+`publish` supports new-target creation, same-tip publication, and fast-forward expected-old CAS. If another writer changes the target first, publication fails without overwriting that update.
 
 ## Requirements
 
@@ -23,7 +33,9 @@ Unsupported filesystems fail with `STORAGE_UNSUPPORTED`; `git-vws` does not sile
 
 ## Install
 
-Download the archive for your platform from the private repository's [Releases](https://github.com/Fuxx-1/git-vws/releases), verify it against `SHA256SUMS`, and place `git-vws` on `PATH`. Git then discovers it as an external subcommand:
+Download the archive for your platform from the private repository's [Releases](https://github.com/Fuxx-1/git-vws/releases), verify it against `SHA256SUMS`, and place `git-vws` on `PATH`. Each release also includes per-archive checksums, an SPDX 2.3 SBOM, a third-party license inventory, build metadata, and GitHub artifact attestations.
+
+After installation, Git discovers the binary as an external subcommand:
 
 ```sh
 git vws -h
