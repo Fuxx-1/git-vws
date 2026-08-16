@@ -1224,7 +1224,7 @@ fn sealed_root(
 ) -> Result<File, Error> {
     let entry = named_identity(container, name)?
         .ok_or_else(|| Error::new("TEMPLATE_CORRUPT", "sealed template root is absent"))?;
-    if entry != sealed.root || !storage::sealed_directory(entry) {
+    if !entry.same_node(sealed.root) || !storage::sealed_directory(entry) {
         return Err(Error::new(
             "TEMPLATE_CORRUPT",
             "sealed template root identity is invalid",
@@ -1233,7 +1233,7 @@ fn sealed_root(
     let name_c = cstring(name.as_bytes(), "template root")?;
     let root = storage::open_directory_at(container.as_raw_fd(), &name_c)
         .map_err(|_| Error::new("TEMPLATE_CORRUPT", "sealed template root type is invalid"))?;
-    if Identity::from_file(&root)? != sealed.root || storage::volume_id(&root)? != volume {
+    if !Identity::from_file(&root)?.same_node(entry) || storage::volume_id(&root)? != volume {
         return Err(Error::new(
             "TEMPLATE_CORRUPT",
             "sealed template root binding is invalid",
