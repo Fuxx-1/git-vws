@@ -20,7 +20,7 @@ impl CheckpointTarget {
     pub fn new(operation: &str, stage: &str) -> Self {
         assert!(matches!(
             operation,
-            "template" | "create" | "remove" | "publish"
+            "template" | "create" | "remove" | "publish" | "gc"
         ));
         assert!(valid_token(stage));
         Self {
@@ -64,13 +64,13 @@ pub enum ProtocolFault {
 }
 
 pub struct CheckpointController {
-    child: Option<Child>,
-    stream: Option<UnixStream>,
+    pub(crate) child: Option<Child>,
+    pub(crate) stream: Option<UnixStream>,
     nonce: String,
     process: ProcessIdentity,
     target: CheckpointTarget,
     next_sequence: u64,
-    events: Vec<Checkpoint>,
+    pub(crate) events: Vec<Checkpoint>,
 }
 
 impl CheckpointController {
@@ -337,7 +337,10 @@ impl CheckpointController {
         if pid != self.process.pid
             || pgid != self.process.pgid
             || fields[6] != format!("{}.{}", self.nonce, sequence)
-            || !matches!(fields[7], "template" | "create" | "remove" | "publish")
+            || !matches!(
+                fields[7],
+                "template" | "create" | "remove" | "publish" | "gc"
+            )
             || !(fields[8] == "-" || lower_hex(fields[8], 64))
             || !(fields[9] == "-" || lower_hex(fields[9], 64))
             || !valid_token(fields[10])

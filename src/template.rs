@@ -3,7 +3,7 @@ use crate::git::{self, AuditConfig, GitChild};
 use crate::storage;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, OsString};
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -27,6 +27,7 @@ static NEXT_BUILD: AtomicUsize = AtomicUsize::new(0);
 pub(crate) struct Template {
     pub(crate) key: String,
     pub(crate) sealed: storage::SealedTreeReceipt,
+    pub(crate) root: File,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -48,6 +49,11 @@ enum TemplatePayload {
         root_name: String,
         sealed: storage::SealedTreeReceipt,
     },
+    Tombstoned {
+        root_name: String,
+        tombstone_name: String,
+        sealed: storage::SealedTreeReceipt,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -57,6 +63,63 @@ struct TemplateRecord {
     manifest: storage::ManifestReceipt,
     volume: String,
     payload: TemplatePayload,
+}
+
+#[derive(Clone)]
+struct TemplateCapability {
+    basename: Vec<u8>,
+    record: TemplateRecord,
+    binding: authority::RecordBinding,
+}
+
+pub(crate) struct MaintenanceEntry {
+    pub(crate) scope: &'static str,
+    pub(crate) record_name: Vec<u8>,
+    pub(crate) path_name: Vec<u8>,
+    pub(crate) state: &'static str,
+    pub(crate) code: &'static str,
+}
+
+#[derive(Default)]
+pub(crate) struct MaintenanceReport {
+    pub(crate) entries: Vec<MaintenanceEntry>,
+    pub(crate) recovery_required: bool,
+}
+
+impl MaintenanceReport {
+    pub(crate) fn entry(
+        &mut self,
+        scope: &'static str,
+        record_name: &[u8],
+        path_name: &[u8],
+        state: &'static str,
+        code: &'static str,
+    ) {
+        self.entries.push(MaintenanceEntry {
+            scope,
+            record_name: record_name.to_vec(),
+            path_name: path_name.to_vec(),
+            state,
+            code,
+        });
+    }
+
+    pub(crate) fn recovery(
+        &mut self,
+        scope: &'static str,
+        record_name: &[u8],
+        path_name: &[u8],
+        state: &'static str,
+    ) {
+        self.recovery_required = true;
+        self.entry(scope, record_name, path_name, state, "RECOVERY_REQUIRED");
+    }
+}
+
+struct TemplateCensus {
+    capabilities: Vec<TemplateCapability>,
+    temporaries: Vec<Vec<u8>>,
+    report: MaintenanceReport,
 }
 
 struct CheckoutAudit {
@@ -95,14 +158,17 @@ pub(crate) fn acquire(
         &first.digest,
     );
     let name = record_name(&key);
-    if let Some(existing) = read_record(&container, &name)? {
-        if existing.key != key || existing.volume != volume || existing.manifest != first {
+    if let Some(existing) = read_template_capability(&container, &name)? {
+        if existing.record.key != key
+            || existing.record.volume != volume
+            || existing.record.manifest != first
+        {
             return Err(Error::new(
                 "TEMPLATE_CORRUPT",
                 "template record does not match the immutable create inputs",
             ));
         }
-        return match existing.payload.clone() {
+        return match existing.record.payload.clone() {
             TemplatePayload::Ready { .. } => {
                 let current = manifest_pass(authority, tree)?;
                 if current != first {
@@ -114,10 +180,18 @@ pub(crate) fn acquire(
                 ready_template(&container, existing, current)
             }
             TemplatePayload::Prepared { .. } => {
-                advance_prepared(&container, &name, existing, authority, tree)
+                advance_prepared(&container, &name, existing.record, authority, tree)
             }
-            TemplatePayload::Materializing { .. } => incomplete_materializing(&container, existing),
-            TemplatePayload::Publishing { .. } => publish_template(&container, &name, existing),
+            TemplatePayload::Materializing { .. } => {
+                incomplete_materializing(&container, existing.record)
+            }
+            TemplatePayload::Publishing { .. } => {
+                publish_template(&container, &name, existing.record)
+            }
+            TemplatePayload::Tombstoned { .. } => Err(Error::new(
+                "TEMPLATE_RECOVERY_REQUIRED",
+                "template garbage collection is incomplete",
+            )),
         };
     }
     let building_name = format!(
@@ -155,9 +229,10 @@ pub(crate) fn acquire(
 
 fn ready_template(
     container: &File,
-    record: TemplateRecord,
+    capability: TemplateCapability,
     manifest: storage::ManifestReceipt,
 ) -> Result<Template, Error> {
+    let record = capability.record.clone();
     let TemplatePayload::Ready {
         root_name: record_root,
         sealed,
@@ -177,11 +252,648 @@ fn ready_template(
             "READY template has an invalid durable receipt",
         ));
     }
-    sealed_root(container, &record_root, &sealed, &record.volume)?;
+    let root = sealed_root(container, &record_root, &sealed, &record.volume)?;
+    acquire_template_lease(&root, false)?;
+    revalidate_template_capability(container, &capability, Some((&root, sealed.root)))?;
     Ok(Template {
         key: record.key,
         sealed,
+        root,
     })
+}
+
+pub(crate) fn doctor(container: &File) -> Result<MaintenanceReport, Error> {
+    Ok(template_census(container, true)?.report)
+}
+
+pub(crate) fn validate_session_template(
+    container: &File,
+    key: &str,
+    expected: &storage::SealedTreeReceipt,
+) -> Result<(), Error> {
+    let name = record_name(key);
+    let capability = read_template_capability(container, &name)?
+        .ok_or_else(|| template_recovery("session template record is absent"))?;
+    if capability.record.key != key
+        || capability.record.volume != expected.volume
+        || capability.record.manifest != expected.manifest
+    {
+        return Err(template_recovery(
+            "session template record does not match its receipt binding",
+        ));
+    }
+    match &capability.record.payload {
+        TemplatePayload::Ready { root_name, sealed } => {
+            if sealed != expected {
+                return Err(template_recovery(
+                    "session template receipt does not match the READY record",
+                ));
+            }
+            let root = sealed_root(container, root_name, sealed, &capability.record.volume)?;
+            revalidate_template_capability(container, &capability, Some((&root, sealed.root)))?;
+        }
+        TemplatePayload::Tombstoned {
+            root_name,
+            tombstone_name,
+            sealed,
+        } => {
+            if sealed != expected {
+                return Err(template_recovery(
+                    "session template receipt does not match the TOMBSTONED record",
+                ));
+            }
+            let root = match (
+                named_identity(container, root_name)?,
+                named_identity(container, tombstone_name)?,
+            ) {
+                (Some(root), None) if root == sealed.root => {
+                    sealed_root(container, root_name, sealed, &capability.record.volume)?
+                }
+                (None, Some(_)) => {
+                    tombstone_root(container, tombstone_name, sealed, &capability.record.volume)?
+                }
+                _ => {
+                    return Err(template_recovery(
+                        "session template tombstone names are not safely bound",
+                    ))
+                }
+            };
+            storage::verify_sealed_tree(&root, sealed)?;
+            revalidate_template_tombstone_capability(container, &capability, &root, sealed)?;
+        }
+        TemplatePayload::Prepared { .. }
+        | TemplatePayload::Materializing { .. }
+        | TemplatePayload::Publishing { .. } => {
+            return Err(template_recovery(
+                "session template record is not in a reachable state",
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn template_census(container: &File, report_temporary: bool) -> Result<TemplateCensus, Error> {
+    let names = storage::directory_names(container.as_raw_fd())?;
+    let mut census = TemplateCensus {
+        capabilities: Vec::new(),
+        temporaries: Vec::new(),
+        report: MaintenanceReport::default(),
+    };
+    let mut authorized = BTreeSet::new();
+    for name in &names {
+        if !template_record_name(name) {
+            continue;
+        }
+        authorized.insert(name.clone());
+        match read_template_capability(container, name) {
+            Ok(Some(capability)) => {
+                authorized.extend(template_payload_names(&capability.record));
+                diagnose_template_capability(container, &capability, &mut census.report);
+                census.capabilities.push(capability);
+            }
+            Ok(None) | Err(_) => census.report.recovery("template", name, name, "CORRUPT"),
+        }
+    }
+    for name in names {
+        if authorized.contains(&name) {
+            continue;
+        }
+        if name.starts_with(b".") && name.ends_with(b".tmp") {
+            match template_predecessor_temporary(container, &name) {
+                Ok(_) => {
+                    census.temporaries.push(name.clone());
+                    if report_temporary {
+                        template_item(&mut census.report, &name, "TMP", "RETAINED");
+                    }
+                }
+                Err(_) => census.report.recovery("template", &name, &name, "TMP"),
+            }
+        } else {
+            census.report.recovery("template", &name, &name, "UNKNOWN");
+        }
+    }
+    Ok(census)
+}
+
+pub(crate) fn gc<F>(container: &File, mut census: F) -> Result<MaintenanceReport, Error>
+where
+    F: FnMut() -> Result<BTreeSet<String>, Error>,
+{
+    let mut planned = template_census(container, false)?;
+    if planned.report.recovery_required {
+        return Ok(planned.report);
+    }
+    planned.report.entries.clear();
+    for name in &planned.temporaries {
+        match clean_predecessor_temporary(container, name) {
+            Ok(()) => template_item(&mut planned.report, name, "TMP", "REMOVED"),
+            Err(_) => {
+                planned.report.recovery("template", name, name, "TMP");
+                return Ok(planned.report);
+            }
+        }
+    }
+    for capability in &planned.capabilities {
+        let name = &capability.basename;
+        match &capability.record.payload {
+            TemplatePayload::Tombstoned { .. } => {
+                match complete_template_tombstone(container, capability, Some(&mut census)) {
+                    Ok(true) => template_item(&mut planned.report, name, "TOMBSTONED", "REMOVED"),
+                    Ok(false) => template_item(&mut planned.report, name, "TOMBSTONED", "RETAINED"),
+                    Err(_) => {
+                        planned
+                            .report
+                            .recovery("template", name, name, "TOMBSTONED");
+                        return Ok(planned.report);
+                    }
+                }
+            }
+            TemplatePayload::Ready { .. } => {
+                match gc_ready_template(container, capability, &mut census) {
+                    Ok(true) => template_item(&mut planned.report, name, "TOMBSTONED", "REMOVED"),
+                    Ok(false) => template_item(&mut planned.report, name, "READY", "RETAINED"),
+                    Err(error) if error.code == "TEMPLATE_BUSY" => {
+                        template_item(&mut planned.report, name, "READY", "BUSY")
+                    }
+                    Err(_) => {
+                        planned.report.recovery("template", name, name, "READY");
+                        return Ok(planned.report);
+                    }
+                }
+            }
+            TemplatePayload::Prepared { .. }
+            | TemplatePayload::Materializing { .. }
+            | TemplatePayload::Publishing { .. } => {
+                planned
+                    .report
+                    .recovery("template", name, name, "INCOMPLETE");
+                return Ok(planned.report);
+            }
+        }
+    }
+    Ok(planned.report)
+}
+
+fn gc_ready_template<F>(
+    container: &File,
+    capability: &TemplateCapability,
+    census: &mut F,
+) -> Result<bool, Error>
+where
+    F: FnMut() -> Result<BTreeSet<String>, Error>,
+{
+    let TemplatePayload::Ready { root_name, sealed } = &capability.record.payload else {
+        return Err(Error::new(
+            "TEMPLATE_CORRUPT",
+            "template record is not READY",
+        ));
+    };
+    let root = sealed_root(container, root_name, sealed, &capability.record.volume)?;
+    acquire_template_lease(&root, true)?;
+    revalidate_template_capability(container, capability, Some((&root, sealed.root)))?;
+    if census()?.contains(&capability.record.key) {
+        return Ok(false);
+    }
+    let tombstoned = transition_template_tombstone(container, capability)?;
+    drop(root);
+    complete_template_tombstone(container, &tombstoned, None)?;
+    Ok(true)
+}
+
+fn transition_template_tombstone(
+    container: &File,
+    expected: &TemplateCapability,
+) -> Result<TemplateCapability, Error> {
+    let TemplatePayload::Ready { root_name, sealed } = &expected.record.payload else {
+        return Err(template_recovery(
+            "only a READY v3 template can enter a tombstone",
+        ));
+    };
+    let mut record = expected.record.clone();
+    record.version = 4;
+    record.payload = TemplatePayload::Tombstoned {
+        root_name: root_name.clone(),
+        tombstone_name: tombstone_name(&record.key),
+        sealed: sealed.clone(),
+    };
+    let bytes = encode_record(&record)?;
+    let capability =
+        replace_template_capability(container, expected, &bytes, "template-tombstoned-record")?;
+    #[cfg(git_vws_m4_checkpoint)]
+    template_checkpoint(&capability.record.key, "template-tombstoned-record")?;
+    Ok(capability)
+}
+
+fn complete_template_tombstone(
+    container: &File,
+    expected: &TemplateCapability,
+    reachability: Option<&mut dyn FnMut() -> Result<BTreeSet<String>, Error>>,
+) -> Result<bool, Error> {
+    let TemplatePayload::Tombstoned {
+        root_name,
+        tombstone_name,
+        sealed,
+    } = &expected.record.payload
+    else {
+        return Err(Error::new(
+            "TEMPLATE_CORRUPT",
+            "template record is not TOMBSTONED",
+        ));
+    };
+    let root = cstring(root_name.as_bytes(), "template root")?;
+    let tombstone = cstring(tombstone_name.as_bytes(), "template tombstone")?;
+    let root_entry = named_identity(container, root_name)?;
+    let tombstone_entry = named_identity(container, tombstone_name)?;
+    let leased = match (root_entry, tombstone_entry) {
+        (Some(root_entry), None) if root_entry == sealed.root => {
+            sealed_root(container, root_name, sealed, &expected.record.volume)?
+        }
+        (None, Some(_)) => {
+            tombstone_root(container, tombstone_name, sealed, &expected.record.volume)?
+        }
+        (None, None) => {
+            if let Some(census) = reachability {
+                if census()?.contains(&expected.record.key) {
+                    return Ok(false);
+                }
+            }
+            remove_template_record(container, expected)?;
+            #[cfg(git_vws_m4_checkpoint)]
+            template_checkpoint(&expected.record.key, "template-return")?;
+            return Ok(true);
+        }
+        _ => {
+            return Err(template_recovery(
+                "template root and tombstone names are not safely recoverable",
+            ))
+        }
+    };
+    acquire_template_lease(&leased, true)?;
+    let current = revalidate_template_tombstone_capability(container, expected, &leased, sealed)?;
+    if let Some(census) = reachability {
+        if census()?.contains(&current.record.key) {
+            return Ok(false);
+        }
+    }
+    promote_template_tombstone(container, &root, &tombstone, sealed.root, &current.record)?;
+    let current = revalidate_template_tombstone_capability(container, &current, &leased, sealed)?;
+    storage::remove_owned_tree_gc(container, &tombstone, sealed.root)?;
+    #[cfg(git_vws_m4_checkpoint)]
+    template_checkpoint(&current.record.key, "template-owned-tree-removed")?;
+    remove_template_record(container, &current)?;
+    #[cfg(git_vws_m4_checkpoint)]
+    template_checkpoint(&current.record.key, "template-return")?;
+    Ok(true)
+}
+
+fn promote_template_tombstone(
+    container: &File,
+    root: &CStr,
+    tombstone: &CStr,
+    expected: Identity,
+    _record: &TemplateRecord,
+) -> Result<(), Error> {
+    let root_name = std::str::from_utf8(root.to_bytes())
+        .map_err(|_| Error::new("TEMPLATE_CORRUPT", "template root name is not UTF-8"))?;
+    let tombstone_name = std::str::from_utf8(tombstone.to_bytes())
+        .map_err(|_| Error::new("TEMPLATE_CORRUPT", "template tombstone name is not UTF-8"))?;
+    match (
+        named_identity(container, root_name)?,
+        named_identity(container, tombstone_name)?,
+    ) {
+        (Some(root_identity), None) if root_identity == expected => {
+            match authority::rename_no_replace(container.as_raw_fd(), root, tombstone) {
+                Ok(()) => {
+                    #[cfg(git_vws_m4_checkpoint)]
+                    template_checkpoint(&_record.key, "template-tombstone-renamed")?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    return Err(Error::io(
+                        "TEMPLATE_RECOVERY_REQUIRED",
+                        "template tombstone rename has an unknown result",
+                        error,
+                    ));
+                }
+                Err(error) => {
+                    return Err(Error::io(
+                        "TEMPLATE_RECOVERY_REQUIRED",
+                        "cannot rename template root into its tombstone namespace",
+                        error,
+                    ));
+                }
+            }
+            container.sync_all().map_err(|error| {
+                Error::io(
+                    "TEMPLATE_RECOVERY_REQUIRED",
+                    "cannot sync template container after tombstone rename",
+                    error,
+                )
+            })?;
+            #[cfg(git_vws_m4_checkpoint)]
+            template_checkpoint(&_record.key, "template-tombstone-parent-synced")?;
+            if named_identity(container, tombstone_name)? != Some(expected) {
+                return Err(Error::new(
+                    "TEMPLATE_RECOVERY_REQUIRED",
+                    "template tombstone binding changed after rename",
+                ));
+            }
+            Ok(())
+        }
+        (None, Some(tombstone_identity))
+            if storage::owned_tree_binding(tombstone_identity, expected)
+                && tombstone_cleanup_mode(tombstone_identity) =>
+        {
+            Ok(())
+        }
+        _ => Err(template_recovery(
+            "template root and tombstone names are not safely recoverable",
+        )),
+    }
+}
+
+fn remove_template_record(container: &File, expected: &TemplateCapability) -> Result<(), Error> {
+    #[cfg(git_vws_m4_checkpoint)]
+    return authority::remove_record_bound(
+        container,
+        &expected.basename,
+        &expected.binding,
+        "gc",
+        "-",
+        &expected.record.key,
+    );
+    #[cfg(not(git_vws_m4_checkpoint))]
+    authority::remove_record_bound(container, &expected.basename, &expected.binding)
+}
+
+fn template_predecessor_temporary(
+    container: &File,
+    name: &[u8],
+) -> Result<(authority::RecordTxnTemporary, TemplateCapability), Error> {
+    let Some(temporary) = authority::record_txn_temporary(container, name, MAX_RECORD)? else {
+        return Err(template_recovery(
+            "temporary template record basename is not a RecordTxn predecessor",
+        ));
+    };
+    if !template_record_name(&temporary.final_name) {
+        return Err(template_recovery(
+            "temporary record does not name a template record",
+        ));
+    }
+    let current = read_template_capability(container, &temporary.final_name)?
+        .ok_or_else(|| template_recovery("temporary template record has no current successor"))?;
+    let previous = parse_record(&temporary.binding.bytes)?;
+    if !template_precedes(&previous, &current.record) {
+        return Err(template_recovery(
+            "temporary template record is not the direct predecessor of its current record",
+        ));
+    }
+    Ok((temporary, current))
+}
+
+fn clean_predecessor_temporary(container: &File, name: &[u8]) -> Result<(), Error> {
+    let (temporary, _current) = template_predecessor_temporary(container, name)?;
+    #[cfg(git_vws_m4_checkpoint)]
+    authority::remove_record_txn_temporary_bound(
+        container,
+        name,
+        &temporary.binding,
+        "gc",
+        "-",
+        &_current.record.key,
+    )?;
+    #[cfg(not(git_vws_m4_checkpoint))]
+    authority::remove_record_txn_temporary_bound(container, name, &temporary.binding)?;
+    #[cfg(git_vws_m4_checkpoint)]
+    template_checkpoint(&_current.record.key, "predecessor-tmp-removed")?;
+    Ok(())
+}
+
+fn template_precedes(previous: &TemplateRecord, current: &TemplateRecord) -> bool {
+    template_transition(previous, current) || template_transition(current, previous)
+}
+
+fn template_transition(previous: &TemplateRecord, current: &TemplateRecord) -> bool {
+    if previous.key != current.key
+        || previous.manifest != current.manifest
+        || previous.volume != current.volume
+        || previous.version != 3
+    {
+        return false;
+    }
+    match (&previous.payload, &current.payload) {
+        (
+            TemplatePayload::Prepared {
+                building_name: left,
+            },
+            TemplatePayload::Materializing {
+                building_name: right,
+                ..
+            },
+        ) => current.version == 3 && left == right,
+        (
+            TemplatePayload::Materializing { building_name, .. },
+            TemplatePayload::Publishing {
+                building_name: next,
+                ..
+            },
+        ) => current.version == 3 && building_name == next,
+        (
+            TemplatePayload::Publishing {
+                ready_name, sealed, ..
+            },
+            TemplatePayload::Ready {
+                root_name,
+                sealed: next,
+            },
+        ) => current.version == 3 && ready_name == root_name && sealed == next,
+        (
+            TemplatePayload::Ready { root_name, sealed },
+            TemplatePayload::Tombstoned {
+                root_name: next_root,
+                sealed: next_sealed,
+                ..
+            },
+        ) => current.version == 4 && root_name == next_root && sealed == next_sealed,
+        _ => false,
+    }
+}
+
+fn diagnose_template_capability(
+    container: &File,
+    capability: &TemplateCapability,
+    report: &mut MaintenanceReport,
+) {
+    let record_name = &capability.basename;
+    let (path_name, state, valid, code) = match &capability.record.payload {
+        TemplatePayload::Ready { root_name, sealed } => (
+            root_name.as_bytes(),
+            "READY",
+            sealed_root(container, root_name, sealed, &capability.record.volume).is_ok(),
+            "OK",
+        ),
+        TemplatePayload::Tombstoned {
+            root_name,
+            tombstone_name,
+            sealed,
+        } => {
+            let valid = match (
+                named_identity(container, root_name),
+                named_identity(container, tombstone_name),
+            ) {
+                (Ok(Some(root)), Ok(None)) if root == sealed.root => {
+                    sealed_root(container, root_name, sealed, &capability.record.volume).is_ok()
+                }
+                (Ok(None), Ok(Some(_))) => {
+                    tombstone_root(container, tombstone_name, sealed, &capability.record.volume)
+                        .is_ok()
+                }
+                (Ok(None), Ok(None)) => true,
+                _ => false,
+            };
+            (tombstone_name.as_bytes(), "TOMBSTONED", valid, "RECOVERY")
+        }
+        TemplatePayload::Prepared { building_name }
+        | TemplatePayload::Materializing { building_name, .. }
+        | TemplatePayload::Publishing { building_name, .. } => {
+            report.recovery(
+                "template",
+                record_name,
+                building_name.as_bytes(),
+                "INCOMPLETE",
+            );
+            return;
+        }
+    };
+    if valid {
+        report.entry("template", record_name, path_name, state, code);
+    } else {
+        report.recovery("template", record_name, path_name, state);
+    }
+}
+
+fn template_payload_names(record: &TemplateRecord) -> Vec<Vec<u8>> {
+    match &record.payload {
+        TemplatePayload::Prepared { building_name }
+        | TemplatePayload::Materializing { building_name, .. } => {
+            vec![building_name.as_bytes().to_vec()]
+        }
+        TemplatePayload::Publishing {
+            building_name,
+            ready_name,
+            ..
+        } => vec![
+            building_name.as_bytes().to_vec(),
+            ready_name.as_bytes().to_vec(),
+        ],
+        TemplatePayload::Ready { root_name, .. } => vec![root_name.as_bytes().to_vec()],
+        TemplatePayload::Tombstoned {
+            root_name,
+            tombstone_name,
+            ..
+        } => vec![
+            root_name.as_bytes().to_vec(),
+            tombstone_name.as_bytes().to_vec(),
+        ],
+    }
+}
+
+fn template_recovery(detail: &'static str) -> Error {
+    Error::new("TEMPLATE_RECOVERY_REQUIRED", detail)
+}
+
+fn template_item(
+    report: &mut MaintenanceReport,
+    name: &[u8],
+    state: &'static str,
+    code: &'static str,
+) {
+    report.entry("template", name, name, state, code);
+}
+
+fn acquire_template_lease(root: &File, exclusive: bool) -> Result<(), Error> {
+    let operation = if exclusive {
+        libc::LOCK_EX | libc::LOCK_NB
+    } else {
+        libc::LOCK_SH
+    };
+    loop {
+        if unsafe { libc::flock(root.as_raw_fd(), operation) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted && !exclusive {
+            continue;
+        }
+        if exclusive && error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Err(Error::new(
+                "TEMPLATE_BUSY",
+                "template root is leased by session creation",
+            ));
+        }
+        return Err(Error::io(
+            "TEMPLATE_RECOVERY_REQUIRED",
+            "cannot acquire template lease",
+            error,
+        ));
+    }
+}
+
+fn revalidate_template_capability(
+    container: &File,
+    expected: &TemplateCapability,
+    root: Option<(&File, Identity)>,
+) -> Result<TemplateCapability, Error> {
+    let current = read_template_capability(container, &expected.basename)?
+        .ok_or_else(|| template_recovery("template record disappeared while its lease was held"))?;
+    if current.binding != expected.binding || current.record != expected.record {
+        return Err(template_recovery(
+            "template record changed while its lease was held",
+        ));
+    }
+    if let Some((root, identity)) = root {
+        if Identity::from_file(root)? != identity {
+            return Err(template_recovery(
+                "template root changed while its lease was held",
+            ));
+        }
+    }
+    Ok(current)
+}
+
+fn replace_template_capability(
+    container: &File,
+    expected: &TemplateCapability,
+    bytes: &[u8],
+    _stage: &'static str,
+) -> Result<TemplateCapability, Error> {
+    #[cfg(not(git_vws_m4_checkpoint))]
+    let transaction =
+        authority::RecordTxn::begin_bound(container, &expected.basename, bytes, &expected.binding)?;
+    #[cfg(git_vws_m4_checkpoint)]
+    let transaction = authority::RecordTxn::begin_bound_checkpointed(
+        container,
+        &expected.basename,
+        bytes,
+        &expected.binding,
+        ("gc", "-", &expected.record.key, _stage),
+    )?;
+    let mut transaction = transaction;
+    let binding = transaction.commit()?;
+    let record = parse_record(&binding.bytes)?;
+    Ok(TemplateCapability {
+        basename: expected.basename.clone(),
+        record,
+        binding,
+    })
+}
+
+#[cfg(git_vws_m4_checkpoint)]
+fn template_checkpoint(key: &str, stage: &str) -> Result<(), Error> {
+    crate::m4_checkpoint::checkpoint("gc", "-", key, stage)
+}
+
+fn template_record_name(name: &[u8]) -> bool {
+    name.starts_with(b"template-") && name.ends_with(b".record")
 }
 
 fn advance_prepared(
@@ -381,7 +1093,7 @@ fn publish_template(
         sealed: sealed.clone(),
     };
     let ready_bytes = encode_record(&ready)?;
-    commit_template_record(
+    let binding = commit_template_record(
         container,
         record_name,
         &ready_bytes,
@@ -389,12 +1101,18 @@ fn publish_template(
         &key,
         "ready-record",
     )?;
+    let template = ready_template(
+        container,
+        TemplateCapability {
+            basename: record_name.to_vec(),
+            record: ready,
+            binding,
+        },
+        sealed.manifest.clone(),
+    )?;
     #[cfg(git_vws_m4_checkpoint)]
     m4("ready-return")?;
-    Ok(Template {
-        key,
-        sealed: sealed.clone(),
-    })
+    Ok(template)
 }
 
 fn private_root(
@@ -523,6 +1241,62 @@ fn sealed_root(
     }
     storage::verify_sealed_tree(&root, sealed)?;
     Ok(root)
+}
+
+fn tombstone_root(
+    container: &File,
+    name: &str,
+    sealed: &storage::SealedTreeReceipt,
+    volume: &str,
+) -> Result<File, Error> {
+    let entry = named_identity(container, name)?
+        .ok_or_else(|| template_recovery("template tombstone root is absent"))?;
+    let name = cstring(name.as_bytes(), "template tombstone")?;
+    let root = storage::open_directory_at(container.as_raw_fd(), &name)
+        .map_err(|_| template_recovery("template tombstone root type is invalid"))?;
+    let descriptor = Identity::from_file(&root)?;
+    if entry != descriptor || !storage::owned_tree_binding(entry, sealed.root) {
+        return Err(template_recovery(
+            "template tombstone root binding changed while opening",
+        ));
+    }
+    validate_template_tombstone_root(&root, sealed, volume)?;
+    Ok(root)
+}
+
+fn revalidate_template_tombstone_capability(
+    container: &File,
+    expected: &TemplateCapability,
+    root: &File,
+    sealed: &storage::SealedTreeReceipt,
+) -> Result<TemplateCapability, Error> {
+    let current = revalidate_template_capability(container, expected, None)?;
+    validate_template_tombstone_root(root, sealed, &current.record.volume)?;
+    Ok(current)
+}
+
+fn validate_template_tombstone_root(
+    root: &File,
+    sealed: &storage::SealedTreeReceipt,
+    volume: &str,
+) -> Result<(), Error> {
+    let identity = Identity::from_file(root)?;
+    if !storage::owned_tree_binding(identity, sealed.root)
+        || !tombstone_cleanup_mode(identity)
+        || storage::volume_id(root)? != volume
+    {
+        return Err(template_recovery(
+            "template tombstone root binding is invalid",
+        ));
+    }
+    if storage::sealed_directory(identity) {
+        storage::verify_sealed_tree(root, sealed)?;
+    }
+    Ok(())
+}
+
+fn tombstone_cleanup_mode(identity: Identity) -> bool {
+    storage::sealed_directory(identity) || storage::private_directory(identity)
 }
 
 fn publishing_root(
@@ -1294,12 +2068,32 @@ fn expect_batch_delimiter(child: &mut GitChild) -> Result<(), Error> {
     }
 }
 
-fn read_record(container: &File, name: &[u8]) -> Result<Option<TemplateRecord>, Error> {
-    let Some(bytes) = authority::read_file_if_present(container.as_raw_fd(), name, MAX_RECORD)?
-    else {
+fn read_template_capability(
+    container: &File,
+    name: &[u8],
+) -> Result<Option<TemplateCapability>, Error> {
+    let name_string = std::str::from_utf8(name)
+        .map_err(|_| Error::new("TEMPLATE_CORRUPT", "template record name is not UTF-8"))?;
+    if named_identity(container, name_string)?.is_none() {
         return Ok(None);
-    };
-    let record: TemplateRecord = serde_json::from_slice(&bytes)
+    }
+    let binding = authority::read_file_binding(container.as_raw_fd(), name, MAX_RECORD)?;
+    let record = parse_record(&binding.bytes)?;
+    if name != record_name(&record.key) {
+        return Err(Error::new(
+            "TEMPLATE_CORRUPT",
+            "template record basename does not match its key",
+        ));
+    }
+    Ok(Some(TemplateCapability {
+        basename: name.to_vec(),
+        record,
+        binding,
+    }))
+}
+
+fn parse_record(bytes: &[u8]) -> Result<TemplateRecord, Error> {
+    let record: TemplateRecord = serde_json::from_slice(bytes)
         .map_err(|_| Error::new("TEMPLATE_CORRUPT", "template record was not JSON"))?;
     if encode_record(&record)? != bytes {
         return Err(Error::new(
@@ -1308,7 +2102,7 @@ fn read_record(container: &File, name: &[u8]) -> Result<Option<TemplateRecord>, 
         ));
     }
     validate_record(&record)?;
-    Ok(Some(record))
+    Ok(record)
 }
 
 fn encode_record(record: &TemplateRecord) -> Result<Vec<u8>, Error> {
@@ -1321,10 +2115,7 @@ fn encode_record(record: &TemplateRecord) -> Result<Vec<u8>, Error> {
 }
 
 fn validate_record(record: &TemplateRecord) -> Result<(), Error> {
-    if record.version != 3
-        || !valid_hash(&record.key)
-        || !valid_hash(&record.manifest.digest)
-        || record.volume.is_empty()
+    if !valid_hash(&record.key) || !valid_hash(&record.manifest.digest) || record.volume.is_empty()
     {
         return Err(Error::new(
             "TEMPLATE_CORRUPT",
@@ -1333,13 +2124,14 @@ fn validate_record(record: &TemplateRecord) -> Result<(), Error> {
     }
     let valid = match &record.payload {
         TemplatePayload::Prepared { building_name } => {
-            valid_building_name(building_name, &record.key)
+            record.version == 3 && valid_building_name(building_name, &record.key)
         }
         TemplatePayload::Materializing {
             building_name,
             root_identity,
         } => {
-            valid_building_name(building_name, &record.key)
+            record.version == 3
+                && valid_building_name(building_name, &record.key)
                 && storage::private_directory(*root_identity)
         }
         TemplatePayload::Publishing {
@@ -1347,7 +2139,8 @@ fn validate_record(record: &TemplateRecord) -> Result<(), Error> {
             ready_name,
             sealed,
         } => {
-            valid_building_name(building_name, &record.key)
+            record.version == 3
+                && valid_building_name(building_name, &record.key)
                 && ready_name == &root_name(&record.key)
                 && sealed.manifest == record.manifest
                 && sealed.volume == record.volume
@@ -1358,7 +2151,21 @@ fn validate_record(record: &TemplateRecord) -> Result<(), Error> {
             root_name: ready_root,
             sealed,
         } => {
-            ready_root == &root_name(&record.key)
+            record.version == 3
+                && ready_root == &root_name(&record.key)
+                && sealed.manifest == record.manifest
+                && sealed.volume == record.volume
+                && storage::sealed_directory(sealed.root)
+                && valid_hash(&sealed.content_digest)
+        }
+        TemplatePayload::Tombstoned {
+            root_name: tombstoned_root,
+            tombstone_name: tombstone,
+            sealed,
+        } => {
+            record.version == 4
+                && tombstoned_root == &root_name(&record.key)
+                && tombstone == &tombstone_name(&record.key)
                 && sealed.manifest == record.manifest
                 && sealed.volume == record.volume
                 && storage::sealed_directory(sealed.root)
@@ -1475,7 +2282,7 @@ fn commit_template_record(
     expected: Option<&[u8]>,
     _key: &str,
     _stage: &'static str,
-) -> Result<(), Error> {
+) -> Result<authority::RecordBinding, Error> {
     #[cfg(not(git_vws_m4_checkpoint))]
     let transaction = authority::RecordTxn::begin(container, name, bytes, expected)?;
     #[cfg(git_vws_m4_checkpoint)]
@@ -1487,8 +2294,7 @@ fn commit_template_record(
         ("template", "-", _key, _stage),
     )?;
     let mut transaction = transaction;
-    transaction.commit()?;
-    Ok(())
+    transaction.commit()
 }
 
 fn template_key(
@@ -1569,6 +2375,10 @@ fn record_name(key: &str) -> Vec<u8> {
 
 fn root_name(key: &str) -> String {
     format!("template-{key}.root")
+}
+
+fn tombstone_name(key: &str) -> String {
+    format!("template-{key}.tombstone")
 }
 
 fn valid_building_name(name: &str, key: &str) -> bool {

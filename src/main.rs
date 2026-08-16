@@ -77,6 +77,8 @@ enum Command {
         #[arg(long, value_name = "HEX")]
         name_hex: Option<String>,
     },
+    Doctor,
+    Gc,
 }
 
 enum CommandOutput {
@@ -146,6 +148,8 @@ fn main() -> ExitCode {
         Command::Publish { name, name_hex } => repository(repo)
             .and_then(|repository| session::publish(&repository, name, name_hex))
             .map(CommandOutput::Text),
+        Command::Doctor => global_maintenance(repo, session::doctor),
+        Command::Gc => global_maintenance(repo, session::gc),
     };
     match result {
         Ok(CommandOutput::Text(message)) => {
@@ -161,6 +165,19 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn global_maintenance(
+    repository: Option<PathBuf>,
+    command: fn() -> Result<(), authority::Error>,
+) -> Result<CommandOutput, authority::Error> {
+    if repository.is_some() {
+        return Err(authority::Error::new(
+            "SESSION_USAGE",
+            "global maintenance commands do not accept --repo",
+        ));
+    }
+    command().map(|_| CommandOutput::Silent)
 }
 
 fn repository(repo: Option<PathBuf>) -> Result<PathBuf, authority::Error> {
