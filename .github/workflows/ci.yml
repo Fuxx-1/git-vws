@@ -191,41 +191,31 @@ jobs:
           } > runner-evidence/host.txt
           test "$(uname -m)" = "${{ matrix.arch }}"
           diskutil info / | grep -Eq 'File System Personality: +APFS'
-      - name: Record frozen M4/M5 source contract
+      - name: Record frozen M4/M5/M6 source contract
         shell: bash
         run: |
           set -euo pipefail
-          expected_m4_sha='c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c'
-          expected_m5_sha='c0eff6cdef36e81f8b35fae262037e292d9b3256450d6f85f9982caf7e889057'
-          expected_checkpoint_sha='b57825c247b2bb0b0ae69db44efe9c682561e08224aa081d4d788b1a8beaf549'
-          expected_main_sha='16758b5ad9d809b98e1d685b0a2b8eae97b04fccdc73376e90db71ffb7bf7208'
-          expected_session_sha='a01c58082ca7d043b7edf122360a192136eddd17748aab1943349ab1138c3f40'
-          expected_checkpoint_module_sha='0ee371b37cd46e02599b675d162bcaae7f181c72013e3a4fb6f7e03e34ca1722'
-          test -n "${GITHUB_SHA:-}"
           head_sha="$(git rev-parse HEAD)"
-          actual_m4_sha="$(shasum -a 256 tests/m4_git_parity.rs | awk '{print $1}')"
-          actual_m5_sha="$(shasum -a 256 tests/m5_publish.rs | awk '{print $1}')"
-          actual_checkpoint_sha="$(shasum -a 256 tests/support/checkpoint.rs | awk '{print $1}')"
-          actual_main_sha="$(shasum -a 256 src/main.rs | awk '{print $1}')"
-          actual_session_sha="$(shasum -a 256 src/session.rs | awk '{print $1}')"
-          actual_checkpoint_module_sha="$(shasum -a 256 src/m4_checkpoint.rs | awk '{print $1}')"
-          {
-            printf 'GITHUB_SHA=%s\n' "$GITHUB_SHA"
-            printf 'HEAD=%s\n' "$head_sha"
-            printf 'tests/m4_git_parity.rs SHA-256=%s\n' "$actual_m4_sha"
-            printf 'tests/m5_publish.rs SHA-256=%s\n' "$actual_m5_sha"
-            printf 'tests/support/checkpoint.rs SHA-256=%s\n' "$actual_checkpoint_sha"
-            printf 'src/main.rs SHA-256=%s\n' "$actual_main_sha"
-            printf 'src/session.rs SHA-256=%s\n' "$actual_session_sha"
-            printf 'src/m4_checkpoint.rs SHA-256=%s\n' "$actual_checkpoint_module_sha"
-          } > runner-evidence/m4-m5-source-contract.log
+          printf 'GITHUB_SHA=%s\nHEAD=%s\n' "$GITHUB_SHA" "$head_sha" \
+            > runner-evidence/m4-m5-source-contract.log
           test "$head_sha" = "$GITHUB_SHA"
-          test "$actual_m4_sha" = "$expected_m4_sha"
-          test "$actual_m5_sha" = "$expected_m5_sha"
-          test "$actual_checkpoint_sha" = "$expected_checkpoint_sha"
-          test "$actual_main_sha" = "$expected_main_sha"
-          test "$actual_session_sha" = "$expected_session_sha"
-          test "$actual_checkpoint_module_sha" = "$expected_checkpoint_module_sha"
+          while read -r path expected; do
+            actual="$(shasum -a 256 "$path" | awk '{print $1}')"
+            printf '%s SHA-256=%s\n' "$path" "$actual" \
+              >> runner-evidence/m4-m5-source-contract.log
+            test "$actual" = "$expected"
+          done <<'EOF'
+          src/authority.rs f924510d658263f350a0d0f34072c6f1965845534f1e67ef0a5c9171f276117d
+          src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
+          src/main.rs bd5cf3a6eea65ef11bfda9476fa3353e5854d22154e7c8c52a22b98d4ce2b861
+          src/session.rs 72c853e53d4a374eb74b348ef78bcdab56f73b6e9c31f9788771331d3af580ee
+          src/storage.rs 3564ebc0ef31e9c4d82f24a8c9c466ba365bd15369f10a18055661fc6a6c7d22
+          src/template.rs e174c0da073eff9843ed9d36de30f0c30c275e284ecd50c7ba24803917e23913
+          tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
+          tests/m5_publish.rs c0eff6cdef36e81f8b35fae262037e292d9b3256450d6f85f9982caf7e889057
+          tests/m6_maintenance.rs 62bdfdd9986d5ba3379170de6394eb16aa2b5d9611ca52c03be925be9896e4cf
+          tests/support/checkpoint.rs c8026cb722d3c0250fc6d403540fd3b78ab18eaac5c881c5e9bb36c8860bef16
+          EOF
       - name: Run full test suite
         shell: bash
         run: |
@@ -316,6 +306,25 @@ jobs:
             printf 'M5 authority_audits=4\n'
             printf 'M5 publish_checkpoints=23\n'
           } > runner-evidence/m5-gates.log
+          : > runner-evidence/m6-gates.log
+          for name in global_maintenance_cli_and_doctor_are_readonly census_and_leases_fail_closed_without_mutation gc_tombstones_and_crash_prefix_recover_exactly_once private_loose_and_predecessor_temporary_gc_contract; do
+            grep -Fx "test $name ... ok" runner-evidence/tests.log >> runner-evidence/m6-gates.log
+          done
+          test "$(wc -l < runner-evidence/m6-gates.log | tr -d ' ')" = 4
+          m6_summary='^test result: ok\. 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in .*$'
+          awk -v expected="$m6_summary" '
+            /Running.*tests\/m6_maintenance\.rs/ { runs++; in_m6=1; next }
+            in_m6 && /^test result:/ { summaries++; if ($0 ~ expected) matches++; in_m6=0 }
+            END { exit !(runs == 1 && summaries == 1 && matches == 1) }
+          ' runner-evidence/tests.log | tee -a runner-evidence/m6-gates.log
+          for marker in 'M6 doctor evidence: readonly=ok' 'M6 gc evidence: session=6 template=11 loose+fanout=5 predecessor=3 global=1 total=26' 'M6 private_objects_retained=ok'; do
+            count="$(grep -Fxc "$marker" runner-evidence/tests.log || true)"
+            test "$count" = 1
+            printf '%s\n' "$marker" >> runner-evidence/m6-gates.log
+          done
+          if grep -qF 'NOT_EXECUTED' runner-evidence/tests.log; then
+            exit 1
+          fi
       - name: Build and scan release binary
         shell: bash
         run: |
@@ -336,12 +345,12 @@ jobs:
           command -v nm | tee -a runner-evidence/release-tools.log
           strings "$release_binary" 2>&1 | tee runner-evidence/release-strings.log
           nm -a "$release_binary" 2>&1 | tee runner-evidence/release-nm.log
-          if LC_ALL=C grep -aF -e 'M4CP/1' -e 'GIT_VWS_M4_CONTROL_FD' -e 'GIT_VWS_M4_NONCE' -e 'GIT_VWS_M4_TARGET' -e 'object-fetch-returned' -e 'cas-child-returned-success' -e 'cas-child-returned-nonzero' -e 'conflict-aborted-parent-synced' -e 'same-return' "$release_binary" > runner-evidence/release-m4-raw-matches.log; then
+          if LC_ALL=C grep -aF -e 'M4CP/1' -e 'GIT_VWS_M4_CONTROL_FD' -e 'GIT_VWS_M4_NONCE' -e 'GIT_VWS_M4_TARGET' -e 'object-fetch-returned' -e 'cas-child-returned-success' -e 'cas-child-returned-nonzero' -e 'conflict-aborted-parent-synced' -e 'same-return' -e 'session-tombstone-renamed' -e 'session-tombstone-parent-synced' -e 'session-owned-tree-removed' -e 'record-deletion-unlinked' -e 'record-deletion-parent-synced' -e 'session-return' -e 'template-tombstoned-record-temporary-synced' -e 'template-tombstoned-record-namespace-applied' -e 'template-tombstoned-record-exchange-old-unlinked' -e 'template-tombstoned-record-parent-synced' -e 'template-tombstoned-record' -e 'template-tombstone-renamed' -e 'template-tombstone-parent-synced' -e 'template-owned-tree-removed' -e 'template-return' -e 'loose-object-unlinked' -e 'loose-object-parent-synced' -e 'loose-fanout-unlinked' -e 'loose-fanout-parent-synced' -e 'loose-return' -e 'predecessor-tmp-unlinked' -e 'predecessor-tmp-parent-synced' -e 'predecessor-tmp-removed' "$release_binary" > runner-evidence/release-m4-raw-matches.log; then
             cat runner-evidence/release-m4-raw-matches.log
             exit 1
           fi
           printf 'release raw checkpoint scan: no matches\n' >> runner-evidence/release-m4-raw-matches.log
-          if grep -F -e 'M4CP/1' -e 'GIT_VWS_M4_CONTROL_FD' -e 'GIT_VWS_M4_NONCE' -e 'GIT_VWS_M4_TARGET' -e 'm4_checkpoint' -e 'object-fetch-returned' -e 'cas-child-returned-success' -e 'cas-child-returned-nonzero' -e 'conflict-aborted-parent-synced' -e 'same-return' runner-evidence/release-strings.log runner-evidence/release-nm.log > runner-evidence/release-m4-matches.log; then
+          if grep -F -e 'M4CP/1' -e 'GIT_VWS_M4_CONTROL_FD' -e 'GIT_VWS_M4_NONCE' -e 'GIT_VWS_M4_TARGET' -e 'm4_checkpoint' -e 'object-fetch-returned' -e 'cas-child-returned-success' -e 'cas-child-returned-nonzero' -e 'conflict-aborted-parent-synced' -e 'same-return' -e 'session-tombstone-renamed' -e 'session-tombstone-parent-synced' -e 'session-owned-tree-removed' -e 'record-deletion-unlinked' -e 'record-deletion-parent-synced' -e 'session-return' -e 'template-tombstoned-record-temporary-synced' -e 'template-tombstoned-record-namespace-applied' -e 'template-tombstoned-record-exchange-old-unlinked' -e 'template-tombstoned-record-parent-synced' -e 'template-tombstoned-record' -e 'template-tombstone-renamed' -e 'template-tombstone-parent-synced' -e 'template-owned-tree-removed' -e 'template-return' -e 'loose-object-unlinked' -e 'loose-object-parent-synced' -e 'loose-fanout-unlinked' -e 'loose-fanout-parent-synced' -e 'loose-return' -e 'predecessor-tmp-unlinked' -e 'predecessor-tmp-parent-synced' -e 'predecessor-tmp-removed' runner-evidence/release-strings.log runner-evidence/release-nm.log > runner-evidence/release-m4-matches.log; then
             cat runner-evidence/release-m4-matches.log
             exit 1
           fi
@@ -538,41 +547,31 @@ jobs:
           test "$(uname -m)" = x86_64
           test "$(findmnt -T "$TMPDIR" -no FSTYPE)" = xfs
           sudo xfs_info "$VWS_XFS_MOUNT" | grep -q 'reflink=1'
-      - name: Record frozen M4/M5 source contract
+      - name: Record frozen M4/M5/M6 source contract
         shell: bash
         run: |
           set -euo pipefail
-          expected_m4_sha='c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c'
-          expected_m5_sha='c0eff6cdef36e81f8b35fae262037e292d9b3256450d6f85f9982caf7e889057'
-          expected_checkpoint_sha='b57825c247b2bb0b0ae69db44efe9c682561e08224aa081d4d788b1a8beaf549'
-          expected_main_sha='16758b5ad9d809b98e1d685b0a2b8eae97b04fccdc73376e90db71ffb7bf7208'
-          expected_session_sha='a01c58082ca7d043b7edf122360a192136eddd17748aab1943349ab1138c3f40'
-          expected_checkpoint_module_sha='0ee371b37cd46e02599b675d162bcaae7f181c72013e3a4fb6f7e03e34ca1722'
-          test -n "${GITHUB_SHA:-}"
           head_sha="$(git rev-parse HEAD)"
-          actual_m4_sha="$(shasum -a 256 tests/m4_git_parity.rs | awk '{print $1}')"
-          actual_m5_sha="$(shasum -a 256 tests/m5_publish.rs | awk '{print $1}')"
-          actual_checkpoint_sha="$(shasum -a 256 tests/support/checkpoint.rs | awk '{print $1}')"
-          actual_main_sha="$(shasum -a 256 src/main.rs | awk '{print $1}')"
-          actual_session_sha="$(shasum -a 256 src/session.rs | awk '{print $1}')"
-          actual_checkpoint_module_sha="$(shasum -a 256 src/m4_checkpoint.rs | awk '{print $1}')"
-          {
-            printf 'GITHUB_SHA=%s\n' "$GITHUB_SHA"
-            printf 'HEAD=%s\n' "$head_sha"
-            printf 'tests/m4_git_parity.rs SHA-256=%s\n' "$actual_m4_sha"
-            printf 'tests/m5_publish.rs SHA-256=%s\n' "$actual_m5_sha"
-            printf 'tests/support/checkpoint.rs SHA-256=%s\n' "$actual_checkpoint_sha"
-            printf 'src/main.rs SHA-256=%s\n' "$actual_main_sha"
-            printf 'src/session.rs SHA-256=%s\n' "$actual_session_sha"
-            printf 'src/m4_checkpoint.rs SHA-256=%s\n' "$actual_checkpoint_module_sha"
-          } > runner-evidence/m4-m5-source-contract.log
+          printf 'GITHUB_SHA=%s\nHEAD=%s\n' "$GITHUB_SHA" "$head_sha" \
+            > runner-evidence/m4-m5-source-contract.log
           test "$head_sha" = "$GITHUB_SHA"
-          test "$actual_m4_sha" = "$expected_m4_sha"
-          test "$actual_m5_sha" = "$expected_m5_sha"
-          test "$actual_checkpoint_sha" = "$expected_checkpoint_sha"
-          test "$actual_main_sha" = "$expected_main_sha"
-          test "$actual_session_sha" = "$expected_session_sha"
-          test "$actual_checkpoint_module_sha" = "$expected_checkpoint_module_sha"
+          while read -r path expected; do
+            actual="$(shasum -a 256 "$path" | awk '{print $1}')"
+            printf '%s SHA-256=%s\n' "$path" "$actual" \
+              >> runner-evidence/m4-m5-source-contract.log
+            test "$actual" = "$expected"
+          done <<'EOF'
+          src/authority.rs f924510d658263f350a0d0f34072c6f1965845534f1e67ef0a5c9171f276117d
+          src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
+          src/main.rs bd5cf3a6eea65ef11bfda9476fa3353e5854d22154e7c8c52a22b98d4ce2b861
+          src/session.rs 72c853e53d4a374eb74b348ef78bcdab56f73b6e9c31f9788771331d3af580ee
+          src/storage.rs 3564ebc0ef31e9c4d82f24a8c9c466ba365bd15369f10a18055661fc6a6c7d22
+          src/template.rs e174c0da073eff9843ed9d36de30f0c30c275e284ecd50c7ba24803917e23913
+          tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
+          tests/m5_publish.rs c0eff6cdef36e81f8b35fae262037e292d9b3256450d6f85f9982caf7e889057
+          tests/m6_maintenance.rs 62bdfdd9986d5ba3379170de6394eb16aa2b5d9611ca52c03be925be9896e4cf
+          tests/support/checkpoint.rs c8026cb722d3c0250fc6d403540fd3b78ab18eaac5c881c5e9bb36c8860bef16
+          EOF
       - name: Run full test suite on XFS reflink
         shell: bash
         run: |
@@ -666,6 +665,25 @@ jobs:
             printf 'M5 authority_audits=4\n'
             printf 'M5 publish_checkpoints=23\n'
           } > runner-evidence/m5-gates.log
+          : > runner-evidence/m6-gates.log
+          for name in global_maintenance_cli_and_doctor_are_readonly census_and_leases_fail_closed_without_mutation gc_tombstones_and_crash_prefix_recover_exactly_once private_loose_and_predecessor_temporary_gc_contract; do
+            grep -Fx "test $name ... ok" runner-evidence/tests.log >> runner-evidence/m6-gates.log
+          done
+          test "$(wc -l < runner-evidence/m6-gates.log | tr -d ' ')" = 4
+          m6_summary='^test result: ok\. 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in .*$'
+          awk -v expected="$m6_summary" '
+            /Running.*tests\/m6_maintenance\.rs/ { runs++; in_m6=1; next }
+            in_m6 && /^test result:/ { summaries++; if ($0 ~ expected) matches++; in_m6=0 }
+            END { exit !(runs == 1 && summaries == 1 && matches == 1) }
+          ' runner-evidence/tests.log | tee -a runner-evidence/m6-gates.log
+          for marker in 'M6 doctor evidence: readonly=ok' 'M6 gc evidence: session=6 template=11 loose+fanout=5 predecessor=3 global=1 total=26' 'M6 private_objects_retained=ok'; do
+            count="$(grep -Fxc "$marker" runner-evidence/tests.log || true)"
+            test "$count" = 1
+            printf '%s\n' "$marker" >> runner-evidence/m6-gates.log
+          done
+          if grep -qF 'NOT_EXECUTED' runner-evidence/tests.log; then
+            exit 1
+          fi
       - name: Build and scan release binary
         shell: bash
         run: |
@@ -686,12 +704,12 @@ jobs:
           command -v nm | tee -a runner-evidence/release-tools.log
           strings "$release_binary" 2>&1 | tee runner-evidence/release-strings.log
           nm -a "$release_binary" 2>&1 | tee runner-evidence/release-nm.log
-          if LC_ALL=C grep -aF -e 'M4CP/1' -e 'GIT_VWS_M4_CONTROL_FD' -e 'GIT_VWS_M4_NONCE' -e 'GIT_VWS_M4_TARGET' -e 'object-fetch-returned' -e 'cas-child-returned-success' -e 'cas-child-returned-nonzero' -e 'conflict-aborted-parent-synced' -e 'same-return' "$release_binary" > runner-evidence/release-m4-raw-matches.log; then
+          if LC_ALL=C grep -aF -e 'M4CP/1' -e 'GIT_VWS_M4_CONTROL_FD' -e 'GIT_VWS_M4_NONCE' -e 'GIT_VWS_M4_TARGET' -e 'object-fetch-returned' -e 'cas-child-returned-success' -e 'cas-child-returned-nonzero' -e 'conflict-aborted-parent-synced' -e 'same-return' -e 'session-tombstone-renamed' -e 'session-tombstone-parent-synced' -e 'session-owned-tree-removed' -e 'record-deletion-unlinked' -e 'record-deletion-parent-synced' -e 'session-return' -e 'template-tombstoned-record-temporary-synced' -e 'template-tombstoned-record-namespace-applied' -e 'template-tombstoned-record-exchange-old-unlinked' -e 'template-tombstoned-record-parent-synced' -e 'template-tombstoned-record' -e 'template-tombstone-renamed' -e 'template-tombstone-parent-synced' -e 'template-owned-tree-removed' -e 'template-return' -e 'loose-object-unlinked' -e 'loose-object-parent-synced' -e 'loose-fanout-unlinked' -e 'loose-fanout-parent-synced' -e 'loose-return' -e 'predecessor-tmp-unlinked' -e 'predecessor-tmp-parent-synced' -e 'predecessor-tmp-removed' "$release_binary" > runner-evidence/release-m4-raw-matches.log; then
             cat runner-evidence/release-m4-raw-matches.log
             exit 1
           fi
           printf 'release raw checkpoint scan: no matches\n' >> runner-evidence/release-m4-raw-matches.log
-          if grep -F -e 'M4CP/1' -e 'GIT_VWS_M4_CONTROL_FD' -e 'GIT_VWS_M4_NONCE' -e 'GIT_VWS_M4_TARGET' -e 'm4_checkpoint' -e 'object-fetch-returned' -e 'cas-child-returned-success' -e 'cas-child-returned-nonzero' -e 'conflict-aborted-parent-synced' -e 'same-return' runner-evidence/release-strings.log runner-evidence/release-nm.log > runner-evidence/release-m4-matches.log; then
+          if grep -F -e 'M4CP/1' -e 'GIT_VWS_M4_CONTROL_FD' -e 'GIT_VWS_M4_NONCE' -e 'GIT_VWS_M4_TARGET' -e 'm4_checkpoint' -e 'object-fetch-returned' -e 'cas-child-returned-success' -e 'cas-child-returned-nonzero' -e 'conflict-aborted-parent-synced' -e 'same-return' -e 'session-tombstone-renamed' -e 'session-tombstone-parent-synced' -e 'session-owned-tree-removed' -e 'record-deletion-unlinked' -e 'record-deletion-parent-synced' -e 'session-return' -e 'template-tombstoned-record-temporary-synced' -e 'template-tombstoned-record-namespace-applied' -e 'template-tombstoned-record-exchange-old-unlinked' -e 'template-tombstoned-record-parent-synced' -e 'template-tombstoned-record' -e 'template-tombstone-renamed' -e 'template-tombstone-parent-synced' -e 'template-owned-tree-removed' -e 'template-return' -e 'loose-object-unlinked' -e 'loose-object-parent-synced' -e 'loose-fanout-unlinked' -e 'loose-fanout-parent-synced' -e 'loose-return' -e 'predecessor-tmp-unlinked' -e 'predecessor-tmp-parent-synced' -e 'predecessor-tmp-removed' runner-evidence/release-strings.log runner-evidence/release-nm.log > runner-evidence/release-m4-matches.log; then
             cat runner-evidence/release-m4-matches.log
             exit 1
           fi

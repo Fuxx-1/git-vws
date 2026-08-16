@@ -282,6 +282,16 @@ pub(crate) fn volume_id(directory: &File) -> Result<String, Error> {
     Ok(format!("{kind}:dev={}:mnt={mount}", identity.dev))
 }
 
+pub(crate) fn same_volume(file: &File, expected: &str) -> Result<bool, Error> {
+    let identity = Identity::from_file(file)?;
+    if identity.uid != current_uid() {
+        return Ok(false);
+    }
+    let kind = filesystem_kind(file)?;
+    let mount = mount_id(file)?;
+    Ok(format!("{kind}:dev={}:mnt={mount}", identity.dev) == expected)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PathSemantics {
     pub(crate) case_insensitive: bool,
@@ -1170,6 +1180,15 @@ fn stable_directory_node(current: Identity, expected: Identity) -> bool {
     current.directory() && expected.directory() && current.same_node(expected)
 }
 
+pub(crate) fn owned_tree_binding(current: Identity, expected: Identity) -> bool {
+    current.directory()
+        && expected.directory()
+        && current.uid == current_uid()
+        && current.dev == expected.dev
+        && current.ino == expected.ino
+        && current.uid == expected.uid
+}
+
 #[cfg(test)]
 #[test]
 fn stable_directory_node_allows_only_link_count_drift() {
@@ -1570,16 +1589,44 @@ pub(crate) fn remove_owned_tree(
     name: &CStr,
     expected: Identity,
 ) -> Result<(), Error> {
-    if !stable_directory_node(identity_at(parent.as_raw_fd(), name)?, expected)
-        || !private_directory(expected)
-    {
+    remove_owned_tree_inner(parent, name, expected, false)
+}
+
+pub(crate) fn remove_owned_tree_gc(
+    parent: &File,
+    name: &CStr,
+    expected: Identity,
+) -> Result<(), Error> {
+    remove_owned_tree_inner(parent, name, expected, true)
+}
+
+fn remove_owned_tree_inner(
+    parent: &File,
+    name: &CStr,
+    expected: Identity,
+    reject_special: bool,
+) -> Result<(), Error> {
+    let sealed_cleanup = sealed_directory(expected);
+    let entry = identity_at(parent.as_raw_fd(), name)?;
+    let bound = if sealed_cleanup {
+        owned_tree_binding(entry, expected) && cleanup_mode_directory(entry)
+    } else {
+        stable_directory_node(entry, expected)
+    };
+    if !bound || !(private_directory(expected) || sealed_cleanup) {
         return Err(Error::new(
             "STORAGE_RECOVERY_REQUIRED",
             "owned tree binding changed before cleanup",
         ));
     }
     let root = open_directory_at(parent.as_raw_fd(), name)?;
-    if !stable_directory_node(Identity::from_file(&root)?, expected) {
+    let descriptor = Identity::from_file(&root)?;
+    let bound = if sealed_cleanup {
+        owned_tree_binding(descriptor, expected) && cleanup_mode_directory(descriptor)
+    } else {
+        stable_directory_node(descriptor, expected)
+    };
+    if !bound {
         return Err(Error::new(
             "STORAGE_RECOVERY_REQUIRED",
             "owned tree descriptor changed before cleanup",
@@ -1592,8 +1639,24 @@ pub(crate) fn remove_owned_tree(
             "owned tree moved to a different volume before cleanup",
         ));
     }
-    remove_owned_children(&root, expected.dev, &volume)?;
-    if !stable_directory_node(identity_at(parent.as_raw_fd(), name)?, expected) {
+    if reject_special {
+        reject_special_entries(&root, expected, expected.dev, &volume, sealed_cleanup)?;
+    }
+    remove_owned_children(
+        &root,
+        expected,
+        expected.dev,
+        &volume,
+        sealed_cleanup,
+        reject_special,
+    )?;
+    let entry = identity_at(parent.as_raw_fd(), name)?;
+    let bound = if sealed_cleanup {
+        owned_tree_binding(entry, expected) && private_directory(entry)
+    } else {
+        stable_directory_node(entry, expected)
+    };
+    if !bound {
         return Err(Error::new(
             "STORAGE_RECOVERY_REQUIRED",
             "owned tree binding changed during cleanup",
@@ -1612,9 +1675,237 @@ pub(crate) fn remove_owned_tree(
     })
 }
 
-fn remove_owned_children(directory: &File, device: u64, volume: &str) -> Result<(), Error> {
+pub(crate) fn verify_identical_owned_regular(
+    owned_parent: &File,
+    owned_name: &CStr,
+    expected_owned: Identity,
+    reference_parent: &File,
+    reference_name: &CStr,
+    expected_reference: Identity,
+) -> Result<(), Error> {
+    if !owned_regular(expected_owned) || !owned_regular(expected_reference) {
+        return Err(cleanup_recovery(
+            "duplicate loose object has an unsafe identity",
+        ));
+    }
+    if identity_at(owned_parent.as_raw_fd(), owned_name)? != expected_owned
+        || identity_at(reference_parent.as_raw_fd(), reference_name)? != expected_reference
+    {
+        return Err(cleanup_recovery(
+            "duplicate loose object binding changed before comparison",
+        ));
+    }
+    let mut owned = open_regular_at(owned_parent.as_raw_fd(), owned_name, libc::O_RDONLY)?;
+    let mut reference =
+        open_regular_at(reference_parent.as_raw_fd(), reference_name, libc::O_RDONLY)?;
+    if Identity::from_file(&owned)? != expected_owned
+        || Identity::from_file(&reference)? != expected_reference
+    {
+        return Err(cleanup_recovery(
+            "duplicate loose object descriptor binding changed before comparison",
+        ));
+    }
+    if mount_id(&owned)? != mount_id(owned_parent)?
+        || mount_id(&reference)? != mount_id(reference_parent)?
+    {
+        return Err(cleanup_recovery(
+            "duplicate loose object left its parent mount",
+        ));
+    }
+    let mut owned_buffer = [0_u8; 64 * 1024];
+    let mut reference_buffer = [0_u8; 64 * 1024];
+    loop {
+        let owned_count = owned.read(&mut owned_buffer).map_err(|error| {
+            Error::io(
+                "STORAGE_RECOVERY_REQUIRED",
+                "cannot read private loose object",
+                error,
+            )
+        })?;
+        let reference_count = reference.read(&mut reference_buffer).map_err(|error| {
+            Error::io(
+                "STORAGE_RECOVERY_REQUIRED",
+                "cannot read authority loose object",
+                error,
+            )
+        })?;
+        if owned_count != reference_count
+            || owned_buffer[..owned_count] != reference_buffer[..reference_count]
+        {
+            return Err(Error::new(
+                "STORAGE_UNSUPPORTED",
+                "private loose object is not an exact authority duplicate",
+            ));
+        }
+        if owned_count == 0 {
+            break;
+        }
+    }
+    if Identity::from_file(&owned)? != expected_owned
+        || Identity::from_file(&reference)? != expected_reference
+        || identity_at(owned_parent.as_raw_fd(), owned_name)? != expected_owned
+        || identity_at(reference_parent.as_raw_fd(), reference_name)? != expected_reference
+    {
+        return Err(cleanup_recovery(
+            "duplicate loose object binding changed before removal",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn unlink_identical_owned_regular(
+    owned_parent: &File,
+    owned_name: &CStr,
+    expected_owned: Identity,
+    reference_parent: &File,
+    reference_name: &CStr,
+    expected_reference: Identity,
+) -> Result<(), Error> {
+    if !owned_cleanup_regular(expected_owned) || !owned_cleanup_regular(expected_reference) {
+        return Err(cleanup_recovery(
+            "duplicate loose object has an unsafe identity",
+        ));
+    }
+    verify_identical_owned_regular(
+        owned_parent,
+        owned_name,
+        expected_owned,
+        reference_parent,
+        reference_name,
+        expected_reference,
+    )?;
+    if identity_at(owned_parent.as_raw_fd(), owned_name)? != expected_owned
+        || identity_at(reference_parent.as_raw_fd(), reference_name)? != expected_reference
+    {
+        return Err(cleanup_recovery(
+            "duplicate loose object binding changed before removal",
+        ));
+    }
+    if unsafe { libc::unlinkat(owned_parent.as_raw_fd(), owned_name.as_ptr(), 0) } != 0 {
+        return Err(storage_io("cannot remove duplicate private loose object"));
+    }
+    Ok(())
+}
+
+pub(crate) fn unlink_empty_owned_directory(
+    parent: &File,
+    name: &CStr,
+    expected: Identity,
+    volume: &str,
+) -> Result<(), Error> {
+    let entry = identity_at(parent.as_raw_fd(), name)?;
+    if !empty_owned_directory_binding(entry, expected) || volume_id(parent)? != volume {
+        return Err(cleanup_recovery(
+            "empty cleanup directory binding changed before removal",
+        ));
+    }
+    let directory = open_directory_at(parent.as_raw_fd(), name)?;
+    if !empty_owned_directory_binding(Identity::from_file(&directory)?, expected)
+        || volume_id(&directory)? != volume
+        || !directory_names(directory.as_raw_fd())?.is_empty()
+    {
+        return Err(cleanup_recovery(
+            "cleanup directory is no longer an owned empty directory",
+        ));
+    }
+    drop(directory);
+    if !empty_owned_directory_binding(identity_at(parent.as_raw_fd(), name)?, expected) {
+        return Err(cleanup_recovery(
+            "empty cleanup directory binding changed before removal",
+        ));
+    }
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+        return Err(storage_io("cannot remove empty private object fanout"));
+    }
+    Ok(())
+}
+
+fn owned_cleanup_regular(identity: Identity) -> bool {
+    owned_regular(identity) && identity.nlink == 1
+}
+
+fn owned_regular(identity: Identity) -> bool {
+    identity.regular() && identity.uid == current_uid()
+}
+
+fn cleanup_recovery(detail: &'static str) -> Error {
+    Error::new("STORAGE_RECOVERY_REQUIRED", detail)
+}
+
+fn empty_owned_directory_binding(current: Identity, expected: Identity) -> bool {
+    current.directory()
+        && expected.directory()
+        && expected.nlink >= 2
+        && current.dev == expected.dev
+        && current.ino == expected.ino
+        && current.uid == expected.uid
+        && current.uid == current_uid()
+        && current.mode == expected.mode
+        && current.kind == expected.kind
+        && current.mode & 0o022 == 0
+        && current.nlink == 2
+}
+
+fn cleanup_mode_directory(identity: Identity) -> bool {
+    sealed_directory(identity) || private_directory(identity)
+}
+
+fn prepare_sealed_cleanup_directory(
+    directory: &File,
+    expected: Identity,
+    device: u64,
+    volume: &str,
+) -> Result<(), Error> {
+    let identity = Identity::from_file(directory)?;
+    if !owned_tree_binding(identity, expected)
+        || !cleanup_mode_directory(identity)
+        || identity.dev != device
+        || volume_id(directory)? != volume
+    {
+        return Err(cleanup_recovery(
+            "sealed owned tree directory drifted during cleanup",
+        ));
+    }
+    if sealed_directory(identity) {
+        if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+            return Err(Error::io(
+                "STORAGE_RECOVERY_REQUIRED",
+                "cannot make sealed owned tree directory writable",
+                io::Error::last_os_error(),
+            ));
+        }
+        directory.sync_all().map_err(|error| {
+            Error::io(
+                "STORAGE_RECOVERY_REQUIRED",
+                "cannot sync writable sealed owned tree directory",
+                error,
+            )
+        })?;
+        let identity = Identity::from_file(directory)?;
+        if !owned_tree_binding(identity, expected)
+            || !private_directory(identity)
+            || volume_id(directory)? != volume
+        {
+            return Err(cleanup_recovery(
+                "sealed owned tree directory changed after becoming writable",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remove_owned_children(
+    directory: &File,
+    expected: Identity,
+    device: u64,
+    volume: &str,
+    sealed_cleanup: bool,
+    reject_special: bool,
+) -> Result<(), Error> {
     let directory_identity = Identity::from_file(directory)?;
-    if !directory_identity.directory()
+    if sealed_cleanup {
+        prepare_sealed_cleanup_directory(directory, expected, device, volume)?;
+    } else if !directory_identity.directory()
         || directory_identity.uid != current_uid()
         || directory_identity.dev != device
         || volume_id(directory)? != volume
@@ -1636,7 +1927,14 @@ fn remove_owned_children(directory: &File, device: u64, volume: &str) -> Result<
         match entry.kind {
             kind if kind == DIRECTORY_TYPE => {
                 let child = open_directory_at(directory.as_raw_fd(), &name)?;
-                if !stable_directory_node(Identity::from_file(&child)?, entry) {
+                let child_identity = Identity::from_file(&child)?;
+                let bound = if sealed_cleanup {
+                    owned_tree_binding(child_identity, entry)
+                        && cleanup_mode_directory(child_identity)
+                } else {
+                    stable_directory_node(child_identity, entry)
+                };
+                if !bound {
                     return Err(Error::new(
                         "STORAGE_RECOVERY_REQUIRED",
                         "owned tree child binding changed before cleanup",
@@ -1648,8 +1946,21 @@ fn remove_owned_children(directory: &File, device: u64, volume: &str) -> Result<
                         "owned tree child crossed a mountpoint during cleanup",
                     ));
                 }
-                remove_owned_children(&child, device, volume)?;
-                if !stable_directory_node(identity_at(directory.as_raw_fd(), &name)?, entry) {
+                remove_owned_children(
+                    &child,
+                    entry,
+                    device,
+                    volume,
+                    sealed_cleanup,
+                    reject_special,
+                )?;
+                let child_identity = identity_at(directory.as_raw_fd(), &name)?;
+                let bound = if sealed_cleanup {
+                    owned_tree_binding(child_identity, entry) && private_directory(child_identity)
+                } else {
+                    stable_directory_node(child_identity, entry)
+                };
+                if !bound {
                     return Err(Error::new(
                         "STORAGE_RECOVERY_REQUIRED",
                         "owned tree child binding changed during cleanup",
@@ -1675,6 +1986,12 @@ fn remove_owned_children(directory: &File, device: u64, volume: &str) -> Result<
                 }
             }
             _ => {
+                if reject_special {
+                    return Err(Error::new(
+                        "STORAGE_RECOVERY_REQUIRED",
+                        "owned tree contains a special entry",
+                    ));
+                }
                 if entry.nlink != 1 || identity_at(directory.as_raw_fd(), &name)? != entry {
                     return Err(Error::new(
                         "STORAGE_RECOVERY_REQUIRED",
@@ -1694,6 +2011,71 @@ fn remove_owned_children(directory: &File, device: u64, volume: &str) -> Result<
             error,
         )
     })
+}
+
+fn reject_special_entries(
+    directory: &File,
+    expected: Identity,
+    device: u64,
+    volume: &str,
+    sealed_cleanup: bool,
+) -> Result<(), Error> {
+    let identity = Identity::from_file(directory)?;
+    let bound = if sealed_cleanup {
+        owned_tree_binding(identity, expected) && cleanup_mode_directory(identity)
+    } else {
+        stable_directory_node(identity, expected)
+    };
+    if !bound || identity.dev != device || volume_id(directory)? != volume {
+        return Err(Error::new(
+            "STORAGE_RECOVERY_REQUIRED",
+            "owned tree changed during special-entry preflight",
+        ));
+    }
+    for bytes in directory_names(directory.as_raw_fd())? {
+        let name = cstring(&bytes)?;
+        let entry = identity_at(directory.as_raw_fd(), &name)?;
+        if entry.uid != current_uid() || entry.dev != device {
+            return Err(Error::new(
+                "STORAGE_RECOVERY_REQUIRED",
+                "owned tree entry drifted during special-entry preflight",
+            ));
+        }
+        match entry.kind {
+            kind if kind == DIRECTORY_TYPE => {
+                let child = open_directory_at(directory.as_raw_fd(), &name)?;
+                let child_identity = Identity::from_file(&child)?;
+                let child_bound = if sealed_cleanup {
+                    owned_tree_binding(child_identity, entry)
+                        && cleanup_mode_directory(child_identity)
+                } else {
+                    stable_directory_node(child_identity, entry)
+                };
+                if !child_bound || volume_id(&child)? != volume {
+                    return Err(Error::new(
+                        "STORAGE_RECOVERY_REQUIRED",
+                        "owned tree child changed during special-entry preflight",
+                    ));
+                }
+                reject_special_entries(&child, entry, device, volume, sealed_cleanup)?;
+            }
+            kind if kind == REGULAR_TYPE || kind == SYMLINK_TYPE => {
+                if entry.nlink != 1 || identity_at(directory.as_raw_fd(), &name)? != entry {
+                    return Err(Error::new(
+                        "STORAGE_RECOVERY_REQUIRED",
+                        "owned tree entry changed during special-entry preflight",
+                    ));
+                }
+            }
+            _ => {
+                return Err(Error::new(
+                    "STORAGE_RECOVERY_REQUIRED",
+                    "owned tree contains a special entry",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_basename(bytes: &[u8]) -> Result<(), Error> {

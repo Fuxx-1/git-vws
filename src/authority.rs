@@ -259,6 +259,30 @@ pub(crate) fn authority_record_present(
     }
 }
 
+pub(crate) fn validate_authority_record(state: &StateRoot, name: &[u8]) -> Result<(), Error> {
+    let record = read_record_at(state.root_fd(), name)?;
+    if name != record_name(&record.canonical).as_bytes() {
+        return Err(Error::new(
+            "STATE_CORRUPT",
+            "state record filename does not match its canonical path",
+        ));
+    }
+    let live = inspect_authority(&record.canonical).map_err(|_| {
+        Error::new(
+            "STATE_CORRUPT",
+            "state record authority cannot be revalidated",
+        )
+    })?;
+    if record.exactly_matches(&live) {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "STATE_CORRUPT",
+            "state record authority identity no longer matches",
+        ))
+    }
+}
+
 fn transaction(state: &mut StateRoot, authority: &Authority) -> Result<(), Error> {
     state.lock()?;
     let locked_probe = inspect_authority(&authority.canonical)?;
@@ -2092,6 +2116,11 @@ pub(crate) struct RecordBinding {
     pub(crate) identity: Identity,
 }
 
+pub(crate) struct RecordTxnTemporary {
+    pub(crate) final_name: Vec<u8>,
+    pub(crate) binding: RecordBinding,
+}
+
 pub(crate) fn remove_record_bound(
     parent: &File,
     basename: &[u8],
@@ -2119,6 +2148,48 @@ pub(crate) fn remove_record_bound(
     sync_record_parent(parent)
 }
 
+pub(crate) fn record_txn_temporary(
+    parent: &File,
+    basename: &[u8],
+    limit: usize,
+) -> Result<Option<RecordTxnTemporary>, Error> {
+    let Some(final_name) = record_txn_final_name(basename) else {
+        return Ok(None);
+    };
+    let binding = read_file_binding(parent.as_raw_fd(), basename, limit)?;
+    Ok(Some(RecordTxnTemporary {
+        final_name,
+        binding,
+    }))
+}
+
+pub(crate) fn remove_record_txn_temporary_bound(
+    parent: &File,
+    basename: &[u8],
+    expected: &RecordBinding,
+    #[cfg(git_vws_m4_checkpoint)] operation: &str,
+    #[cfg(git_vws_m4_checkpoint)] sid: &str,
+    #[cfg(git_vws_m4_checkpoint)] key: &str,
+) -> Result<(), Error> {
+    let binding = read_file_binding(parent.as_raw_fd(), basename, expected.bytes.len())?;
+    if binding != *expected {
+        return Err(Error::new(
+            "STATE_CORRUPT",
+            "temporary state record bytes or identity changed before removal",
+        ));
+    }
+    let name = cstring(basename, "temporary record")?;
+    unlink_capability(parent.as_raw_fd(), &name, expected.identity)?;
+    #[cfg(git_vws_m4_checkpoint)]
+    {
+        crate::m4_checkpoint::checkpoint(operation, sid, key, "predecessor-tmp-unlinked")?;
+        sync_record_parent(parent)?;
+        crate::m4_checkpoint::checkpoint(operation, sid, key, "predecessor-tmp-parent-synced")
+    }
+    #[cfg(not(git_vws_m4_checkpoint))]
+    sync_record_parent(parent)
+}
+
 fn cleanup_unpublished_record(
     parent: &File,
     name: &CStr,
@@ -2136,6 +2207,26 @@ fn cleanup_unpublished_record(
             error,
         ),
     }
+}
+
+fn record_txn_final_name(name: &[u8]) -> Option<Vec<u8>> {
+    let stem = name.strip_prefix(b".")?.strip_suffix(b".tmp")?;
+    let (stem, counter) = split_record_txn_component(stem)?;
+    let (final_name, pid) = split_record_txn_component(stem)?;
+    if final_name.is_empty()
+        || pid.is_empty()
+        || counter.is_empty()
+        || !pid.iter().all(u8::is_ascii_digit)
+        || !counter.iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    Some(final_name.to_vec())
+}
+
+fn split_record_txn_component(value: &[u8]) -> Option<(&[u8], &[u8])> {
+    let separator = value.iter().rposition(|byte| *byte == b'-')?;
+    Some((&value[..separator], &value[separator + 1..]))
 }
 
 fn sync_record_parent(parent: &File) -> Result<(), Error> {
@@ -2213,27 +2304,6 @@ pub(crate) fn read_file_binding(
         bytes,
         identity: final_entry,
     })
-}
-
-pub(crate) fn read_file_if_present(
-    parent: RawFd,
-    basename: &[u8],
-    limit: usize,
-) -> Result<Option<Vec<u8>>, Error> {
-    let name = cstring(basename, "record")?;
-    let mut stat = zeroed_stat();
-    if unsafe { libc::fstatat(parent, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::NotFound {
-            return Ok(None);
-        }
-        return Err(Error::io(
-            "STATE_UNAVAILABLE",
-            "cannot inspect record",
-            error,
-        ));
-    }
-    read_file_binding(parent, basename, limit).map(|binding| Some(binding.bytes))
 }
 
 #[cfg(test)]

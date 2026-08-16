@@ -1,9 +1,10 @@
 use crate::authority::{self, Authority, Error, Identity, StateRoot};
 use crate::git::{self, AuditConfig, Output};
 use crate::storage::{self, CowPlan};
-use crate::template;
+use crate::template::{self, MaintenanceReport};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -216,10 +217,103 @@ struct RemoveEvent {
     name_hex: String,
 }
 
+struct SessionCensus {
+    reachable_templates: BTreeSet<String>,
+    capabilities: Vec<CensusCapability>,
+    temporaries: Vec<Vec<u8>>,
+    report: MaintenanceReport,
+}
+
+struct CensusCapability {
+    capability: RecordCapability,
+    private_objects: Option<PrivateObjectPlan>,
+}
+
+#[derive(Eq, PartialEq)]
+struct PrivateObjectPlan {
+    objects_identity: Identity,
+    authority_objects: AuthorityObjectsPlan,
+    pack_present: bool,
+    fanouts: Vec<PrivateFanoutPlan>,
+}
+
+#[derive(Eq, PartialEq)]
+struct AuthorityObjectsPlan {
+    identity: Identity,
+    volume: String,
+    entries: Vec<AuthorityObjectPlan>,
+}
+
+#[derive(Eq, PartialEq)]
+struct AuthorityObjectPlan {
+    name: Vec<u8>,
+    identity: Identity,
+    children: Vec<(Vec<u8>, Identity)>,
+}
+
+#[derive(Eq, PartialEq)]
+struct PrivateFanoutPlan {
+    name: Vec<u8>,
+    identity: Identity,
+    authority_identity: Option<Identity>,
+    loose: Vec<PrivateLoosePlan>,
+}
+
+#[derive(Eq, PartialEq)]
+struct PrivateLoosePlan {
+    name: Vec<u8>,
+    identity: Identity,
+    action: LooseAction,
+}
+
+#[derive(Eq, PartialEq)]
+enum LooseAction {
+    Remove { authority_identity: Identity },
+    Retain,
+}
+
+#[derive(Serialize)]
+struct MaintenanceLine {
+    version: u8,
+    kind: &'static str,
+    scope: &'static str,
+    record_name_hex: String,
+    path_hex: String,
+    state: &'static str,
+    code: &'static str,
+}
+
+#[derive(Serialize)]
+struct MaintenanceSummary {
+    version: u8,
+    kind: &'static str,
+    items: usize,
+    findings: usize,
+    recovery_required: bool,
+}
+
 struct SessionContext {
     authority: Authority,
     sessions: File,
     sessions_path: PathBuf,
+}
+
+fn maintenance_context(
+    sessions: &File,
+    sessions_path: &Path,
+    record: &SessionRecord,
+) -> Result<SessionContext, Error> {
+    Ok(SessionContext {
+        authority: authority_from_record(record)?,
+        sessions: sessions.try_clone().map_err(|error| {
+            Error::io(
+                "SESSION_RECOVERY_REQUIRED",
+                "cannot retain session container for maintenance",
+                error,
+            )
+        })?,
+        sessions_path: sessions_path.to_path_buf(),
+    })
 }
 
 pub(crate) fn list(repository: Option<&Path>, all: bool) -> Result<(), Error> {
@@ -399,6 +493,252 @@ pub(crate) fn list(repository: Option<&Path>, all: bool) -> Result<(), Error> {
             "one or more session records could not be trusted",
         ))
     }
+}
+
+pub(crate) fn doctor() -> Result<(), Error> {
+    maintain(false)
+}
+
+pub(crate) fn gc() -> Result<(), Error> {
+    maintain(true)
+}
+
+fn maintain(cleanup: bool) -> Result<(), Error> {
+    let mut report = MaintenanceReport::default();
+    let state = match authority::open_existing_state() {
+        Ok(state) => state,
+        Err(error)
+            if error.code == "STATE_UNAVAILABLE" && error.detail == "state root does not exist" =>
+        {
+            return finish_maintenance(report, cleanup);
+        }
+        Err(_) => {
+            report.recovery("state", b"", b"", "CORRUPT");
+            return finish_maintenance(report, cleanup);
+        }
+    };
+    if !scan_state_root(&state, &mut report) {
+        return finish_maintenance(report, cleanup);
+    }
+    let templates = maintenance_container(&state, b"templates", &mut report);
+    let sessions = maintenance_container(&state, b"sessions", &mut report);
+    let (Some(templates), Some(sessions)) = (templates.as_ref(), sessions.as_ref()) else {
+        if templates.is_none() && sessions.is_none() {
+            return finish_maintenance(report, cleanup);
+        }
+        if templates.is_none() {
+            report.recovery("state", b"", b"templates", "ABSENT");
+        }
+        if sessions.is_none() {
+            report.recovery("state", b"", b"sessions", "ABSENT");
+        }
+        return finish_maintenance(report, cleanup);
+    };
+    let sessions_path = match state.container_path("sessions") {
+        Ok(path) => path,
+        Err(_) => {
+            report.recovery("state", b"", b"sessions", "CORRUPT");
+            return finish_maintenance(report, cleanup);
+        }
+    };
+    let mut census = match session_census(templates, sessions, &sessions_path, !cleanup) {
+        Ok(census) => census,
+        Err(_) => {
+            report.recovery("session", b"", b"", "CORRUPT");
+            return finish_maintenance(report, cleanup);
+        }
+    };
+    let session_safe = !census.report.recovery_required;
+    if !cleanup || !session_safe {
+        merge_maintenance(&mut report, &mut census.report);
+    }
+    let mut template_report = match template::doctor(templates) {
+        Ok(template_report) => template_report,
+        Err(_) => {
+            report.recovery("template", b"", b"", "CORRUPT");
+            return finish_maintenance(report, cleanup);
+        }
+    };
+    let template_safe = !template_report.recovery_required;
+    if !cleanup || !template_safe {
+        merge_maintenance(&mut report, &mut template_report);
+    }
+    if !cleanup || !session_safe || !template_safe || report.recovery_required {
+        return finish_maintenance(report, cleanup);
+    }
+    let mut template_report = match template::gc(templates, || {
+        let census = session_census(templates, sessions, &sessions_path, false)?;
+        if !census.report.recovery_required {
+            Ok(census.reachable_templates)
+        } else {
+            Err(Error::new(
+                "GC_RECOVERY_REQUIRED",
+                "session census cannot prove template reachability",
+            ))
+        }
+    }) {
+        Ok(template_report) => template_report,
+        Err(_) => {
+            report.recovery("template", b"", b"", "CORRUPT");
+            return finish_maintenance(report, cleanup);
+        }
+    };
+    merge_maintenance(&mut report, &mut template_report);
+    if report.recovery_required {
+        return finish_maintenance(report, cleanup);
+    }
+    let mut session_report = gc_sessions(sessions, &sessions_path, &census);
+    merge_maintenance(&mut report, &mut session_report);
+    finish_maintenance(report, cleanup)
+}
+
+fn maintenance_container(
+    state: &StateRoot,
+    name: &[u8],
+    report: &mut MaintenanceReport,
+) -> Option<File> {
+    match state.open_container_if_present(name) {
+        Ok(container) => container,
+        Err(_) => {
+            report.recovery("state", b"", name, "CORRUPT");
+            None
+        }
+    }
+}
+
+fn scan_state_root(state: &StateRoot, report: &mut MaintenanceReport) -> bool {
+    let names = match storage::directory_names(state.root_fd()) {
+        Ok(names) => names,
+        Err(_) => {
+            report.recovery("state", b"", b"", "CORRUPT");
+            return false;
+        }
+    };
+    let mut safe = true;
+    let mut authority_records = 0_usize;
+    for name in names {
+        if name == b"templates" || name == b"sessions" {
+            continue;
+        }
+        if !name.starts_with(b".") && name.ends_with(b".record") {
+            match authority::validate_authority_record(state, &name) {
+                Ok(()) => authority_records += 1,
+                Err(_) => {
+                    report.recovery("state", &name, &name, "CORRUPT");
+                    safe = false;
+                }
+            }
+            continue;
+        }
+        report.recovery("state", &name, &name, "UNKNOWN");
+        safe = false;
+    }
+    if authority_records == 0 {
+        report.recovery("state", b"", b"", "AUTHORITY");
+        safe = false;
+    }
+    safe
+}
+
+fn merge_maintenance(report: &mut MaintenanceReport, other: &mut MaintenanceReport) {
+    report.recovery_required |= other.recovery_required;
+    report.entries.append(&mut other.entries);
+}
+
+fn finish_maintenance(mut report: MaintenanceReport, cleanup: bool) -> Result<(), Error> {
+    if cleanup && !report.recovery_required {
+        #[cfg(git_vws_m4_checkpoint)]
+        if crate::m4_checkpoint::checkpoint("gc", "-", "-", "return").is_err() {
+            report.recovery("gc", b"", b"", "RETURN");
+        }
+    }
+    write_maintenance(&mut report)?;
+    if report.recovery_required {
+        Err(Error::new(
+            if cleanup {
+                "GC_RECOVERY_REQUIRED"
+            } else {
+                "DOCTOR_RECOVERY_REQUIRED"
+            },
+            "maintenance found state that cannot be safely reclaimed",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn write_maintenance(report: &mut MaintenanceReport) -> Result<(), Error> {
+    report.entries.sort_by(|left, right| {
+        left.scope
+            .cmp(right.scope)
+            .then_with(|| left.record_name.cmp(&right.record_name))
+            .then_with(|| left.path_name.cmp(&right.path_name))
+            .then_with(|| left.state.cmp(right.state))
+            .then_with(|| left.code.cmp(right.code))
+    });
+    let stdout = io::stdout();
+    let mut output = io::BufWriter::new(stdout.lock());
+    let mut items = 0_usize;
+    let mut findings = 0_usize;
+    for entry in &report.entries {
+        let item = entry.code != "RECOVERY_REQUIRED";
+        if item {
+            items += 1;
+        } else {
+            findings += 1;
+        }
+        serde_json::to_writer(
+            &mut output,
+            &MaintenanceLine {
+                version: 1,
+                kind: if item { "item" } else { "finding" },
+                scope: entry.scope,
+                record_name_hex: authority::hex(&entry.record_name),
+                path_hex: authority::hex(&entry.path_name),
+                state: entry.state,
+                code: entry.code,
+            },
+        )
+        .map_err(|error| {
+            Error::new(
+                "SESSION_IO_FAILED",
+                format!("cannot encode maintenance record: {error}"),
+            )
+        })?;
+        output.write_all(b"\n").map_err(|error| {
+            Error::io(
+                "SESSION_IO_FAILED",
+                "cannot write maintenance record",
+                error,
+            )
+        })?;
+    }
+    serde_json::to_writer(
+        &mut output,
+        &MaintenanceSummary {
+            version: 1,
+            kind: "summary",
+            items,
+            findings,
+            recovery_required: report.recovery_required,
+        },
+    )
+    .map_err(|error| {
+        Error::new(
+            "SESSION_IO_FAILED",
+            format!("cannot encode maintenance summary: {error}"),
+        )
+    })?;
+    output
+        .write_all(b"\n")
+        .and_then(|_| output.flush())
+        .map_err(|error| {
+            Error::io(
+                "SESSION_IO_FAILED",
+                "cannot flush maintenance output",
+                error,
+            )
+        })
 }
 
 pub(crate) fn exec(
@@ -729,7 +1069,7 @@ pub(crate) fn remove(
             return remove_event(&context.authority, &name);
         }
     };
-    complete_tombstone(&context, &tombstoned)?;
+    complete_tombstone(&context, &tombstoned, "remove")?;
     #[cfg(git_vws_m4_checkpoint)]
     session_checkpoint("remove", &tombstoned.record, "return")?;
     remove_event(&context.authority, &name)
@@ -841,7 +1181,6 @@ pub(crate) fn create(repository: &Path, request: CreateRequest) -> Result<PathBu
     );
     let result = materialize_session(
         &mut transaction,
-        &state,
         &authority,
         &template,
         &root_path,
@@ -859,7 +1198,6 @@ pub(crate) fn create(repository: &Path, request: CreateRequest) -> Result<PathBu
 
 fn materialize_session(
     transaction: &mut CreateTxn<'_>,
-    state: &StateRoot,
     authority: &Authority,
     template: &template::Template,
     root_path: &Path,
@@ -955,11 +1293,7 @@ fn materialize_session(
             "linked worktree is not an owned directory",
         ));
     }
-    let templates = state.open_container(b"templates")?;
-    let template_name = format!("template-{}.root", template.key);
-    let template_name = cstring(template_name.as_bytes(), "sealed template root")?;
-    let template_root = storage::open_directory_at(templates.as_raw_fd(), &template_name)?;
-    if Identity::from_file(&template_root)? != template.sealed.root {
+    if Identity::from_file(&template.root)? != template.sealed.root {
         return Err(Error::new(
             "TEMPLATE_CORRUPT",
             "template root binding changed before native clone",
@@ -973,7 +1307,7 @@ fn materialize_session(
         ));
     }
     let receipt = storage::cow_clone(CowPlan {
-        source: &template_root,
+        source: &template.root,
         destination_parent: transaction.root(),
         destination_parent_identity: clone_parent_identity,
         destination_name: c"worktree",
@@ -1375,17 +1709,6 @@ fn record_capability_from_binding(
             "session record basename does not match its session ID",
         ));
     }
-    let name = decode_hex(&record.name)?;
-    let authority_path = authority_path_from_record(&record)?;
-    if !valid_session_name(&name)
-        || !record.authority_identity.directory()
-        || record.sid != session_id_for_binding(&authority_path, record.authority_identity, &name)
-    {
-        return Err(Error::new(
-            "SESSION_CORRUPT",
-            "session record does not prove its authority and name binding",
-        ));
-    }
     Ok(RecordCapability {
         basename,
         record,
@@ -1431,6 +1754,10 @@ fn record_binding_recovery(error: Error, boundary: &str) -> Error {
         "SESSION_RECOVERY_REQUIRED",
         format!("{boundary}: {}", error.detail),
     )
+}
+
+fn session_recovery(detail: &'static str) -> Error {
+    Error::new("SESSION_RECOVERY_REQUIRED", detail)
 }
 
 fn bound_record_error(error: Error, boundary: &str) -> Error {
@@ -1570,6 +1897,8 @@ fn revalidate_ready_lease(
         || !storage::identity_at(context.sessions.as_raw_fd(), &ready.root_name)?
             .same_node(ready.root_identity)
         || !Identity::from_file(&checked.root)?.same_node(ready.root_identity)
+        || !Identity::from_file(&ready.common)?.same_node(ready.common_identity)
+        || !Identity::from_file(&checked.common)?.same_node(ready.common_identity)
         || checked.worktree_path != ready.worktree_path
     {
         return Err(Error::new(
@@ -1702,7 +2031,11 @@ fn transition_tombstone(
     )
 }
 
-fn complete_tombstone(context: &SessionContext, expected: &RecordCapability) -> Result<(), Error> {
+fn complete_tombstone(
+    context: &SessionContext,
+    expected: &RecordCapability,
+    operation: &'static str,
+) -> Result<(), Error> {
     let SessionPayload::Tombstoned {
         root_name,
         tombstone_name,
@@ -1736,7 +2069,7 @@ fn complete_tombstone(context: &SessionContext, expected: &RecordCapability) -> 
         }
         (None, None) => {
             let current = revalidate_record(&context.sessions, expected)?;
-            return remove_record_capability(&context.sessions, &current, "remove");
+            return remove_record_capability(&context.sessions, &current, operation);
         }
         _ => {
             return Err(Error::new(
@@ -1759,12 +2092,21 @@ fn complete_tombstone(context: &SessionContext, expected: &RecordCapability) -> 
         &tombstone,
         *root_identity,
         &expected.record,
+        operation,
     )?;
     let current = revalidate_record(&context.sessions, &current)?;
-    storage::remove_owned_tree(&context.sessions, &tombstone, *root_identity)?;
+    if operation == "gc" {
+        storage::remove_owned_tree_gc(&context.sessions, &tombstone, *root_identity)?;
+    } else {
+        storage::remove_owned_tree(&context.sessions, &tombstone, *root_identity)?;
+    }
     #[cfg(git_vws_m4_checkpoint)]
-    session_checkpoint("remove", &current.record, "owned-tree-removed")?;
-    remove_record_capability(&context.sessions, &current, "remove")
+    session_checkpoint(
+        operation,
+        &current.record,
+        tombstone_stage(operation, "owned-tree-removed"),
+    )?;
+    remove_record_capability(&context.sessions, &current, operation)
 }
 
 fn promote_tombstone(
@@ -1773,6 +2115,7 @@ fn promote_tombstone(
     tombstone: &CStr,
     expected: Identity,
     _record: &SessionRecord,
+    _operation: &'static str,
 ) -> Result<(), Error> {
     match (
         entry_identity_if_present(sessions.as_raw_fd(), root)?,
@@ -1782,7 +2125,11 @@ fn promote_tombstone(
             match authority::rename_no_replace(sessions.as_raw_fd(), root, tombstone) {
                 Ok(()) => {
                     #[cfg(git_vws_m4_checkpoint)]
-                    session_checkpoint("remove", _record, "tombstone-renamed")?;
+                    session_checkpoint(
+                        _operation,
+                        _record,
+                        tombstone_stage(_operation, "tombstone-renamed"),
+                    )?;
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                     return Err(Error::io(
@@ -1807,7 +2154,11 @@ fn promote_tombstone(
                 )
             })?;
             #[cfg(git_vws_m4_checkpoint)]
-            session_checkpoint("remove", _record, "tombstone-parent-synced")?;
+            session_checkpoint(
+                _operation,
+                _record,
+                tombstone_stage(_operation, "tombstone-parent-synced"),
+            )?;
             if !entry_identity_if_present(sessions.as_raw_fd(), tombstone)?
                 .is_some_and(|identity| identity.same_node(expected))
             {
@@ -1823,6 +2174,19 @@ fn promote_tombstone(
             "SESSION_RECOVERY_REQUIRED",
             "session root and tombstone names are not safely recoverable",
         )),
+    }
+}
+
+#[cfg(git_vws_m4_checkpoint)]
+fn tombstone_stage(operation: &str, stage: &'static str) -> &'static str {
+    if operation != "gc" {
+        return stage;
+    }
+    match stage {
+        "tombstone-renamed" => "session-tombstone-renamed",
+        "tombstone-parent-synced" => "session-tombstone-parent-synced",
+        "owned-tree-removed" => "session-owned-tree-removed",
+        _ => stage,
     }
 }
 
@@ -1849,10 +2213,9 @@ fn ensure_discard_safe(ready: &ReadySession, record: &SessionRecord) -> Result<(
             "worktree has tracked, untracked, or ignored changes",
         ));
     }
-    let common = storage::open_directory_at(ready.root.as_raw_fd(), c"common.git")?;
-    ensure_private_refs_safe(&common, &ready.root_path, record)?;
-    ensure_private_object_store_empty(&common)?;
-    ensure_no_unreachable_private_closure(&common, &ready.root_path, record)?;
+    ensure_private_refs_safe(&ready.common, &ready.root_path, record)?;
+    ensure_private_object_store_empty(&ready.common)?;
+    ensure_no_unreachable_private_closure(&ready.common, &ready.root_path, record)?;
     Ok(())
 }
 
@@ -2149,6 +2512,8 @@ struct ReadySession {
     root: File,
     root_name: CString,
     root_identity: Identity,
+    common: File,
+    common_identity: Identity,
     root_path: PathBuf,
     worktree_path: PathBuf,
 }
@@ -2240,6 +2605,1011 @@ fn diagnose_list_record(
     Ok(())
 }
 
+fn session_census(
+    templates: &File,
+    sessions: &File,
+    sessions_path: &Path,
+    report_temporary: bool,
+) -> Result<SessionCensus, Error> {
+    let names = storage::directory_names(sessions.as_raw_fd())?;
+    let mut census = SessionCensus {
+        reachable_templates: BTreeSet::new(),
+        capabilities: Vec::new(),
+        temporaries: Vec::new(),
+        report: MaintenanceReport::default(),
+    };
+    let mut authorized = BTreeSet::new();
+    for name in &names {
+        if !session_record_name(name) {
+            continue;
+        }
+        authorized.insert(name.clone());
+        match read_record_capability(sessions, name) {
+            Ok(capability) => {
+                match &capability.record.payload {
+                    SessionPayload::Prepared { .. } => {}
+                    SessionPayload::Materializing { root_name, .. }
+                    | SessionPayload::Ready { root_name, .. } => {
+                        authorized.insert(root_name.as_bytes().to_vec());
+                    }
+                    SessionPayload::Tombstoned {
+                        root_name,
+                        tombstone_name,
+                        ..
+                    } => {
+                        authorized.insert(root_name.as_bytes().to_vec());
+                        authorized.insert(tombstone_name.as_bytes().to_vec());
+                    }
+                }
+                let state = match capability.record.payload {
+                    SessionPayload::Prepared { .. } | SessionPayload::Materializing { .. } => {
+                        "CREATING"
+                    }
+                    SessionPayload::Ready { .. } => "READY",
+                    SessionPayload::Tombstoned { .. } => "TOMBSTONED",
+                };
+                let private_objects: Result<Option<PrivateObjectPlan>, Error> = (|| {
+                    template::validate_session_template(
+                        templates,
+                        &capability.record.template_key,
+                        &capability.record.template,
+                    )?;
+                    let authority = authority_from_record(&capability.record)?;
+                    if !matches!(capability.record.payload, SessionPayload::Ready { .. }) {
+                        diagnose_list_record(sessions, sessions_path, &authority, &capability)?;
+                        return Ok(None);
+                    }
+                    let ready =
+                        load_ready_capability(sessions, sessions_path, &authority, &capability)?;
+                    let plan =
+                        classify_private_objects(&ready.common, &authority, &capability.record)?;
+                    revalidate_record(sessions, &capability)?;
+                    Ok(Some(plan))
+                })(
+                );
+                if private_objects.is_ok() {
+                    census
+                        .reachable_templates
+                        .insert(capability.record.template_key.clone());
+                }
+                if private_objects.is_err() {
+                    census.report.recovery("session", name, name, state);
+                } else if !capability.record.journal.is_idle() {
+                    census.report.recovery("session", name, name, "PUBLISH");
+                } else {
+                    census.report.entry(
+                        "session",
+                        name,
+                        name,
+                        state,
+                        if matches!(capability.record.payload, SessionPayload::Tombstoned { .. }) {
+                            "PENDING"
+                        } else {
+                            "RETAINED"
+                        },
+                    );
+                }
+                census.capabilities.push(CensusCapability {
+                    capability,
+                    private_objects: private_objects.ok().flatten(),
+                });
+            }
+            Err(_) => {
+                census.report.recovery("session", name, name, "CORRUPT");
+            }
+        }
+    }
+    for name in names {
+        if authorized.contains(&name) {
+            continue;
+        }
+        if name.starts_with(b".") && name.ends_with(b".tmp") {
+            match session_predecessor_temporary(sessions, &name) {
+                Ok(_) => {
+                    census.temporaries.push(name.clone());
+                    if report_temporary {
+                        census
+                            .report
+                            .entry("session", &name, &name, "TMP", "RETAINED");
+                    }
+                }
+                Err(_) => {
+                    census.report.recovery("session", &name, &name, "TMP");
+                }
+            }
+        } else {
+            census.report.recovery("session", &name, &name, "UNKNOWN");
+        }
+    }
+    Ok(census)
+}
+
+fn session_record_name(name: &[u8]) -> bool {
+    name.starts_with(b"session-") && name.ends_with(b".record")
+}
+
+fn session_predecessor_temporary(
+    sessions: &File,
+    name: &[u8],
+) -> Result<(RecordCapability, authority::RecordTxnTemporary), Error> {
+    let temporary =
+        authority::record_txn_temporary(sessions, name, MAX_RECORD)?.ok_or_else(|| {
+            Error::new(
+                "SESSION_RECOVERY_REQUIRED",
+                "temporary session record basename is not a RecordTxn predecessor",
+            )
+        })?;
+    if !session_record_name(&temporary.final_name) {
+        return Err(Error::new(
+            "SESSION_RECOVERY_REQUIRED",
+            "temporary record does not name a session record",
+        ));
+    }
+    let previous =
+        record_capability_from_binding(temporary.final_name.clone(), temporary.binding.clone())?;
+    let current = read_record_capability(sessions, &temporary.final_name)?;
+    if session_precedes(&previous.record, &current.record) {
+        Ok((current, temporary))
+    } else {
+        Err(Error::new(
+            "SESSION_RECOVERY_REQUIRED",
+            "temporary session record is not the direct predecessor of its current record",
+        ))
+    }
+}
+
+fn session_precedes(previous: &SessionRecord, current: &SessionRecord) -> bool {
+    if !matches_existing(previous, current)
+        || !previous.journal.is_idle()
+        || !current.journal.is_idle()
+    {
+        return false;
+    }
+    match (&previous.payload, &current.payload) {
+        (
+            SessionPayload::Prepared { root_name: left },
+            SessionPayload::Materializing {
+                root_name: right, ..
+            },
+        ) => left == right,
+        (
+            SessionPayload::Materializing {
+                root_name: left,
+                root_identity: left_identity,
+            },
+            SessionPayload::Ready {
+                root_name: right,
+                root_identity: right_identity,
+                ..
+            },
+        ) => left == right && left_identity.same_node(*right_identity),
+        (
+            SessionPayload::Ready {
+                root_name: left,
+                root_identity: left_identity,
+                ..
+            },
+            SessionPayload::Tombstoned {
+                root_name: right,
+                root_identity: right_identity,
+                ..
+            },
+        ) => left == right && left_identity.same_node(*right_identity),
+        _ => false,
+    }
+}
+
+fn gc_sessions(sessions: &File, sessions_path: &Path, census: &SessionCensus) -> MaintenanceReport {
+    let mut report = MaintenanceReport::default();
+    for name in &census.temporaries {
+        match gc_session_predecessor_temporary(sessions, name) {
+            Ok(_) => report.entry("session", name, name, "TMP", "REMOVED"),
+            Err(_) => {
+                report.recovery("session", name, name, "TMP");
+                return report;
+            }
+        }
+    }
+    for census_capability in &census.capabilities {
+        let capability = &census_capability.capability;
+        match &capability.record.payload {
+            SessionPayload::Tombstoned { tombstone_name, .. } => {
+                let result = maintenance_context(sessions, sessions_path, &capability.record)
+                    .and_then(|context| {
+                        complete_tombstone(&context, capability, "gc")?;
+                        #[cfg(git_vws_m4_checkpoint)]
+                        session_checkpoint("gc", &capability.record, "session-return")?;
+                        Ok(())
+                    });
+                if result.is_ok() {
+                    report.entry(
+                        "session",
+                        &capability.basename,
+                        tombstone_name.as_bytes(),
+                        "TOMBSTONED",
+                        "REMOVED",
+                    );
+                } else {
+                    report.recovery(
+                        "session",
+                        &capability.basename,
+                        tombstone_name.as_bytes(),
+                        "TOMBSTONED",
+                    );
+                    return report;
+                }
+            }
+            SessionPayload::Ready { .. } if capability.record.journal.is_idle() => {
+                let result = census_capability
+                    .private_objects
+                    .as_ref()
+                    .ok_or_else(|| {
+                        session_recovery("READY session was not fully classified before cleanup")
+                    })
+                    .and_then(|plan| {
+                        gc_private_loose(sessions, sessions_path, capability, plan, &mut report)
+                    });
+                match result {
+                    Ok(()) => {}
+                    Err(error) if error.code == "SESSION_BUSY" => report.entry(
+                        "session",
+                        &capability.basename,
+                        &capability.basename,
+                        "READY",
+                        "BUSY",
+                    ),
+                    Err(_) => {
+                        report.recovery(
+                            "session",
+                            &capability.basename,
+                            &capability.basename,
+                            "READY",
+                        );
+                        return report;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    report
+}
+
+fn gc_session_predecessor_temporary(
+    sessions: &File,
+    name: &[u8],
+) -> Result<RecordCapability, Error> {
+    let (current, temporary) = session_predecessor_temporary(sessions, name)?;
+    #[cfg(git_vws_m4_checkpoint)]
+    authority::remove_record_txn_temporary_bound(
+        sessions,
+        name,
+        &temporary.binding,
+        "gc",
+        &current.record.sid,
+        &current.record.template_key,
+    )?;
+    #[cfg(not(git_vws_m4_checkpoint))]
+    authority::remove_record_txn_temporary_bound(sessions, name, &temporary.binding)?;
+    #[cfg(git_vws_m4_checkpoint)]
+    session_checkpoint("gc", &current.record, "predecessor-tmp-removed")?;
+    Ok(current)
+}
+
+fn gc_private_loose(
+    sessions: &File,
+    sessions_path: &Path,
+    capability: &RecordCapability,
+    plan: &PrivateObjectPlan,
+    report: &mut MaintenanceReport,
+) -> Result<(), Error> {
+    let context = maintenance_context(sessions, sessions_path, &capability.record)?;
+    let ready = load_ready_capability(
+        &context.sessions,
+        &context.sessions_path,
+        &context.authority,
+        capability,
+    )?;
+    acquire_lease(&ready.root, true)?;
+    let current = revalidate_ready_lease(&context, capability, &ready)?;
+    ensure_publish_idle(&current.record)?;
+    let lease_plan = classify_private_objects(&ready.common, &context.authority, &current.record)?;
+    require_session(
+        lease_plan == *plan,
+        "private object classifier binding changed while its lease was held",
+    )?;
+    let (authority_objects, mut authority_objects_plan) =
+        open_record_authority_objects(&current.record)?;
+    classify_authority_objects(
+        &authority_objects,
+        &mut authority_objects_plan,
+        current.record.base.len(),
+    )?;
+    require_session(
+        authority_objects_plan == plan.authority_objects,
+        "authority object classifier binding changed before cleanup",
+    )?;
+    let (private_objects, objects_identity) = open_private_objects(&ready.common, &current.record)?;
+    require_session(
+        objects_identity == plan.objects_identity
+            && private_objects_matches_plan(&private_objects, plan)?,
+        "private object classifier binding changed before cleanup",
+    )?;
+    if plan.pack_present {
+        report.entry(
+            "loose",
+            &current.basename,
+            &loose_path_name(&current.record, b"pack", None),
+            "PACK",
+            "RETAINED",
+        );
+    }
+    let mut removed = false;
+    for fanout_plan in &plan.fanouts {
+        let fanout_name = &fanout_plan.name;
+        let fanout = cstring(fanout_name, "private loose object fanout")?;
+        let (private_fanout, fanout_identity) = open_git_metadata_directory(
+            &private_objects,
+            &fanout,
+            objects_identity,
+            &current.record.volume,
+            "private object metadata is not an owned same-volume directory",
+        )?;
+        require_session(
+            fanout_identity == fanout_plan.identity
+                && private_fanout_matches_plan(&private_fanout, fanout_plan)?,
+            "private loose object fanout changed after classification",
+        )?;
+        let authority_fanout = match fanout_plan.authority_identity {
+            Some(expected) if fanout_plan.loose.iter().any(loose_plan_removes) => {
+                match open_authority_fanout(&authority_objects, &authority_objects_plan, &fanout)? {
+                    Some((fanout, identity)) if identity == expected => Some(fanout),
+                    _ => {
+                        return Err(session_recovery(
+                            "authority loose object fanout changed after classification",
+                        ))
+                    }
+                }
+            }
+            _ => None,
+        };
+        let fanout_removed = gc_loose_fanout(
+            &private_fanout,
+            authority_fanout.as_ref(),
+            fanout_name,
+            &fanout_plan.loose,
+            &current,
+            report,
+        )?;
+        let empty = storage::directory_names(private_fanout.as_raw_fd())?.is_empty();
+        drop(authority_fanout);
+        drop(private_fanout);
+        if empty {
+            storage::unlink_empty_owned_directory(
+                &private_objects,
+                &fanout,
+                fanout_identity,
+                &current.record.volume,
+            )?;
+            #[cfg(git_vws_m4_checkpoint)]
+            session_checkpoint("gc", &current.record, "loose-fanout-unlinked")?;
+            private_objects.sync_all().map_err(|error| {
+                Error::io(
+                    "SESSION_RECOVERY_REQUIRED",
+                    "cannot sync private object directory after fanout cleanup",
+                    error,
+                )
+            })?;
+            #[cfg(git_vws_m4_checkpoint)]
+            session_checkpoint("gc", &current.record, "loose-fanout-parent-synced")?;
+            report.entry(
+                "loose",
+                &current.basename,
+                &loose_path_name(&current.record, fanout_name, None),
+                "FANOUT",
+                "REMOVED",
+            );
+            removed = true;
+        }
+        removed |= fanout_removed;
+    }
+    if removed {
+        #[cfg(git_vws_m4_checkpoint)]
+        session_checkpoint("gc", &current.record, "loose-return")?;
+    }
+    Ok(())
+}
+
+fn gc_loose_fanout(
+    private_fanout: &File,
+    authority_fanout: Option<&File>,
+    fanout_name: &[u8],
+    loose: &[PrivateLoosePlan],
+    current: &RecordCapability,
+    report: &mut MaintenanceReport,
+) -> Result<bool, Error> {
+    let mut removed = false;
+    for loose_plan in loose {
+        let name = cstring(&loose_plan.name, "private loose object")?;
+        if storage::identity_at(private_fanout.as_raw_fd(), &name)? != loose_plan.identity {
+            return Err(session_recovery(
+                "private loose object changed after classification",
+            ));
+        }
+        let path = loose_path_name(&current.record, fanout_name, Some(&loose_plan.name));
+        match &loose_plan.action {
+            LooseAction::Retain => retain_loose(report, current, &path),
+            LooseAction::Remove { authority_identity } => {
+                let authority_fanout = authority_fanout.ok_or_else(|| {
+                    session_recovery("authority loose object plan lost its fanout binding")
+                })?;
+                storage::unlink_identical_owned_regular(
+                    private_fanout,
+                    &name,
+                    loose_plan.identity,
+                    authority_fanout,
+                    &name,
+                    *authority_identity,
+                )?;
+                #[cfg(git_vws_m4_checkpoint)]
+                session_checkpoint("gc", &current.record, "loose-object-unlinked")?;
+                private_fanout.sync_all().map_err(|error| {
+                    Error::io(
+                        "SESSION_RECOVERY_REQUIRED",
+                        "cannot sync private loose object fanout",
+                        error,
+                    )
+                })?;
+                #[cfg(git_vws_m4_checkpoint)]
+                session_checkpoint("gc", &current.record, "loose-object-parent-synced")?;
+                report.entry("loose", &current.basename, &path, "LOOSE", "REMOVED");
+                removed = true;
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn private_objects_matches_plan(objects: &File, plan: &PrivateObjectPlan) -> Result<bool, Error> {
+    let mut expected = vec![b"info".to_vec()];
+    if plan.pack_present {
+        expected.push(b"pack".to_vec());
+    }
+    expected.extend(plan.fanouts.iter().map(|fanout| fanout.name.clone()));
+    expected.sort();
+    Ok(storage::directory_names(objects.as_raw_fd())? == expected)
+}
+
+fn private_fanout_matches_plan(fanout: &File, plan: &PrivateFanoutPlan) -> Result<bool, Error> {
+    Ok(storage::directory_names(fanout.as_raw_fd())?
+        == plan
+            .loose
+            .iter()
+            .map(|loose| loose.name.clone())
+            .collect::<Vec<_>>())
+}
+
+fn loose_plan_removes(plan: &PrivateLoosePlan) -> bool {
+    matches!(&plan.action, LooseAction::Remove { .. })
+}
+
+fn retain_loose(report: &mut MaintenanceReport, current: &RecordCapability, path: &[u8]) {
+    report.entry("loose", &current.basename, path, "LOOSE", "RETAINED");
+}
+
+fn open_record_authority_objects(
+    record: &SessionRecord,
+) -> Result<(File, AuthorityObjectsPlan), Error> {
+    let path = authority_path_from_record(record)?;
+    let root = File::open(&path).map_err(|error| {
+        Error::io(
+            "SESSION_RECOVERY_REQUIRED",
+            "cannot open authority for loose object comparison",
+            error,
+        )
+    })?;
+    require_session(
+        Identity::from_file(&root)?.same_node(record.authority_identity)
+            && record.authority_identity.directory(),
+        "authority identity changed before loose object comparison",
+    )?;
+    bind_path(&path, &root, "authority")?;
+    let root_identity = Identity::from_file(&root)?;
+    let root_volume = storage::volume_id(&root)?;
+    let (objects, identity) = open_git_metadata_directory(
+        &root,
+        c"objects",
+        root_identity,
+        &root_volume,
+        "authority object metadata is not an owned same-volume directory",
+    )?;
+    Ok((
+        objects,
+        AuthorityObjectsPlan {
+            identity,
+            volume: root_volume,
+            entries: Vec::new(),
+        },
+    ))
+}
+
+fn open_git_metadata_directory(
+    parent: &File,
+    name: &CStr,
+    parent_identity: Identity,
+    volume: &str,
+    detail: &'static str,
+) -> Result<(File, Identity), Error> {
+    let identity = storage::identity_at(parent.as_raw_fd(), name)?;
+    let directory = storage::open_directory_at(parent.as_raw_fd(), name)?;
+    require_session(
+        Identity::from_file(&directory)? == identity
+            && private_git_metadata_directory(identity)
+            && identity.dev == parent_identity.dev
+            && storage::volume_id(&directory)? == volume,
+        detail,
+    )?;
+    Ok((directory, identity))
+}
+
+fn open_private_objects(common: &File, record: &SessionRecord) -> Result<(File, Identity), Error> {
+    open_git_metadata_directory(
+        common,
+        c"objects",
+        Identity::from_file(common)?,
+        &record.volume,
+        "private object metadata is not an owned same-volume directory",
+    )
+}
+
+fn classify_private_objects(
+    common: &File,
+    authority: &Authority,
+    record: &SessionRecord,
+) -> Result<PrivateObjectPlan, Error> {
+    let (authority_objects, mut authority_objects_plan) = open_record_authority_objects(record)?;
+    classify_authority_objects(
+        &authority_objects,
+        &mut authority_objects_plan,
+        record.base.len(),
+    )?;
+    let (objects, objects_identity) = open_private_objects(common, record)?;
+    let oid_length = record.base.len();
+    let tail_length = oid_length - 2;
+    let mut plan = PrivateObjectPlan {
+        objects_identity,
+        authority_objects: authority_objects_plan,
+        pack_present: false,
+        fanouts: Vec::new(),
+    };
+    let mut info_present = false;
+    for entry in storage::directory_names(objects.as_raw_fd())? {
+        match entry.as_slice() {
+            b"info" => {
+                classify_private_info(&objects, objects_identity, authority, record)?;
+                info_present = true;
+            }
+            b"pack" => {
+                classify_private_pack(&objects, objects_identity, &record.volume, oid_length)?;
+                plan.pack_present = true;
+            }
+            _ if loose_fanout_name(&entry) => plan.fanouts.push(classify_private_fanout(
+                &objects,
+                objects_identity,
+                &record.volume,
+                &authority_objects,
+                &plan.authority_objects,
+                &entry,
+                tail_length,
+            )?),
+            _ => {
+                return Err(session_recovery(
+                    "private object store contains an unrecognized entry",
+                ))
+            }
+        }
+    }
+    require_session(
+        info_present
+            && Identity::from_file(&objects)? == objects_identity
+            && storage::identity_at(common.as_raw_fd(), c"objects")? == objects_identity
+            && Identity::from_file(&authority_objects)? == plan.authority_objects.identity
+            && storage::volume_id(&authority_objects)? == plan.authority_objects.volume,
+        "private object store changed during classification",
+    )?;
+    Ok(plan)
+}
+
+fn classify_authority_objects(
+    objects: &File,
+    plan: &mut AuthorityObjectsPlan,
+    oid_length: usize,
+) -> Result<(), Error> {
+    plan.entries.clear();
+    for entry in storage::directory_names(objects.as_raw_fd())? {
+        require_session(
+            matches!(entry.as_slice(), b"info" | b"pack") || loose_fanout_name(&entry),
+            "authority object store contains an unrecognized entry",
+        )?;
+        let name = cstring(&entry, "authority object metadata")?;
+        let (directory, identity) = open_git_metadata_directory(
+            objects,
+            &name,
+            plan.identity,
+            &plan.volume,
+            "authority object metadata is not an owned same-volume directory",
+        )?;
+        let children = match entry.as_slice() {
+            b"info" => {
+                require_session(
+                    storage::directory_names(directory.as_raw_fd())?.is_empty(),
+                    "authority object info contains an unrecognized entry",
+                )?;
+                Vec::new()
+            }
+            b"pack" => classify_pack_entries(
+                &directory,
+                identity,
+                &plan.volume,
+                oid_length,
+                "authority packed object",
+            )?,
+            _ => classify_authority_fanout(&directory, identity, &plan.volume, oid_length - 2)?,
+        };
+        plan.entries.push(AuthorityObjectPlan {
+            name: entry,
+            identity,
+            children,
+        });
+    }
+    Ok(())
+}
+
+fn classify_authority_fanout(
+    fanout: &File,
+    fanout_identity: Identity,
+    volume: &str,
+    tail_length: usize,
+) -> Result<Vec<(Vec<u8>, Identity)>, Error> {
+    let mut children = Vec::new();
+    for tail in storage::directory_names(fanout.as_raw_fd())? {
+        let name = cstring(&tail, "authority loose object")?;
+        let identity = storage::identity_at(fanout.as_raw_fd(), &name)?;
+        require_session(
+            tail.len() == tail_length && lower_hex(&tail),
+            "authority loose object has an unrecognized name or type",
+        )?;
+        validate_authority_regular(
+            fanout,
+            &name,
+            identity,
+            fanout_identity,
+            volume,
+            "authority loose object has an unsafe identity",
+        )?;
+        children.push((tail, identity));
+    }
+    require_session(
+        Identity::from_file(fanout)? == fanout_identity,
+        "authority loose object fanout changed during classification",
+    )?;
+    Ok(children)
+}
+
+fn validate_authority_regular(
+    parent: &File,
+    name: &CStr,
+    expected: Identity,
+    parent_identity: Identity,
+    volume: &str,
+    detail: &'static str,
+) -> Result<(), Error> {
+    require_session(
+        expected.regular()
+            && expected.uid == current_uid()
+            && expected.nlink == 1
+            && expected.mode & 0o022 == 0
+            && expected.dev == parent_identity.dev,
+        detail,
+    )?;
+    let raw = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(Error::io(
+            "SESSION_RECOVERY_REQUIRED",
+            detail,
+            io::Error::last_os_error(),
+        ));
+    }
+    let file = unsafe { File::from_raw_fd(raw) };
+    require_session(
+        Identity::from_file(&file)? == expected && storage::same_volume(&file, volume)?,
+        detail,
+    )
+}
+
+fn classify_private_info(
+    objects: &File,
+    objects_identity: Identity,
+    authority: &Authority,
+    record: &SessionRecord,
+) -> Result<(), Error> {
+    let (info, identity) = open_git_metadata_directory(
+        objects,
+        c"info",
+        objects_identity,
+        &record.volume,
+        "private object metadata is not an owned same-volume directory",
+    )?;
+    let names = storage::directory_names(info.as_raw_fd())?;
+    require_session(
+        names.len() == 1 && names[0] == b"alternates",
+        "private object info directory contains an unrecognized entry",
+    )?;
+    let mut expected = authority
+        .canonical
+        .join("objects")
+        .into_os_string()
+        .into_vec();
+    expected.push(b'\n');
+    require_session(
+        read_regular_at(&info, c"alternates", "private alternate")? == expected
+            && Identity::from_file(&info)? == identity
+            && storage::identity_at(objects.as_raw_fd(), c"info")? == identity,
+        "private object alternate changed during classification",
+    )?;
+    Ok(())
+}
+
+fn classify_private_pack(
+    objects: &File,
+    objects_identity: Identity,
+    volume: &str,
+    oid_length: usize,
+) -> Result<(), Error> {
+    let (pack, identity) = open_git_metadata_directory(
+        objects,
+        c"pack",
+        objects_identity,
+        volume,
+        "private object metadata is not an owned same-volume directory",
+    )?;
+    classify_pack_entries(&pack, identity, volume, oid_length, "private packed object")?;
+    require_session(
+        Identity::from_file(&pack)? == identity
+            && storage::identity_at(objects.as_raw_fd(), c"pack")? == identity,
+        "private packed object directory changed during classification",
+    )?;
+    Ok(())
+}
+
+fn classify_pack_entries(
+    pack: &File,
+    pack_identity: Identity,
+    volume: &str,
+    oid_length: usize,
+    label: &'static str,
+) -> Result<Vec<(Vec<u8>, Identity)>, Error> {
+    let entries = storage::directory_names(pack.as_raw_fd())?;
+    let mut children = Vec::new();
+    for entry in &entries {
+        let name = cstring(entry, label)?;
+        let entry_identity = storage::identity_at(pack.as_raw_fd(), &name)?;
+        require_session(
+            pack_entry_name(entry, oid_length),
+            "packed object has an unrecognized name or type",
+        )?;
+        validate_authority_regular(
+            pack,
+            &name,
+            entry_identity,
+            pack_identity,
+            volume,
+            "packed object has an unsafe identity",
+        )?;
+        let pair = pack_entry_pair(entry)
+            .ok_or_else(|| session_recovery("packed object has an unrecognized name or type"))?;
+        require_session(
+            entries.iter().any(|candidate| candidate == &pair),
+            "packed object is missing its pair",
+        )?;
+        children.push((entry.clone(), entry_identity));
+    }
+    Ok(children)
+}
+
+fn classify_private_fanout(
+    objects: &File,
+    objects_identity: Identity,
+    volume: &str,
+    authority_objects: &File,
+    authority_plan: &AuthorityObjectsPlan,
+    name: &[u8],
+    tail_length: usize,
+) -> Result<PrivateFanoutPlan, Error> {
+    let name = cstring(name, "private loose object fanout")?;
+    let (fanout, identity) = open_git_metadata_directory(
+        objects,
+        &name,
+        objects_identity,
+        volume,
+        "private object metadata is not an owned same-volume directory",
+    )?;
+    let authority_fanout = open_authority_fanout(authority_objects, authority_plan, &name)?;
+    let authority_identity = authority_fanout.as_ref().map(|(_, identity)| *identity);
+    let mut loose = Vec::new();
+    for tail in storage::directory_names(fanout.as_raw_fd())? {
+        let tail_name = cstring(&tail, "private loose object")?;
+        let tail_identity = storage::identity_at(fanout.as_raw_fd(), &tail_name)?;
+        require_session(
+            tail.len() == tail_length && lower_hex(&tail) && loose_regular_owner(tail_identity),
+            "private loose object has an unrecognized name or type",
+        )?;
+        let action = classify_private_loose(
+            &fanout,
+            &tail_name,
+            tail_identity,
+            authority_fanout.as_ref().map(|(fanout, _)| fanout),
+            authority_identity,
+        )?;
+        loose.push(PrivateLoosePlan {
+            name: tail,
+            identity: tail_identity,
+            action,
+        });
+    }
+    if let Some((authority_fanout, expected)) = authority_fanout.as_ref() {
+        require_session(
+            Identity::from_file(authority_fanout)? == *expected
+                && storage::identity_at(authority_objects.as_raw_fd(), &name)? == *expected,
+            "authority loose object fanout changed during classification",
+        )?;
+    }
+    require_session(
+        Identity::from_file(&fanout)? == identity
+            && storage::identity_at(objects.as_raw_fd(), &name)? == identity,
+        "private loose object fanout changed during classification",
+    )?;
+    Ok(PrivateFanoutPlan {
+        name: name.into_bytes(),
+        identity,
+        authority_identity,
+        loose,
+    })
+}
+
+fn open_authority_fanout(
+    authority_objects: &File,
+    authority_plan: &AuthorityObjectsPlan,
+    name: &CStr,
+) -> Result<Option<(File, Identity)>, Error> {
+    let Some(expected) = entry_identity_if_present(authority_objects.as_raw_fd(), name)? else {
+        return Ok(None);
+    };
+    require_session(
+        private_git_metadata_directory(expected) && expected.dev == authority_plan.identity.dev,
+        "authority loose object fanout has an unsafe identity",
+    )?;
+    let (fanout, identity) = open_git_metadata_directory(
+        authority_objects,
+        name,
+        authority_plan.identity,
+        &authority_plan.volume,
+        "authority object metadata is not an owned same-volume directory",
+    )?;
+    require_session(
+        identity == expected,
+        "authority loose object fanout changed while opening",
+    )?;
+    Ok(Some((fanout, identity)))
+}
+
+fn classify_private_loose(
+    private_fanout: &File,
+    name: &CStr,
+    private_identity: Identity,
+    authority_fanout: Option<&File>,
+    authority_fanout_identity: Option<Identity>,
+) -> Result<LooseAction, Error> {
+    let Some(authority_fanout) = authority_fanout else {
+        return Ok(LooseAction::Retain);
+    };
+    let Some(authority_identity) = entry_identity_if_present(authority_fanout.as_raw_fd(), name)?
+    else {
+        return Ok(LooseAction::Retain);
+    };
+    let authority_fanout_identity = authority_fanout_identity
+        .ok_or_else(|| session_recovery("authority loose object plan lost its fanout identity"))?;
+    require_session(
+        loose_regular_owner(authority_identity)
+            && authority_identity.dev == authority_fanout_identity.dev,
+        "authority loose object has an unsafe identity",
+    )?;
+    match storage::verify_identical_owned_regular(
+        private_fanout,
+        name,
+        private_identity,
+        authority_fanout,
+        name,
+        authority_identity,
+    ) {
+        Ok(()) if private_identity.nlink == 1 && authority_identity.nlink == 1 => {
+            Ok(LooseAction::Remove { authority_identity })
+        }
+        Ok(()) => Ok(LooseAction::Retain),
+        Err(error)
+            if error.code == "STORAGE_UNSUPPORTED"
+                && error.detail == "private loose object is not an exact authority duplicate" =>
+        {
+            Ok(LooseAction::Retain)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn pack_entry_name(name: &[u8], oid_length: usize) -> bool {
+    for suffix in [b".pack".as_slice(), b".idx".as_slice()] {
+        if let Some(oid) = name
+            .strip_prefix(b"pack-")
+            .and_then(|value| value.strip_suffix(suffix))
+        {
+            return oid.len() == oid_length && lower_hex(oid);
+        }
+    }
+    false
+}
+
+fn pack_entry_pair(name: &[u8]) -> Option<Vec<u8>> {
+    let (stem, suffix) = if let Some(stem) = name.strip_suffix(b".pack") {
+        (stem, b".idx".as_slice())
+    } else if let Some(stem) = name.strip_suffix(b".idx") {
+        (stem, b".pack".as_slice())
+    } else {
+        return None;
+    };
+    let mut pair = stem.to_vec();
+    pair.extend_from_slice(suffix);
+    Some(pair)
+}
+
+fn loose_regular_owner(identity: Identity) -> bool {
+    identity.regular() && identity.uid == current_uid()
+}
+
+fn loose_fanout_name(name: &[u8]) -> bool {
+    name.len() == 2 && lower_hex(name)
+}
+
+fn lower_hex(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn require_session(condition: bool, detail: &'static str) -> Result<(), Error> {
+    if condition {
+        Ok(())
+    } else {
+        Err(session_recovery(detail))
+    }
+}
+
+fn loose_path_name(record: &SessionRecord, fanout: &[u8], tail: Option<&[u8]>) -> Vec<u8> {
+    let mut path = root_name(&record.sid).into_bytes();
+    path.extend_from_slice(b"/common.git/objects/");
+    path.extend_from_slice(fanout);
+    if let Some(tail) = tail {
+        path.push(b'/');
+        path.extend_from_slice(tail);
+    }
+    path
+}
+
 fn load_ready_session(
     sessions: &File,
     sessions_path: &Path,
@@ -2319,6 +3689,8 @@ fn load_ready_session(
         root,
         root_name: name,
         root_identity: *root_identity,
+        common,
+        common_identity: *common_identity,
         root_path,
         worktree_path,
     })
