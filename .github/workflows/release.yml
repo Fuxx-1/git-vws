@@ -6,9 +6,15 @@ on:
 
 permissions:
   contents: read
+  attestations: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
   validate-tag:
@@ -16,23 +22,31 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      source-date-epoch: ${{ steps.version.outputs.source-date-epoch }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          set-safe-directory: false
       - uses: dtolnay/rust-toolchain@1.85.0
       - id: version
-        name: Match tag to Cargo package version
+        name: Match tag, package version, and commit
         shell: bash
         run: |
-          version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
-          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "tag $GITHUB_REF_NAME does not match Cargo version $version" >&2
+          set -euo pipefail
+          version="$(python3 -c 'import json,subprocess; data=json.loads(subprocess.check_output(["cargo","metadata","--locked","--no-deps","--format-version","1"])); print(data["packages"][0]["version"])')"
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]]; then
+            printf 'release tag is not a semantic prerelease: %s\n' "$GITHUB_REF_NAME" >&2
             exit 1
           fi
-          case "$version" in
-            *-*) ;;
-            *) echo "alpha workflow only publishes prerelease versions" >&2; exit 1 ;;
-          esac
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          test "$GITHUB_REF_NAME" = "v$version"
+          tagged="$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")"
+          test "$tagged" = "$GITHUB_SHA"
+          epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          test "$epoch" -gt 0
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'source-date-epoch=%s\n' "$epoch" >> "$GITHUB_OUTPUT"
 
   validation:
     name: Validate macOS/Linux on release commit
@@ -41,137 +55,230 @@ jobs:
     permissions:
       contents: read
 
-  build:
-    name: Build ${{ matrix.asset }}
+  metadata:
+    name: Generate release metadata
     needs: [validate-tag, validation]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          set-safe-directory: false
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: Generate SPDX and license inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/release.py common \
+            --output release-common \
+            --version '${{ needs.validate-tag.outputs.version }}' \
+            --source-sha "$GITHUB_SHA" \
+            --epoch '${{ needs.validate-tag.outputs.source-date-epoch }}'
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-common
+          path: release-common
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [validate-tag, validation, metadata]
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            asset: x86_64-unknown-linux-musl
-            binary: git-vws
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            asset: x86_64-apple-darwin
-            binary: git-vws
           - os: macos-15
             target: aarch64-apple-darwin
-            asset: aarch64-apple-darwin
-            binary: git-vws
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          set-safe-directory: false
+      - uses: actions/download-artifact@v5
+        with:
+          name: release-common
+          path: release-common
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
           targets: ${{ matrix.target }}
-      - name: Install Linux musl toolchain
+      - name: Install Linux release tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
+          sudo apt-get install -y binutils file musl-tools
       - name: Build release binary
         shell: bash
         run: |
+          set -euo pipefail
           unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS
-          for variable in "${!CARGO_TARGET_@}"; do
-            [[ "$variable" == *_RUSTFLAGS ]] && unset "$variable"
-          done
-          cargo build --locked --release --all-features --target ${{ matrix.target }} --bin git-vws
-      - name: Reject checkpoint controls
+          while IFS= read -r variable; do
+            unset "$variable"
+          done < <(compgen -e | grep -E '^CARGO_TARGET_.*_RUSTFLAGS$' || true)
+          cargo build --locked --release --all-features \
+            --target '${{ matrix.target }}' --bin git-vws
+      - name: Verify and package native archive
         shell: bash
         run: |
-          binary="target/${{ matrix.target }}/release/${{ matrix.binary }}"
-          if ! strings_output="$(strings "$binary")"; then
-            echo "cannot inspect release binary strings" >&2
-            exit 1
-          fi
-          if grep -F -e 'M4CP/1' -e 'GIT_VWS_M4_CONTROL_FD' -e 'GIT_VWS_M4_NONCE' -e 'GIT_VWS_M4_TARGET' <<<"$strings_output"; then
-            echo "release binary retains M4 checkpoint controls" >&2
-            exit 1
-          fi
-          if ! symbols="$(nm -a "$binary")"; then
-            echo "cannot inspect release binary symbols" >&2
-            exit 1
-          fi
-          if grep -F 'm4_checkpoint' <<<"$symbols"; then
-            echo "release binary retains M4 checkpoint symbols" >&2
-            exit 1
-          fi
-      - name: Verify native binary
-        shell: bash
-        run: |
-          target/${{ matrix.target }}/release/${{ matrix.binary }} --version
-          PATH="$PWD/target/${{ matrix.target }}/release:$PATH" git vws -h
-      - name: Package archive
-        shell: bash
-        env:
-          VERSION: ${{ needs.validate-tag.outputs.version }}
-        run: |
-          package="git-vws-v${VERSION}-${{ matrix.asset }}"
-          mkdir -p "$package"
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$package/"
-          cp README.md LICENSE LICENSE-MIT LICENSE-APACHE "$package/"
-          tar -czf "$package.tar.gz" "$package"
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "$package.tar.gz" > "$package.tar.gz.sha256"
-            sha256sum -c "$package.tar.gz.sha256"
-          else
-            shasum -a 256 "$package.tar.gz" > "$package.tar.gz.sha256"
-            shasum -a 256 -c "$package.tar.gz.sha256"
-          fi
+          set -euo pipefail
+          python3 .github/scripts/release.py package \
+            --output release-output \
+            --common release-common \
+            --version '${{ needs.validate-tag.outputs.version }}' \
+            --source-sha "$GITHUB_SHA" \
+            --epoch '${{ needs.validate-tag.outputs.source-date-epoch }}' \
+            --target '${{ matrix.target }}' \
+            --binary 'target/${{ matrix.target }}/release/git-vws'
       - uses: actions/upload-artifact@v5
         with:
-          name: release-${{ matrix.asset }}
-          path: |
-            git-vws-v${{ needs.validate-tag.outputs.version }}-${{ matrix.asset }}.tar.gz
-            git-vws-v${{ needs.validate-tag.outputs.version }}-${{ matrix.asset }}.tar.gz.sha256
+          name: release-${{ matrix.target }}
+          path: release-output
           if-no-files-found: error
+          retention-days: 1
 
-  publish:
-    name: Publish prerelease
+  draft:
+    name: Create and attest draft release
     needs: [validate-tag, validation, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          set-safe-directory: false
       - uses: actions/download-artifact@v5
         with:
           path: release-assets
           pattern: release-*
           merge-multiple: true
-      - name: Create combined checksum manifest
-        working-directory: release-assets
+      - name: Assemble exact release asset set
         shell: bash
         run: |
           set -euo pipefail
-          for checksum in *.tar.gz.sha256; do
-            sha256sum -c "$checksum"
-          done
-          sha256sum *.tar.gz > SHA256SUMS
-          sha256sum -c SHA256SUMS
-      - name: Create GitHub prerelease
+          python3 .github/scripts/release.py assemble \
+            --directory release-assets \
+            --version '${{ needs.validate-tag.outputs.version }}' \
+            --source-sha "$GITHUB_SHA"
+      - name: Create or update draft GitHub release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.validate-tag.outputs.version }}
         run: |
+          set -euo pipefail
           notes="$(mktemp)"
           {
-            echo "Alpha release of git-vws ${VERSION}."
-            echo
-            echo "Implemented: bare authority initialization and native-COW session creation."
-            echo "Not implemented: list, exec, remove, publish, gc, doctor, and Windows support."
-            echo
-            echo "Validation and build run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            printf 'Alpha release of git-vws %s.\n\n' "$VERSION"
+            printf 'Implemented commands: init, create, list, exec, remove, publish, gc, doctor.\n'
+            printf 'Supported hosts: macOS APFS and Linux filesystems that pass FICLONE/FIEMAP validation.\n'
+            printf 'No FUSE, kernel extension, administrator installation, daemon, or full-copy fallback is used.\n'
+            printf 'Windows remains unsupported in this release.\n\n'
+            printf 'Validation and build run: %s/%s/actions/runs/%s\n' \
+              "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
           } > "$notes"
-          gh release create "$GITHUB_REF_NAME" \
-            --verify-tag \
-            --prerelease \
-            --title "git-vws ${VERSION}" \
-            --notes-file "$notes" \
-            release-assets/*.tar.gz \
-            release-assets/*.tar.gz.sha256 \
-            release-assets/SHA256SUMS
+          if gh release view "$GITHUB_REF_NAME" --json isDraft > release-view.json 2>/dev/null; then
+            test "$(jq -r .isDraft release-view.json)" = true
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "git-vws $VERSION" \
+              --notes-file "$notes"
+            gh release upload "$GITHUB_REF_NAME" --clobber release-assets/*
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --draft \
+              --title "git-vws $VERSION" \
+              --notes-file "$notes" \
+              release-assets/*
+          fi
+          test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = true
+      - name: Attest every release asset
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: release-assets/*
+
+  verify:
+    name: Verify release on ${{ matrix.target }}
+    needs: [validate-tag, draft]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          set-safe-directory: false
+      - name: Install Linux verification tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils file
+      - name: Download assets from the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = true
+          mkdir release-download
+          gh release download "$GITHUB_REF_NAME" --dir release-download
+      - name: Verify artifact attestations
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for asset in release-download/*; do
+            gh attestation verify "$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --signer-digest "$GITHUB_SHA" \
+              --source-digest "$GITHUB_SHA" \
+              --source-ref "$GITHUB_REF" \
+              --deny-self-hosted-runners
+          done
+      - name: Verify exact assets, archive safety, and native binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/release.py verify \
+            --directory release-download \
+            --version '${{ needs.validate-tag.outputs.version }}' \
+            --source-sha "$GITHUB_SHA" \
+            --target '${{ matrix.target }}'
+
+  promote:
+    name: Promote verified draft to prerelease
+    needs: [validate-tag, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Promote only after all verification jobs pass
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = true
+          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease
+          test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = false
+          test "$(gh release view "$GITHUB_REF_NAME" --json isPrerelease --jq .isPrerelease)" = true
