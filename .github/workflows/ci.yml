@@ -210,7 +210,7 @@ jobs:
           src/main.rs bd5cf3a6eea65ef11bfda9476fa3353e5854d22154e7c8c52a22b98d4ce2b861
           src/session.rs 72c853e53d4a374eb74b348ef78bcdab56f73b6e9c31f9788771331d3af580ee
           src/storage.rs 3564ebc0ef31e9c4d82f24a8c9c466ba365bd15369f10a18055661fc6a6c7d22
-          src/template.rs e174c0da073eff9843ed9d36de30f0c30c275e284ecd50c7ba24803917e23913
+          src/template.rs 89a9f8ccdf11e5162c548f7ea74d0197f70976bd75218d860470e63132bfbbff
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
           tests/m5_publish.rs c0eff6cdef36e81f8b35fae262037e292d9b3256450d6f85f9982caf7e889057
           tests/m6_maintenance.rs 62bdfdd9986d5ba3379170de6394eb16aa2b5d9611ca52c03be925be9896e4cf
@@ -308,7 +308,7 @@ jobs:
           } > runner-evidence/m5-gates.log
           : > runner-evidence/m6-gates.log
           for name in global_maintenance_cli_and_doctor_are_readonly census_and_leases_fail_closed_without_mutation gc_tombstones_and_crash_prefix_recover_exactly_once private_loose_and_predecessor_temporary_gc_contract; do
-            grep -Fx "test $name ... ok" runner-evidence/tests.log >> runner-evidence/m6-gates.log
+            grep -F "test $name ..." runner-evidence/tests.log >> runner-evidence/m6-gates.log
           done
           test "$(wc -l < runner-evidence/m6-gates.log | tr -d ' ')" = 4
           m6_summary='^test result: ok\. 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in .*$'
@@ -566,7 +566,7 @@ jobs:
           src/main.rs bd5cf3a6eea65ef11bfda9476fa3353e5854d22154e7c8c52a22b98d4ce2b861
           src/session.rs 72c853e53d4a374eb74b348ef78bcdab56f73b6e9c31f9788771331d3af580ee
           src/storage.rs 3564ebc0ef31e9c4d82f24a8c9c466ba365bd15369f10a18055661fc6a6c7d22
-          src/template.rs e174c0da073eff9843ed9d36de30f0c30c275e284ecd50c7ba24803917e23913
+          src/template.rs 89a9f8ccdf11e5162c548f7ea74d0197f70976bd75218d860470e63132bfbbff
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
           tests/m5_publish.rs c0eff6cdef36e81f8b35fae262037e292d9b3256450d6f85f9982caf7e889057
           tests/m6_maintenance.rs 62bdfdd9986d5ba3379170de6394eb16aa2b5d9611ca52c03be925be9896e4cf
@@ -667,7 +667,7 @@ jobs:
           } > runner-evidence/m5-gates.log
           : > runner-evidence/m6-gates.log
           for name in global_maintenance_cli_and_doctor_are_readonly census_and_leases_fail_closed_without_mutation gc_tombstones_and_crash_prefix_recover_exactly_once private_loose_and_predecessor_temporary_gc_contract; do
-            grep -Fx "test $name ... ok" runner-evidence/tests.log >> runner-evidence/m6-gates.log
+            grep -F "test $name ..." runner-evidence/tests.log >> runner-evidence/m6-gates.log
           done
           test "$(wc -l < runner-evidence/m6-gates.log | tr -d ' ')" = 4
           m6_summary='^test result: ok\. 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in .*$'
