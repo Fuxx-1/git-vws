@@ -44,7 +44,7 @@ gh attestation verify '<release-asset>' \
   --signer-workflow Fuxx-1/git-vws/.github/workflows/release-sign.yml \
   --signer-digest '<signer-workflow-commit-from-release-notes>' \
   --source-digest '<source-commit-from-release-notes>' \
-  --source-ref refs/tags/v0.1.0-alpha.3 \
+  --source-ref refs/tags/v0.1.0-alpha.4 \
   --deny-self-hosted-runners
 ```
 
