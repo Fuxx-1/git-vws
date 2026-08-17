@@ -1252,6 +1252,8 @@ fn gc_stages(group: &str) -> &'static [&'static str] {
             "template-tombstoned-record-exchange-old-unlinked",
             "template-tombstoned-record-parent-synced",
             "template-tombstoned-record",
+            #[cfg(target_os = "macos")]
+            "template-tombstone-cleanup-mode-synced",
             "template-tombstone-renamed",
             "template-tombstone-parent-synced",
             "template-owned-tree-removed",
@@ -1911,7 +1913,8 @@ fn gc_tombstones_and_crash_prefix_recover_exactly_once() {
     let mut artifacts = Sandbox::new();
     let binaries = build_m6_binaries(&artifacts);
     let expected_count: usize = gc_groups().iter().map(|group| gc_stages(group).len()).sum();
-    assert_eq!(expected_count, 26, "M6 GC stage ledger changed");
+    let platform_count = if cfg!(target_os = "macos") { 27 } else { 26 };
+    assert_eq!(expected_count, platform_count, "M6 GC stage ledger changed");
 
     let mut wrong_arm = Fixture::new(true);
     let wrong_before = snapshot(&wrong_arm.state());

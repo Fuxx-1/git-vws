@@ -505,8 +505,8 @@ fn complete_template_tombstone(
     let root_entry = named_identity(container, root_name)?;
     let tombstone_entry = named_identity(container, tombstone_name)?;
     let leased = match (root_entry, tombstone_entry) {
-        (Some(root_entry), None) if root_entry.same_node(sealed.root) => {
-            sealed_root(container, root_name, sealed, &expected.record.volume)?
+        (Some(root_entry), None) if storage::owned_tree_binding(root_entry, sealed.root) => {
+            tombstone_root(container, root_name, sealed, &expected.record.volume)?
         }
         (None, Some(_)) => {
             tombstone_root(container, tombstone_name, sealed, &expected.record.volume)?
@@ -535,6 +535,8 @@ fn complete_template_tombstone(
             return Ok(false);
         }
     }
+    #[cfg(target_os = "macos")]
+    prepare_template_tombstone_rename(&leased, sealed.root, &current.record)?;
     promote_template_tombstone(container, &root, &tombstone, sealed.root, &current.record)?;
     let current = revalidate_template_tombstone_capability(container, &current, &leased, sealed)?;
     storage::remove_owned_tree_gc(container, &tombstone, sealed.root)?;
@@ -544,6 +546,46 @@ fn complete_template_tombstone(
     #[cfg(git_vws_m4_checkpoint)]
     template_checkpoint(&current.record.key, "template-return")?;
     Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_template_tombstone_rename(
+    root: &File,
+    expected: Identity,
+    _record: &TemplateRecord,
+) -> Result<(), Error> {
+    let identity = Identity::from_file(root)?;
+    if storage::private_directory(identity) && storage::owned_tree_binding(identity, expected) {
+        return Ok(());
+    }
+    if !storage::sealed_directory(identity) || !storage::owned_tree_binding(identity, expected) {
+        return Err(template_recovery(
+            "template root is not eligible for the tombstone mode transition",
+        ));
+    }
+    if unsafe { libc::fchmod(root.as_raw_fd(), 0o700) } != 0 {
+        return Err(Error::io(
+            "TEMPLATE_RECOVERY_REQUIRED",
+            "cannot make template root private before tombstone rename",
+            io::Error::last_os_error(),
+        ));
+    }
+    root.sync_all().map_err(|error| {
+        Error::io(
+            "TEMPLATE_RECOVERY_REQUIRED",
+            "cannot sync private template root before tombstone rename",
+            error,
+        )
+    })?;
+    #[cfg(git_vws_m4_checkpoint)]
+    template_checkpoint(&_record.key, "template-tombstone-cleanup-mode-synced")?;
+    let identity = Identity::from_file(root)?;
+    if !storage::private_directory(identity) || !storage::owned_tree_binding(identity, expected) {
+        return Err(template_recovery(
+            "template root changed during the tombstone mode transition",
+        ));
+    }
+    Ok(())
 }
 
 fn promote_template_tombstone(
@@ -561,7 +603,10 @@ fn promote_template_tombstone(
         named_identity(container, root_name)?,
         named_identity(container, tombstone_name)?,
     ) {
-        (Some(root_identity), None) if root_identity.same_node(expected) => {
+        (Some(root_identity), None)
+            if storage::owned_tree_binding(root_identity, expected)
+                && tombstone_cleanup_mode(root_identity) =>
+        {
             match authority::rename_no_replace(container.as_raw_fd(), root, tombstone) {
                 Ok(()) => {
                     #[cfg(git_vws_m4_checkpoint)]
@@ -591,9 +636,9 @@ fn promote_template_tombstone(
             })?;
             #[cfg(git_vws_m4_checkpoint)]
             template_checkpoint(&_record.key, "template-tombstone-parent-synced")?;
-            if !named_identity(container, tombstone_name)?
-                .is_some_and(|identity| identity.same_node(expected))
-            {
+            if !named_identity(container, tombstone_name)?.is_some_and(|identity| {
+                storage::owned_tree_binding(identity, expected) && tombstone_cleanup_mode(identity)
+            }) {
                 return Err(Error::new(
                     "TEMPLATE_RECOVERY_REQUIRED",
                     "template tombstone binding changed after rename",
@@ -742,8 +787,11 @@ fn diagnose_template_capability(
                 named_identity(container, root_name),
                 named_identity(container, tombstone_name),
             ) {
-                (Ok(Some(root)), Ok(None)) if root.same_node(sealed.root) => {
-                    sealed_root(container, root_name, sealed, &capability.record.volume).is_ok()
+                (Ok(Some(root)), Ok(None))
+                    if storage::owned_tree_binding(root, sealed.root)
+                        && tombstone_cleanup_mode(root) =>
+                {
+                    tombstone_root(container, root_name, sealed, &capability.record.volume).is_ok()
                 }
                 (Ok(None), Ok(Some(_))) => {
                     tombstone_root(container, tombstone_name, sealed, &capability.record.volume)
