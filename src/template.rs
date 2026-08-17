@@ -306,7 +306,7 @@ pub(crate) fn validate_session_template(
                 named_identity(container, root_name)?,
                 named_identity(container, tombstone_name)?,
             ) {
-                (Some(root), None) if root == sealed.root => {
+                (Some(root), None) if root.same_node(sealed.root) => {
                     sealed_root(container, root_name, sealed, &capability.record.volume)?
                 }
                 (None, Some(_)) => {
@@ -505,7 +505,7 @@ fn complete_template_tombstone(
     let root_entry = named_identity(container, root_name)?;
     let tombstone_entry = named_identity(container, tombstone_name)?;
     let leased = match (root_entry, tombstone_entry) {
-        (Some(root_entry), None) if root_entry == sealed.root => {
+        (Some(root_entry), None) if root_entry.same_node(sealed.root) => {
             sealed_root(container, root_name, sealed, &expected.record.volume)?
         }
         (None, Some(_)) => {
@@ -561,7 +561,7 @@ fn promote_template_tombstone(
         named_identity(container, root_name)?,
         named_identity(container, tombstone_name)?,
     ) {
-        (Some(root_identity), None) if root_identity == expected => {
+        (Some(root_identity), None) if root_identity.same_node(expected) => {
             match authority::rename_no_replace(container.as_raw_fd(), root, tombstone) {
                 Ok(()) => {
                     #[cfg(git_vws_m4_checkpoint)]
@@ -591,7 +591,9 @@ fn promote_template_tombstone(
             })?;
             #[cfg(git_vws_m4_checkpoint)]
             template_checkpoint(&_record.key, "template-tombstone-parent-synced")?;
-            if named_identity(container, tombstone_name)? != Some(expected) {
+            if !named_identity(container, tombstone_name)?
+                .is_some_and(|identity| identity.same_node(expected))
+            {
                 return Err(Error::new(
                     "TEMPLATE_RECOVERY_REQUIRED",
                     "template tombstone binding changed after rename",
@@ -740,7 +742,7 @@ fn diagnose_template_capability(
                 named_identity(container, root_name),
                 named_identity(container, tombstone_name),
             ) {
-                (Ok(Some(root)), Ok(None)) if root == sealed.root => {
+                (Ok(Some(root)), Ok(None)) if root.same_node(sealed.root) => {
                     sealed_root(container, root_name, sealed, &capability.record.volume).is_ok()
                 }
                 (Ok(None), Ok(Some(_))) => {
@@ -1224,7 +1226,7 @@ fn sealed_root(
 ) -> Result<File, Error> {
     let entry = named_identity(container, name)?
         .ok_or_else(|| Error::new("TEMPLATE_CORRUPT", "sealed template root is absent"))?;
-    if !entry.same_node(sealed.root) || !storage::sealed_directory(entry) {
+    if !entry.same_node(sealed.root) {
         return Err(Error::new(
             "TEMPLATE_CORRUPT",
             "sealed template root identity is invalid",
@@ -1233,7 +1235,11 @@ fn sealed_root(
     let name_c = cstring(name.as_bytes(), "template root")?;
     let root = storage::open_directory_at(container.as_raw_fd(), &name_c)
         .map_err(|_| Error::new("TEMPLATE_CORRUPT", "sealed template root type is invalid"))?;
-    if !Identity::from_file(&root)?.same_node(entry) || storage::volume_id(&root)? != volume {
+    let descriptor = Identity::from_file(&root)?;
+    if !descriptor.same_node(entry)
+        || !storage::sealed_directory(descriptor)
+        || storage::volume_id(&root)? != volume
+    {
         return Err(Error::new(
             "TEMPLATE_CORRUPT",
             "sealed template root binding is invalid",
@@ -1255,7 +1261,7 @@ fn tombstone_root(
     let root = storage::open_directory_at(container.as_raw_fd(), &name)
         .map_err(|_| template_recovery("template tombstone root type is invalid"))?;
     let descriptor = Identity::from_file(&root)?;
-    if entry != descriptor || !storage::owned_tree_binding(entry, sealed.root) {
+    if !entry.same_node(descriptor) || !storage::owned_tree_binding(entry, sealed.root) {
         return Err(template_recovery(
             "template tombstone root binding changed while opening",
         ));
@@ -2248,7 +2254,7 @@ fn rename_ready(
         }
     }
     seal_publishing_root(root, sealed.root, _key, true)?;
-    if storage::identity_at(parent.as_raw_fd(), &ready)? != sealed.root {
+    if !storage::identity_at(parent.as_raw_fd(), &ready)?.same_node(sealed.root) {
         return Err(Error::new(
             "TEMPLATE_RECOVERY_REQUIRED",
             "READY template binding changed after rename",
@@ -2263,7 +2269,7 @@ fn rename_ready(
     })?;
     #[cfg(git_vws_m4_checkpoint)]
     m4("rename-parent-synced")?;
-    if storage::identity_at(parent.as_raw_fd(), &ready)? != sealed.root {
+    if !storage::identity_at(parent.as_raw_fd(), &ready)?.same_node(sealed.root) {
         return Err(Error::new(
             "TEMPLATE_RECOVERY_REQUIRED",
             "READY template binding changed after sync",
