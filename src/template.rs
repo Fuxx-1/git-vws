@@ -853,7 +853,7 @@ fn revalidate_template_capability(
         ));
     }
     if let Some((root, identity)) = root {
-        if Identity::from_file(root)? != identity {
+        if !Identity::from_file(root)?.same_node(identity) {
             return Err(template_recovery(
                 "template root changed while its lease was held",
             ));

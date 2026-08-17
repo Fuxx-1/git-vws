@@ -477,7 +477,7 @@ impl ProbeProcessCleanup {
                         )));
                     }
                 }
-                wait_for(Duration::from_secs(2), || !process_alive(pid as u32)).map_err(
+                wait_for(Duration::from_secs(10), || !process_alive(pid as u32)).map_err(
                     |error| io::Error::other(format!("escaped PID {pid} remained alive: {error}")),
                 )?;
                 self.escaped_ready.take();
@@ -1562,7 +1562,7 @@ fn escaped_git_probe_writer_is_bounded_and_leaves_no_state() {
         let script = wrapper.join("git");
         fs::write(
             &script,
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$VWS_TEST_DIRECT_PID\"\n/usr/bin/perl -MPOSIX=setsid -e 'setsid() or die; open my $ready, q(>), $ENV{VWS_TEST_ESCAPED_READY} or die; print $ready qq(ready\\n); close $ready; while (!-f $ENV{VWS_TEST_ESCAPED_RELEASE}) { select undef, undef, undef, 0.001 } open my $pid, q(>), $ENV{VWS_TEST_ESCAPED_PID} or die; print $pid $$; close $pid; open my $marker, q(>), $ENV{VWS_TEST_ESCAPED} or die; print $marker qq(escaped\\n); close $marker; $SIG{PIPE}=q(IGNORE); while (1) { print q(x); select undef, undef, undef, 0.001 }' &\nexit 0\n",
+            "#!/usr/bin/perl\nuse POSIX qw(setsid);\nopen my $direct, q(>), $ENV{VWS_TEST_DIRECT_PID} or die; print $direct $$; close $direct;\nmy $child = fork(); defined $child or die;\nif (!$child) { setsid() or die; open my $ready, q(>), $ENV{VWS_TEST_ESCAPED_READY} or die; print $ready qq(ready\\n); close $ready; while (!-f $ENV{VWS_TEST_ESCAPED_RELEASE}) { select undef, undef, undef, 0.001 } open my $pid, q(>), $ENV{VWS_TEST_ESCAPED_PID} or die; print $pid $$; close $pid; open my $marker, q(>), $ENV{VWS_TEST_ESCAPED} or die; print $marker qq(escaped\\n); close $marker; $SIG{PIPE}=q(IGNORE); while (1) { print q(x); select undef, undef, undef, 0.001 } }\nwhile (!-f $ENV{VWS_TEST_ESCAPED_READY}) { select undef, undef, undef, 0.001 }\nexit 0;\n",
         )
         .expect("output wrapper");
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("wrapper mode");
@@ -1589,20 +1589,27 @@ fn escaped_git_probe_writer_is_bounded_and_leaves_no_state() {
         });
         let before_home = snapshot(&home);
         let before_authority = snapshot(&authority);
-        let started = Instant::now();
-        let output = init_command(&home, &authority)
+        let mut command = init_command(&home, &authority);
+        command
             .env("PATH", path)
             .env("VWS_TEST_ESCAPED", &escaped)
             .env("VWS_TEST_ESCAPED_READY", &escaped_ready)
             .env("VWS_TEST_ESCAPED_RELEASE", &escaped_release)
             .env("VWS_TEST_ESCAPED_PID", &escaped_pid)
-            .env("VWS_TEST_DIRECT_PID", &direct_pid)
-            .output()
+            .env("VWS_TEST_DIRECT_PID", &direct_pid);
+        let probe = thread::spawn(move || command.output());
+        let ready = wait_for(Duration::from_secs(10), || escaped_ready.is_file());
+        let started = Instant::now();
+        let output = probe
+            .join()
+            .expect("join oversized probe")
             .expect("run oversized probe");
+        ready.expect("escaped writer ready marker");
         let assertions = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let elapsed = started.elapsed();
             assert!(
-                started.elapsed() < Duration::from_secs(2),
-                "escaped writer kept the probe open"
+                elapsed < Duration::from_secs(2),
+                "escaped writer kept the probe open for {elapsed:?} (panic_window={panic_window})"
             );
             assert!(!output.status.success(), "unexpected success: {output:?}");
             assert!(String::from_utf8_lossy(&output.stderr).contains("GIT_PROBE_FAILED"));

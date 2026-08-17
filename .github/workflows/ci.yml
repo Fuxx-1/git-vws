@@ -209,8 +209,8 @@ jobs:
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
           src/main.rs bd5cf3a6eea65ef11bfda9476fa3353e5854d22154e7c8c52a22b98d4ce2b861
           src/session.rs 72c853e53d4a374eb74b348ef78bcdab56f73b6e9c31f9788771331d3af580ee
-          src/storage.rs 3564ebc0ef31e9c4d82f24a8c9c466ba365bd15369f10a18055661fc6a6c7d22
-          src/template.rs 1f9e911c7ec50a4f472c8b0fd621462731468071dec1d0bd6347c6500e12d0dc
+          src/storage.rs c225abf105b871e7ed503343058653ab3f4fcad19ad8471f807a014d0951c871
+          src/template.rs b47f1ef76ac73a0d1f7acaf83af9adced23b4dfc68786dd4bfd20b7a5234e211
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
           tests/m5_publish.rs c0eff6cdef36e81f8b35fae262037e292d9b3256450d6f85f9982caf7e889057
           tests/m6_maintenance.rs 62bdfdd9986d5ba3379170de6394eb16aa2b5d9611ca52c03be925be9896e4cf
@@ -220,7 +220,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked --all-targets -- --test-threads=1 --nocapture 2>&1 | tee runner-evidence/tests.log
+          CARGO_TERM_COLOR=never cargo test --locked --all-targets -- --test-threads=1 --nocapture 2>&1 | tee runner-evidence/tests.log
       - name: Verify M4 APFS evidence
         shell: bash
         run: |
@@ -565,8 +565,8 @@ jobs:
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
           src/main.rs bd5cf3a6eea65ef11bfda9476fa3353e5854d22154e7c8c52a22b98d4ce2b861
           src/session.rs 72c853e53d4a374eb74b348ef78bcdab56f73b6e9c31f9788771331d3af580ee
-          src/storage.rs 3564ebc0ef31e9c4d82f24a8c9c466ba365bd15369f10a18055661fc6a6c7d22
-          src/template.rs 1f9e911c7ec50a4f472c8b0fd621462731468071dec1d0bd6347c6500e12d0dc
+          src/storage.rs c225abf105b871e7ed503343058653ab3f4fcad19ad8471f807a014d0951c871
+          src/template.rs b47f1ef76ac73a0d1f7acaf83af9adced23b4dfc68786dd4bfd20b7a5234e211
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
           tests/m5_publish.rs c0eff6cdef36e81f8b35fae262037e292d9b3256450d6f85f9982caf7e889057
           tests/m6_maintenance.rs 62bdfdd9986d5ba3379170de6394eb16aa2b5d9611ca52c03be925be9896e4cf
@@ -576,7 +576,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked --all-targets -- --test-threads=1 --nocapture 2>&1 | tee runner-evidence/tests.log
+          CARGO_TERM_COLOR=never cargo test --locked --all-targets -- --test-threads=1 --nocapture 2>&1 | tee runner-evidence/tests.log
       - name: Verify M4 XFS evidence
         shell: bash
         run: |
