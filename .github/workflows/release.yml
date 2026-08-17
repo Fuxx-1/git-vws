@@ -50,9 +50,11 @@ jobs:
           fi
           test "$GITHUB_REF_NAME" = "v$version"
           tag_ref="refs/tags/$GITHUB_REF_NAME"
-          test "$(git cat-file -t "$tag_ref")" = tag
-          tag_object_sha="$(git rev-parse "$tag_ref")"
-          source_sha="$(git rev-parse "$tag_ref^{commit}")"
+          fetched_tag_ref="refs/vws-release-tags/$GITHUB_REF_NAME"
+          git fetch --force --no-tags origin "$tag_ref:$fetched_tag_ref"
+          test "$(git cat-file -t "$fetched_tag_ref")" = tag
+          tag_object_sha="$(git rev-parse "$fetched_tag_ref")"
+          source_sha="$(git rev-parse "$fetched_tag_ref^{commit}")"
           test "$source_sha" = "$GITHUB_SHA"
           epoch="$(git show -s --format=%ct "$source_sha")"
           test "$epoch" -gt 0
