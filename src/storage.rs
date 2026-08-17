@@ -1127,14 +1127,14 @@ pub(crate) fn private_directory(identity: Identity) -> bool {
     identity.directory()
         && identity.uid == current_uid()
         && identity.mode == 0o700
-        && identity.nlink >= 2
+        && supported_directory_nlink(identity.nlink)
 }
 
 pub(crate) fn sealed_directory(identity: Identity) -> bool {
     identity.directory()
         && identity.uid == current_uid()
         && identity.mode == 0o555
-        && identity.nlink >= 2
+        && supported_directory_nlink(identity.nlink)
 }
 
 #[cfg(target_os = "macos")]
@@ -1142,7 +1142,7 @@ fn publishing_directory(identity: Identity) -> bool {
     identity.directory()
         && identity.uid == current_uid()
         && matches!(identity.mode, 0o555 | 0o755)
-        && identity.nlink >= 2
+        && supported_directory_nlink(identity.nlink)
 }
 
 #[cfg(target_os = "linux")]
@@ -1167,14 +1167,36 @@ fn worktree_directory(identity: Identity) -> bool {
     identity.directory()
         && identity.uid == current_uid()
         && identity.mode == 0o755
-        && identity.nlink >= 2
+        && supported_directory_nlink(identity.nlink)
 }
 
 fn clone_destination_directory(identity: Identity) -> bool {
     identity.directory()
         && identity.uid == current_uid()
         && matches!(identity.mode, 0o700 | 0o755)
-        && identity.nlink >= 2
+        && supported_directory_nlink(identity.nlink)
+}
+
+fn supported_directory_nlink(nlink: u64) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        nlink >= 1
+    }
+    #[cfg(target_os = "linux")]
+    {
+        nlink >= 2
+    }
+}
+
+fn empty_directory_nlink(nlink: u64) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        nlink >= 1
+    }
+    #[cfg(target_os = "linux")]
+    {
+        nlink == 2
+    }
 }
 
 fn stable_directory_node(current: Identity, expected: Identity) -> bool {
@@ -1204,6 +1226,12 @@ fn stable_directory_node_allows_only_link_count_drift() {
     let mut link_drift = expected;
     link_drift.nlink = 9;
     assert!(stable_directory_node(link_drift, expected));
+    assert!(supported_directory_nlink(2));
+    assert!(empty_directory_nlink(2));
+    #[cfg(target_os = "macos")]
+    assert!(supported_directory_nlink(1) && empty_directory_nlink(1));
+    #[cfg(target_os = "linux")]
+    assert!(!supported_directory_nlink(1) && !empty_directory_nlink(1));
     for current in [
         Identity { dev: 4, ..expected },
         Identity { ino: 4, ..expected },
@@ -1841,7 +1869,7 @@ fn cleanup_recovery(detail: &'static str) -> Error {
 fn empty_owned_directory_binding(current: Identity, expected: Identity) -> bool {
     current.directory()
         && expected.directory()
-        && expected.nlink >= 2
+        && supported_directory_nlink(expected.nlink)
         && current.dev == expected.dev
         && current.ino == expected.ino
         && current.uid == expected.uid
@@ -1849,7 +1877,7 @@ fn empty_owned_directory_binding(current: Identity, expected: Identity) -> bool 
         && current.mode == expected.mode
         && current.kind == expected.kind
         && current.mode & 0o022 == 0
-        && current.nlink == 2
+        && empty_directory_nlink(current.nlink)
 }
 
 fn cleanup_mode_directory(identity: Identity) -> bool {
