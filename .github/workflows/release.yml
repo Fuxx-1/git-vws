@@ -264,6 +264,8 @@ jobs:
     name: Create verified draft release
     needs: [validate-tag, sign]
     runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
     permissions:
       attestations: read
       contents: write
@@ -302,7 +304,8 @@ jobs:
             --directory release-assets \
             --version '${{ needs.validate-tag.outputs.version }}' \
             --source-sha "$GITHUB_SHA"
-      - name: Replace draft assets with the exact signed closure
+      - id: draft
+        name: Replace draft assets with the exact signed closure
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -334,8 +337,11 @@ jobs:
             gh release create "$GITHUB_REF_NAME" --verify-tag --draft --title "git-vws $VERSION" --notes-file "$notes"
           fi
           gh release upload "$GITHUB_REF_NAME" release-assets/*
-          gh release view "$GITHUB_REF_NAME" --json isDraft,assets > "$RUNNER_TEMP/release-after.json"
+          gh release view "$GITHUB_REF_NAME" --json databaseId,isDraft,assets > "$RUNNER_TEMP/release-after.json"
           test "$(jq -r .isDraft "$RUNNER_TEMP/release-after.json")" = true
+          release_id="$(jq -er .databaseId "$RUNNER_TEMP/release-after.json")"
+          test "$release_id" != null
+          printf 'release_id=%s\n' "$release_id" >> "$GITHUB_OUTPUT"
           python3 - release-assets "$RUNNER_TEMP/release-after.json" <<'PY'
           import json
           import sys
@@ -416,7 +422,7 @@ jobs:
 
   promote:
     name: Promote verified draft to prerelease
-    needs: [validate-tag, verify]
+    needs: [validate-tag, draft, verify]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -425,9 +431,18 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.draft.outputs.release_id }}
         run: |
           set -euo pipefail
-          test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = true
-          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease
-          test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = false
-          test "$(gh release view "$GITHUB_REF_NAME" --json isPrerelease --jq .isPrerelease)" = true
+          test -n "$RELEASE_ID"
+          release_endpoint="repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"
+          gh api "$release_endpoint" > "$RUNNER_TEMP/release-before-promote.json"
+          jq -e --arg tag "$GITHUB_REF_NAME" \
+            '.tag_name == $tag and .draft == true and .prerelease == false' \
+            "$RUNNER_TEMP/release-before-promote.json" > /dev/null
+          jq -n '{draft: false, prerelease: true}' \
+            | gh api --method PATCH "$release_endpoint" --input - \
+                > "$RUNNER_TEMP/release-after-promote.json"
+          jq -e --arg tag "$GITHUB_REF_NAME" \
+            '.tag_name == $tag and .draft == false and .prerelease == true' \
+            "$RUNNER_TEMP/release-after-promote.json" > /dev/null
