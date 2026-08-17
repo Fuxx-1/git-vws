@@ -623,22 +623,23 @@ fn walk_tree(
         path.extend_from_slice(&bytes);
         match entry.kind {
             kind if kind == DIRECTORY_TYPE => {
+                let child = open_directory_at(source.as_raw_fd(), &name)?;
+                let child_identity = Identity::from_file(&child)?;
+                if !entry.same_node(child_identity) {
+                    return Err(Error::new(
+                        "STORAGE_UNSUPPORTED",
+                        "sealed-tree directory changed while opening",
+                    ));
+                }
                 let valid_directory = if source_is_private {
-                    private_directory(entry)
+                    private_directory(child_identity)
                 } else {
-                    sealed_directory(entry)
+                    sealed_directory(child_identity)
                 };
                 if !valid_directory {
                     return Err(Error::new(
                         "STORAGE_UNSUPPORTED",
                         "sealed-tree child directory is invalid",
-                    ));
-                }
-                let child = open_directory_at(source.as_raw_fd(), &name)?;
-                if !stable_directory_node(Identity::from_file(&child)?, entry) {
-                    return Err(Error::new(
-                        "STORAGE_UNSUPPORTED",
-                        "sealed-tree directory changed while opening",
                     ));
                 }
                 if let Some(destination) = destination {
