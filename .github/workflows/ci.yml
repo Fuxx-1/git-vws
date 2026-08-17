@@ -209,7 +209,7 @@ jobs:
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
           src/main.rs bd5cf3a6eea65ef11bfda9476fa3353e5854d22154e7c8c52a22b98d4ce2b861
           src/session.rs 72c853e53d4a374eb74b348ef78bcdab56f73b6e9c31f9788771331d3af580ee
-          src/storage.rs eea8066086aac2fffa35b6c3d34ba4ae7bbf721ffb004a293089e39b94af4f18
+          src/storage.rs b1d20dda5f247f6fa2ebc69495b4b070c85ab6ad0188a46f55b2f565d9fc3910
           src/template.rs b47f1ef76ac73a0d1f7acaf83af9adced23b4dfc68786dd4bfd20b7a5234e211
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
           tests/m5_publish.rs c0eff6cdef36e81f8b35fae262037e292d9b3256450d6f85f9982caf7e889057
@@ -322,7 +322,7 @@ jobs:
             END { exit !(runs == 1 && summaries == 1 && matches == 1) }
           ' runner-evidence/tests.log | tee -a runner-evidence/m6-gates.log
           for marker in 'M6 doctor evidence: readonly=ok' 'M6 gc evidence: session=6 template=11 loose+fanout=5 predecessor=3 global=1 total=26' 'M6 private_objects_retained=ok'; do
-            count="$(grep -Fxc "$marker" runner-evidence/tests.log || true)"
+            count="$(grep -Fc "$marker" runner-evidence/tests.log || true)"
             test "$count" = 1
             printf '%s\n' "$marker" >> runner-evidence/m6-gates.log
           done
@@ -569,7 +569,7 @@ jobs:
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
           src/main.rs bd5cf3a6eea65ef11bfda9476fa3353e5854d22154e7c8c52a22b98d4ce2b861
           src/session.rs 72c853e53d4a374eb74b348ef78bcdab56f73b6e9c31f9788771331d3af580ee
-          src/storage.rs eea8066086aac2fffa35b6c3d34ba4ae7bbf721ffb004a293089e39b94af4f18
+          src/storage.rs b1d20dda5f247f6fa2ebc69495b4b070c85ab6ad0188a46f55b2f565d9fc3910
           src/template.rs b47f1ef76ac73a0d1f7acaf83af9adced23b4dfc68786dd4bfd20b7a5234e211
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
           tests/m5_publish.rs c0eff6cdef36e81f8b35fae262037e292d9b3256450d6f85f9982caf7e889057
@@ -685,7 +685,7 @@ jobs:
             END { exit !(runs == 1 && summaries == 1 && matches == 1) }
           ' runner-evidence/tests.log | tee -a runner-evidence/m6-gates.log
           for marker in 'M6 doctor evidence: readonly=ok' 'M6 gc evidence: session=6 template=11 loose+fanout=5 predecessor=3 global=1 total=26' 'M6 private_objects_retained=ok'; do
-            count="$(grep -Fxc "$marker" runner-evidence/tests.log || true)"
+            count="$(grep -Fc "$marker" runner-evidence/tests.log || true)"
             test "$count" = 1
             printf '%s\n' "$marker" >> runner-evidence/m6-gates.log
           done
