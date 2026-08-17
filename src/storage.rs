@@ -1608,12 +1608,12 @@ fn remove_owned_tree_inner(
 ) -> Result<(), Error> {
     let sealed_cleanup = sealed_directory(expected);
     let entry = identity_at(parent.as_raw_fd(), name)?;
-    let bound = if sealed_cleanup {
-        owned_tree_binding(entry, expected) && cleanup_mode_directory(entry)
+    let entry_bound = if sealed_cleanup {
+        owned_tree_binding(entry, expected)
     } else {
         stable_directory_node(entry, expected)
     };
-    if !bound || !(private_directory(expected) || sealed_cleanup) {
+    if !entry_bound || !(private_directory(expected) || sealed_cleanup) {
         return Err(Error::new(
             "STORAGE_RECOVERY_REQUIRED",
             "owned tree binding changed before cleanup",
@@ -1622,9 +1622,11 @@ fn remove_owned_tree_inner(
     let root = open_directory_at(parent.as_raw_fd(), name)?;
     let descriptor = Identity::from_file(&root)?;
     let bound = if sealed_cleanup {
-        owned_tree_binding(descriptor, expected) && cleanup_mode_directory(descriptor)
+        entry.same_node(descriptor)
+            && owned_tree_binding(descriptor, expected)
+            && cleanup_mode_directory(descriptor)
     } else {
-        stable_directory_node(descriptor, expected)
+        entry.same_node(descriptor) && stable_directory_node(descriptor, expected)
     };
     if !bound {
         return Err(Error::new(
@@ -1651,10 +1653,13 @@ fn remove_owned_tree_inner(
         reject_special,
     )?;
     let entry = identity_at(parent.as_raw_fd(), name)?;
+    let descriptor = Identity::from_file(&root)?;
     let bound = if sealed_cleanup {
-        owned_tree_binding(entry, expected) && private_directory(entry)
+        entry.same_node(descriptor)
+            && owned_tree_binding(descriptor, expected)
+            && private_directory(descriptor)
     } else {
-        stable_directory_node(entry, expected)
+        entry.same_node(descriptor) && stable_directory_node(descriptor, expected)
     };
     if !bound {
         return Err(Error::new(
@@ -1929,7 +1934,7 @@ fn remove_owned_children(
                 let child = open_directory_at(directory.as_raw_fd(), &name)?;
                 let child_identity = Identity::from_file(&child)?;
                 let bound = if sealed_cleanup {
-                    owned_tree_binding(child_identity, entry)
+                    stable_directory_node(child_identity, entry)
                         && cleanup_mode_directory(child_identity)
                 } else {
                     stable_directory_node(child_identity, entry)
@@ -1954,11 +1959,15 @@ fn remove_owned_children(
                     sealed_cleanup,
                     reject_special,
                 )?;
-                let child_identity = identity_at(directory.as_raw_fd(), &name)?;
+                let child_entry = identity_at(directory.as_raw_fd(), &name)?;
+                let child_descriptor = Identity::from_file(&child)?;
                 let bound = if sealed_cleanup {
-                    owned_tree_binding(child_identity, entry) && private_directory(child_identity)
+                    child_entry.same_node(child_descriptor)
+                        && owned_tree_binding(child_descriptor, entry)
+                        && private_directory(child_descriptor)
                 } else {
-                    stable_directory_node(child_identity, entry)
+                    child_entry.same_node(child_descriptor)
+                        && stable_directory_node(child_descriptor, entry)
                 };
                 if !bound {
                     return Err(Error::new(
