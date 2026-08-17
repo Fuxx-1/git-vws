@@ -209,7 +209,7 @@ jobs:
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
           src/main.rs bd5cf3a6eea65ef11bfda9476fa3353e5854d22154e7c8c52a22b98d4ce2b861
           src/session.rs 72c853e53d4a374eb74b348ef78bcdab56f73b6e9c31f9788771331d3af580ee
-          src/storage.rs c225abf105b871e7ed503343058653ab3f4fcad19ad8471f807a014d0951c871
+          src/storage.rs eea8066086aac2fffa35b6c3d34ba4ae7bbf721ffb004a293089e39b94af4f18
           src/template.rs b47f1ef76ac73a0d1f7acaf83af9adced23b4dfc68786dd4bfd20b7a5234e211
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
           tests/m5_publish.rs c0eff6cdef36e81f8b35fae262037e292d9b3256450d6f85f9982caf7e889057
@@ -241,8 +241,7 @@ jobs:
           grep -Fx 'test unsupported_filter_config_rejects_create_without_authority_write ... ok' runner-evidence/tests.log \
             | tee runner-evidence/filter-config-gate.log
           test "$(wc -l < runner-evidence/filter-config-gate.log | tr -d ' ')" = 1
-          m4_summary='test result: ok\. 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in .*$'
-          awk -v expected="$m4_summary" '
+          awk '
             /Running.*tests\/m4_git_parity\.rs/ {
               runs += 1
               in_m4 = 1
@@ -250,7 +249,7 @@ jobs:
             }
             in_m4 && /test result:/ {
               summaries += 1
-              if ($0 ~ expected) {
+              if ($0 ~ /test result: ok[.] 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in [0-9]+([.][0-9]+)?s$/) {
                 print
                 matches += 1
               }
@@ -275,8 +274,7 @@ jobs:
           grep -F 'test publish_names_new_fast_forwards_and_private_objects_are_retained ...' runner-evidence/tests.log | tee -a runner-evidence/m5-tests.log
           grep -F 'test publish_same_non_fast_forward_and_lease_preserve_lifecycle_contract ...' runner-evidence/tests.log | tee -a runner-evidence/m5-tests.log
           test "$(wc -l < runner-evidence/m5-tests.log | tr -d ' ')" = 4
-          m5_summary='test result: ok\. 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in .*$'
-          awk -v expected="$m5_summary" '
+          awk '
             /Running.*tests\/m5_publish\.rs/ {
               runs += 1
               in_m5 = 1
@@ -284,7 +282,7 @@ jobs:
             }
             in_m5 && /test result:/ {
               summaries += 1
-              if ($0 ~ expected) {
+              if ($0 ~ /test result: ok[.] 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in [0-9]+([.][0-9]+)?s$/) {
                 print
                 matches += 1
               }
@@ -311,10 +309,16 @@ jobs:
             grep -F "test $name ..." runner-evidence/tests.log >> runner-evidence/m6-gates.log
           done
           test "$(wc -l < runner-evidence/m6-gates.log | tr -d ' ')" = 4
-          m6_summary='test result: ok\. 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in .*$'
-          awk -v expected="$m6_summary" '
+          awk '
             /Running.*tests\/m6_maintenance\.rs/ { runs++; in_m6=1; next }
-            in_m6 && /test result:/ { summaries++; if ($0 ~ expected) matches++; in_m6=0 }
+            in_m6 && /test result:/ {
+              summaries++
+              if ($0 ~ /test result: ok[.] 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in [0-9]+([.][0-9]+)?s$/) {
+                print
+                matches++
+              }
+              in_m6=0
+            }
             END { exit !(runs == 1 && summaries == 1 && matches == 1) }
           ' runner-evidence/tests.log | tee -a runner-evidence/m6-gates.log
           for marker in 'M6 doctor evidence: readonly=ok' 'M6 gc evidence: session=6 template=11 loose+fanout=5 predecessor=3 global=1 total=26' 'M6 private_objects_retained=ok'; do
@@ -565,7 +569,7 @@ jobs:
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
           src/main.rs bd5cf3a6eea65ef11bfda9476fa3353e5854d22154e7c8c52a22b98d4ce2b861
           src/session.rs 72c853e53d4a374eb74b348ef78bcdab56f73b6e9c31f9788771331d3af580ee
-          src/storage.rs c225abf105b871e7ed503343058653ab3f4fcad19ad8471f807a014d0951c871
+          src/storage.rs eea8066086aac2fffa35b6c3d34ba4ae7bbf721ffb004a293089e39b94af4f18
           src/template.rs b47f1ef76ac73a0d1f7acaf83af9adced23b4dfc68786dd4bfd20b7a5234e211
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
           tests/m5_publish.rs c0eff6cdef36e81f8b35fae262037e292d9b3256450d6f85f9982caf7e889057
@@ -596,8 +600,7 @@ jobs:
           grep -Fx 'test unsupported_filter_config_rejects_create_without_authority_write ... ok' runner-evidence/tests.log \
             | tee runner-evidence/filter-config-gate.log
           test "$(wc -l < runner-evidence/filter-config-gate.log | tr -d ' ')" = 1
-          m4_summary='test result: ok\. 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in .*$'
-          awk -v expected="$m4_summary" '
+          awk '
             /Running.*tests\/m4_git_parity\.rs/ {
               runs += 1
               in_m4 = 1
@@ -605,7 +608,7 @@ jobs:
             }
             in_m4 && /test result:/ {
               summaries += 1
-              if ($0 ~ expected) {
+              if ($0 ~ /test result: ok[.] 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in [0-9]+([.][0-9]+)?s$/) {
                 print
                 matches += 1
               }
@@ -634,8 +637,7 @@ jobs:
           grep -F 'test publish_names_new_fast_forwards_and_private_objects_are_retained ...' runner-evidence/tests.log | tee -a runner-evidence/m5-tests.log
           grep -F 'test publish_same_non_fast_forward_and_lease_preserve_lifecycle_contract ...' runner-evidence/tests.log | tee -a runner-evidence/m5-tests.log
           test "$(wc -l < runner-evidence/m5-tests.log | tr -d ' ')" = 4
-          m5_summary='test result: ok\. 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in .*$'
-          awk -v expected="$m5_summary" '
+          awk '
             /Running.*tests\/m5_publish\.rs/ {
               runs += 1
               in_m5 = 1
@@ -643,7 +645,7 @@ jobs:
             }
             in_m5 && /test result:/ {
               summaries += 1
-              if ($0 ~ expected) {
+              if ($0 ~ /test result: ok[.] 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in [0-9]+([.][0-9]+)?s$/) {
                 print
                 matches += 1
               }
@@ -670,10 +672,16 @@ jobs:
             grep -F "test $name ..." runner-evidence/tests.log >> runner-evidence/m6-gates.log
           done
           test "$(wc -l < runner-evidence/m6-gates.log | tr -d ' ')" = 4
-          m6_summary='test result: ok\. 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in .*$'
-          awk -v expected="$m6_summary" '
+          awk '
             /Running.*tests\/m6_maintenance\.rs/ { runs++; in_m6=1; next }
-            in_m6 && /test result:/ { summaries++; if ($0 ~ expected) matches++; in_m6=0 }
+            in_m6 && /test result:/ {
+              summaries++
+              if ($0 ~ /test result: ok[.] 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in [0-9]+([.][0-9]+)?s$/) {
+                print
+                matches++
+              }
+              in_m6=0
+            }
             END { exit !(runs == 1 && summaries == 1 && matches == 1) }
           ' runner-evidence/tests.log | tee -a runner-evidence/m6-gates.log
           for marker in 'M6 doctor evidence: readonly=ok' 'M6 gc evidence: session=6 template=11 loose+fanout=5 predecessor=3 global=1 total=26' 'M6 private_objects_retained=ok'; do
