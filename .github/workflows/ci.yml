@@ -516,8 +516,25 @@ jobs:
           components: rustfmt, clippy
       - name: Install XFS tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          set -euo pipefail
+          apt_mirrors=/etc/apt/apt-mirrors.txt
+          test -f "$apt_mirrors"
+          sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' "$apt_mirrors"
+          if sudo grep -Fq 'azure.archive.ubuntu.com' "$apt_mirrors"; then
+            printf 'Azure Ubuntu mirror remains configured\n' >&2
+            exit 1
+          fi
+          sudo grep -Fq 'archive.ubuntu.com' "$apt_mirrors"
+          sudo timeout 180s apt-get \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            update
+          sudo timeout 180s apt-get \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            install -y xfsprogs
       - name: Prepare ephemeral XFS reflink volume
         shell: bash
         run: |
