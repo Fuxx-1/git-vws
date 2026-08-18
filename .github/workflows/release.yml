@@ -258,7 +258,7 @@ jobs:
       attestations: write
       contents: read
       id-token: write
-    uses: Fuxx-1/git-vws/.github/workflows/release-sign.yml@0000000000000000000000000000000000000000
+    uses: Fuxx-1/git-vws/.github/workflows/release-sign.yml@f95933f61693d240012b9902ffe77fc40a1ae088
 
   draft:
     name: Create verified draft release
