@@ -23,6 +23,7 @@ PACKAGE = "git-vws"
 REPOSITORY = "https://github.com/Fuxx-1/git-vws"
 CI_WORKFLOW = ".github/workflows/ci.yml"
 PROVENANCE_BUNDLE = "PROVENANCE.sigstore.json"
+REMOTE_MANIFEST_SCHEMA = 1
 IN_TOTO_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
 SLSA_PROVENANCE_TYPE = "https://slsa.dev/provenance/v1"
 LICENSE_FILES = ["README.md", "LICENSE", "LICENSE-MIT", "LICENSE-APACHE"]
@@ -37,6 +38,7 @@ VERSION_PATTERN = re.compile(
 SOURCE_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 GIT_OBJECT_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+GITHUB_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 RFC3339_PATTERN = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z"
 )
@@ -48,6 +50,32 @@ CI_JOB_NAMES = (
     "Linux XFS FICLONE/FIEMAP",
 )
 SIGNER_PLACEHOLDER = "__" + "SIGNER_SHA" + "__"
+REMOTE_MANIFEST_KEYS = {
+    "assets",
+    "draft",
+    "prerelease",
+    "repository",
+    "repository_id",
+    "release_id",
+    "run_attempt",
+    "run_id",
+    "schema",
+    "source_sha",
+    "tag",
+    "version",
+}
+REMOTE_ASSET_KEYS = {"digest", "id", "name", "size", "state", "updated_at"}
+REPOSITORY_SLUG = "Fuxx-1/git-vws"
+RUNTIME_TOKEN_ENV_NAMES = {
+    "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+    "ACTIONS_ID_TOKEN_REQUEST_URL",
+    "ACTIONS_RUNTIME_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_APP_TOKEN",
+    "GITHUB_TOKEN",
+    "RUNNER_TOKEN",
+}
 FORBIDDEN_MARKERS = [
     "M4CP/1",
     "GIT_VWS_M4_CONTROL_FD",
@@ -388,16 +416,31 @@ def validate_binary(binary: Path, target: str, version: str) -> dict[str, object
         if marker in scan or marker in symbols:
             fail(f"release binary retains checkpoint marker: {marker}")
 
-    version_result = run([str(binary), "--version"])
-    if version_result.stdout.strip() != f"{PACKAGE} {version}" or version_result.stderr:
-        fail(f"release binary reported an unexpected version: {version_result!r}")
-    path = os.environ.copy()
-    path["PATH"] = f"{binary.parent}{os.pathsep}{path.get('PATH', '')}"
-    help_result = run(["git", "vws", "-h"], env=path)
-    help_text = help_result.stdout + help_result.stderr
-    for command in ["init", "create", "list", "exec", "remove", "publish", "doctor", "gc"]:
-        if command not in help_text:
-            fail(f"git vws help omitted command: {command}")
+    with tempfile.TemporaryDirectory(prefix="git-vws-release-home-") as home:
+        safe_env = {
+            "PATH": f"{binary.parent}{os.pathsep}{os.environ.get('PATH', os.defpath)}",
+            "HOME": home,
+            "TMPDIR": home,
+            "LANG": "C",
+            "LC_ALL": "C",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
+        }
+        for name in RUNTIME_TOKEN_ENV_NAMES:
+            if name in safe_env:
+                fail(f"release binary environment retained a runtime token: {name}")
+        version_result = run([str(binary), "--version"], cwd=Path(home), env=safe_env)
+        if version_result.stdout.strip() != f"{PACKAGE} {version}" or version_result.stderr:
+            fail(f"release binary reported an unexpected version: {version_result!r}")
+        help_result = run(["git", "vws", "-h"], cwd=Path(home), env=safe_env)
+        help_text = help_result.stdout + help_result.stderr
+        for command in ["init", "create", "list", "exec", "remove", "publish", "doctor", "gc"]:
+            if command not in help_text:
+                fail(f"git vws help omitted command: {command}")
     return {
         "sha256": sha256_file(binary),
         "size": metadata.st_size,
@@ -514,6 +557,24 @@ def require_mapping(value: object, label: str) -> dict[str, object]:
     return value
 
 
+def require_positive_int(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        fail(f"{label} must be a positive integer")
+    return value
+
+
+def require_nonnegative_int(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        fail(f"{label} must be a non-negative integer")
+    return value
+
+
+def require_bool(value: object, label: str) -> bool:
+    if not isinstance(value, bool):
+        fail(f"{label} must be a boolean")
+    return value
+
+
 def require_string(value: object, label: str) -> str:
     if not isinstance(value, str) or not value:
         fail(f"{label} must be a nonempty string")
@@ -565,6 +626,229 @@ def release_files(directory: Path, label: str) -> set[str]:
         require_regular_file(path, f"{label} member")
         names.add(path.name)
     return names
+
+
+def reject_duplicate_json_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            fail(f"canonical JSON contains duplicate key: {key}")
+        result[key] = value
+    return result
+
+
+def read_canonical_json(path: Path, label: str) -> object:
+    require_regular_file(path, label)
+    raw = path.read_bytes()
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate_json_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"{label} is not valid JSON: {error}")
+    canonical = json.dumps(value, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+    if raw != canonical.encode("utf-8"):
+        fail(f"{label} is not canonical JSON")
+    return value
+
+
+def release_identity(args: argparse.Namespace) -> dict[str, object]:
+    validate_release_identity(args.version, args.source_sha)
+    if args.repository != REPOSITORY_SLUG:
+        fail(f"release repository is invalid: {args.repository}")
+    return {
+        "repository": args.repository,
+        "repository_id": require_decimal(args.repository_id, "release repository id"),
+        "run_id": require_decimal(args.run_id, "release workflow run id"),
+        "schema": REMOTE_MANIFEST_SCHEMA,
+        "source_sha": args.source_sha,
+        "tag": f"v{args.version}",
+        "version": args.version,
+    }
+
+
+def snapshot_identity(args: argparse.Namespace, run_attempt: object) -> dict[str, object]:
+    return {
+        **release_identity(args),
+        "run_attempt": require_decimal(run_attempt, "release workflow run attempt"),
+    }
+
+
+def normalize_remote_assets(value: object, version: str) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        fail("release assets must be an array")
+    expected_names = expected_release_assets(version)
+    by_name: dict[str, dict[str, object]] = {}
+    asset_ids: set[int] = set()
+    for raw_asset in value:
+        asset = require_mapping(raw_asset, "release asset")
+        asset_id = require_positive_int(asset.get("id"), "release asset id")
+        if asset_id in asset_ids:
+            fail(f"release assets duplicate id: {asset_id}")
+        asset_ids.add(asset_id)
+        name = require_string(asset.get("name"), "release asset name")
+        if name in by_name:
+            fail(f"release assets duplicate name: {name}")
+        if name not in expected_names:
+            fail(f"release assets contain an unexpected member: {name}")
+        size = require_nonnegative_int(asset.get("size"), f"release asset {name} size")
+        digest = require_string(asset.get("digest"), f"release asset {name} digest")
+        if GITHUB_DIGEST_PATTERN.fullmatch(digest) is None:
+            fail(f"release asset {name} digest is not a lowercase GitHub SHA-256")
+        updated_at = require_string(asset.get("updated_at"), f"release asset {name} update")
+        validate_timestamp(updated_at, f"release asset {name} update")
+        if asset.get("state") != "uploaded":
+            fail(f"release asset {name} is not uploaded")
+        by_name[name] = {
+            "digest": digest,
+            "id": asset_id,
+            "name": name,
+            "size": size,
+            "state": "uploaded",
+            "updated_at": updated_at,
+        }
+    if set(by_name) != expected_names:
+        fail(
+            "release asset set mismatch: "
+            f"actual={sorted(by_name)} expected={sorted(expected_names)}"
+        )
+    return [by_name[name] for name in sorted(by_name)]
+
+
+def remote_release_manifest(
+    release: object,
+    args: argparse.Namespace,
+    *,
+    draft: bool,
+    prerelease: bool,
+    run_attempt: object,
+) -> dict[str, object]:
+    value = require_mapping(release, "GitHub release")
+    if value.get("tag_name") != f"v{args.version}":
+        fail("GitHub release tag does not match the release version")
+    if (
+        require_bool(value.get("draft"), "GitHub release draft") is not draft
+        or require_bool(value.get("prerelease"), "GitHub release prerelease")
+        is not prerelease
+    ):
+        fail("GitHub release state does not match the expected promotion state")
+    return {
+        **snapshot_identity(args, run_attempt),
+        "assets": normalize_remote_assets(value.get("assets"), args.version),
+        "draft": draft,
+        "prerelease": prerelease,
+        "release_id": require_positive_int(value.get("id"), "GitHub release id"),
+    }
+
+
+def validate_remote_manifest(
+    value: object, args: argparse.Namespace
+) -> dict[str, object]:
+    manifest = require_mapping(value, "release snapshot manifest")
+    if set(manifest) != REMOTE_MANIFEST_KEYS:
+        fail("release snapshot manifest keys are invalid")
+    if (
+        require_positive_int(manifest.get("schema"), "release snapshot schema")
+        != REMOTE_MANIFEST_SCHEMA
+    ):
+        fail("release snapshot manifest schema is invalid")
+    expected_identity = release_identity(args)
+    for key, expected in expected_identity.items():
+        if key == "schema":
+            continue
+        if manifest.get(key) != expected:
+            fail(f"release snapshot manifest {key} is invalid")
+    run_attempt = require_decimal(
+        manifest.get("run_attempt"), "release snapshot workflow run attempt"
+    )
+    if manifest.get("draft") is not True or manifest.get("prerelease") is not False:
+        fail("release snapshot manifest is not a draft prerelease candidate")
+    release_id = require_positive_int(manifest.get("release_id"), "release snapshot id")
+    raw_assets = manifest.get("assets")
+    if not isinstance(raw_assets, list) or any(
+        not isinstance(asset, dict) or set(asset) != REMOTE_ASSET_KEYS
+        for asset in raw_assets
+    ):
+        fail("release snapshot manifest asset keys are invalid")
+    assets = normalize_remote_assets(raw_assets, args.version)
+    if raw_assets != assets:
+        fail("release snapshot manifest assets are not in canonical name order")
+    return {
+        **expected_identity,
+        "assets": assets,
+        "draft": True,
+        "prerelease": False,
+        "release_id": release_id,
+        "run_attempt": run_attempt,
+    }
+
+
+def validate_snapshot_assets(directory: Path, manifest: dict[str, object]) -> None:
+    names = release_files(directory, "release snapshot assets")
+    assets = manifest["assets"]
+    if not isinstance(assets, list):
+        fail("release snapshot manifest assets are invalid")
+    by_name = {
+        str(asset["name"]): asset
+        for asset in assets
+        if isinstance(asset, dict) and isinstance(asset.get("name"), str)
+    }
+    if names != set(by_name):
+        fail(
+            "release snapshot files do not match the manifest: "
+            f"actual={sorted(names)} expected={sorted(by_name)}"
+        )
+    for name, asset in by_name.items():
+        path = directory / name
+        if path.stat().st_size != asset["size"]:
+            fail(f"release snapshot asset size drifted: {name}")
+        if f"sha256:{sha256_file(path)}" != asset["digest"]:
+            fail(f"release snapshot asset digest drifted: {name}")
+
+
+def snapshot_release(args: argparse.Namespace) -> None:
+    manifest = remote_release_manifest(
+        read_json(Path(args.release)),
+        args,
+        draft=True,
+        prerelease=False,
+        run_attempt=args.run_attempt,
+    )
+    validate_snapshot_assets(Path(args.assets), manifest)
+    write_json(Path(args.output), manifest)
+
+
+def emit_release_assets(args: argparse.Namespace) -> None:
+    manifest = remote_release_manifest(
+        read_json(Path(args.release)),
+        args,
+        draft=True,
+        prerelease=False,
+        run_attempt=args.run_attempt,
+    )
+    assets = manifest["assets"]
+    if not isinstance(assets, list):
+        fail("release asset manifest is invalid")
+    for asset in assets:
+        print(f"{asset['id']}\t{asset['name']}")
+
+
+def verify_release_snapshot(args: argparse.Namespace) -> None:
+    manifest = validate_remote_manifest(
+        read_canonical_json(Path(args.manifest), "release snapshot manifest"), args
+    )
+    validate_snapshot_assets(Path(args.assets), manifest)
+    if args.release is not None:
+        expected_draft = not args.promoted
+        expected_prerelease = args.promoted
+        live = remote_release_manifest(
+            read_json(Path(args.release)),
+            args,
+            draft=expected_draft,
+            prerelease=expected_prerelease,
+            run_attempt=manifest["run_attempt"],
+        )
+        expected = {**manifest, "draft": expected_draft, "prerelease": expected_prerelease}
+        if live != expected:
+            fail("GitHub release no longer matches the verified draft snapshot")
 
 
 def validate_timestamp(value: object, label: str) -> dt.datetime:
@@ -1054,6 +1338,40 @@ def parser() -> argparse.ArgumentParser:
     provenance_verify.add_argument("--version", required=True)
     provenance_verify.add_argument("--source-sha", required=True)
     provenance_verify.set_defaults(function=verify_public_provenance)
+
+    snapshot = subcommands.add_parser("snapshot-release")
+    snapshot.add_argument("--release", required=True)
+    snapshot.add_argument("--assets", required=True)
+    snapshot.add_argument("--output", required=True)
+    snapshot.add_argument("--repository", required=True)
+    snapshot.add_argument("--repository-id", required=True)
+    snapshot.add_argument("--run-id", required=True)
+    snapshot.add_argument("--run-attempt", required=True)
+    snapshot.add_argument("--version", required=True)
+    snapshot.add_argument("--source-sha", required=True)
+    snapshot.set_defaults(function=snapshot_release)
+
+    snapshot_assets = subcommands.add_parser("release-assets")
+    snapshot_assets.add_argument("--release", required=True)
+    snapshot_assets.add_argument("--repository", required=True)
+    snapshot_assets.add_argument("--repository-id", required=True)
+    snapshot_assets.add_argument("--run-id", required=True)
+    snapshot_assets.add_argument("--run-attempt", required=True)
+    snapshot_assets.add_argument("--version", required=True)
+    snapshot_assets.add_argument("--source-sha", required=True)
+    snapshot_assets.set_defaults(function=emit_release_assets)
+
+    snapshot_verify = subcommands.add_parser("verify-release-snapshot")
+    snapshot_verify.add_argument("--manifest", required=True)
+    snapshot_verify.add_argument("--assets", required=True)
+    snapshot_verify.add_argument("--release")
+    snapshot_verify.add_argument("--promoted", action="store_true")
+    snapshot_verify.add_argument("--repository", required=True)
+    snapshot_verify.add_argument("--repository-id", required=True)
+    snapshot_verify.add_argument("--run-id", required=True)
+    snapshot_verify.add_argument("--version", required=True)
+    snapshot_verify.add_argument("--source-sha", required=True)
+    snapshot_verify.set_defaults(function=verify_release_snapshot)
 
     pretag = subcommands.add_parser("validate-pretag")
     pretag.add_argument("--input", required=True)
