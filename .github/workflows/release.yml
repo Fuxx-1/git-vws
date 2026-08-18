@@ -320,7 +320,7 @@ jobs:
             printf 'Supported hosts: macOS APFS and Linux filesystems that pass FICLONE/FIEMAP validation.\n'
             printf 'No FUSE, kernel extension, administrator installation, daemon, or full-copy fallback is used.\n'
             printf 'Windows remains unsupported in this release.\n\n'
-            printf 'Every asset is covered by a GitHub artifact attestation signed through the public Sigstore service.\n'
+            printf 'Every uploaded release asset is covered by a GitHub artifact attestation signed through the public Sigstore service.\n'
             printf 'The release includes the exact Sigstore bundle as PROVENANCE.sigstore.json.\n\n'
             printf 'Source commit: %s\n' "$GITHUB_SHA"
             printf 'Signer workflow commit: %s\n' "$SIGNER_SHA"
@@ -356,9 +356,80 @@ jobs:
               raise SystemExit(f"draft asset set mismatch: local={local} remote={remote}")
           PY
 
+  snapshot:
+    name: Snapshot exact draft assets
+    needs: [validate-tag, draft]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+          set-safe-directory: false
+      - name: Download draft assets by validated identifiers
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.draft.outputs.release_id }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_ID"
+          release_endpoint="repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"
+          release_json="$RUNNER_TEMP/release-snapshot.json"
+          gh api "$release_endpoint" > "$release_json"
+          test "$(jq -er .id "$release_json")" = "$RELEASE_ID"
+          mkdir -p release-snapshot/assets
+          python3 .github/scripts/release.py release-assets \
+            --release "$release_json" \
+            --repository "$GITHUB_REPOSITORY" \
+            --repository-id "$REPOSITORY_ID" \
+            --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT" \
+            --version "$VERSION" \
+            --source-sha "$GITHUB_SHA" > "$RUNNER_TEMP/release-assets.tsv"
+          while IFS=$'\t' read -r asset_id asset_name; do
+            test -n "$asset_id"
+            test "$asset_name" = "$(basename "$asset_name")"
+            test "$asset_name" != .
+            test "$asset_name" != ..
+            gh api --header 'Accept: application/octet-stream' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              > "release-snapshot/assets/$asset_name"
+          done < "$RUNNER_TEMP/release-assets.tsv"
+      - name: Canonicalize and validate draft snapshot
+        shell: bash
+        env:
+          REPOSITORY_ID: ${{ github.repository_id }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/release.py snapshot-release \
+            --release "$RUNNER_TEMP/release-snapshot.json" \
+            --assets release-snapshot/assets \
+            --output release-snapshot/manifest.json \
+            --repository "$GITHUB_REPOSITORY" \
+            --repository-id "$REPOSITORY_ID" \
+            --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT" \
+            --version "$VERSION" \
+            --source-sha "$GITHUB_SHA"
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        with:
+          name: release-snapshot
+          path: release-snapshot
+          if-no-files-found: error
+          retention-days: 1
+
   verify:
     name: Verify draft on ${{ matrix.target }}
-    needs: [validate-tag, draft]
+    needs: [validate-tag, snapshot]
     strategy:
       fail-fast: false
       matrix:
@@ -372,7 +443,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       attestations: read
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
@@ -383,25 +454,31 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y binutils file
-      - name: Download exact draft assets
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          name: release-snapshot
+          path: release-snapshot
+      - name: Verify snapshot and public provenance
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = true
-          mkdir release-download
-          gh release download "$GITHUB_REF_NAME" --dir release-download
-      - name: Verify provenance, archive safety, and native binary
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          RUN_ID: ${{ github.run_id }}
           SIGNER_SHA: ${{ needs.validate-tag.outputs.signer-workflow-sha }}
+          VERSION: ${{ needs.validate-tag.outputs.version }}
         run: |
           set -euo pipefail
-          bundle=release-download/PROVENANCE.sigstore.json
+          python3 .github/scripts/release.py verify-release-snapshot \
+            --manifest release-snapshot/manifest.json \
+            --assets release-snapshot/assets \
+            --repository "$GITHUB_REPOSITORY" \
+            --repository-id "$REPOSITORY_ID" \
+            --run-id "$RUN_ID" \
+            --version "$VERSION" \
+            --source-sha "$GITHUB_SHA"
+          bundle=release-snapshot/assets/PROVENANCE.sigstore.json
           test -f "$bundle"
-          for asset in release-download/*; do
+          for asset in release-snapshot/assets/*; do
             if [ "$asset" = "$bundle" ]; then
               continue
             fi
@@ -414,35 +491,83 @@ jobs:
               --source-ref "$GITHUB_REF" \
               --deny-self-hosted-runners
           done
-          python3 .github/scripts/release.py verify \
-            --directory release-download \
-            --version '${{ needs.validate-tag.outputs.version }}' \
-            --source-sha "$GITHUB_SHA" \
-            --target '${{ matrix.target }}'
+      - name: Verify archive safety and native binary without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_APP_TOKEN \
+            ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL \
+            ACTIONS_RUNTIME_TOKEN RUNNER_TOKEN GITHUB_ENV GITHUB_OUTPUT \
+            GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY
+          verify_home="$RUNNER_TEMP/vws-verify-home"
+          verify_tmp="$RUNNER_TEMP/vws-verify-tmp"
+          mkdir -p "$verify_home" "$verify_tmp"
+          env -i \
+            PATH="$PATH" \
+            HOME="$verify_home" \
+            TMPDIR="$verify_tmp" \
+            LANG=C \
+            LC_ALL=C \
+            GIT_CONFIG_NOSYSTEM=1 \
+            GIT_CONFIG_GLOBAL=/dev/null \
+            GIT_CONFIG_SYSTEM=/dev/null \
+            GIT_TERMINAL_PROMPT=0 \
+            GIT_PAGER=cat \
+            PAGER=cat \
+            python3 .github/scripts/release.py verify \
+              --directory release-snapshot/assets \
+              --version '${{ needs.validate-tag.outputs.version }}' \
+              --source-sha "$GITHUB_SHA" \
+              --target '${{ matrix.target }}'
 
   promote:
     name: Promote verified draft to prerelease
-    needs: [validate-tag, draft, verify]
+    needs: [validate-tag, draft, snapshot, verify]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+          set-safe-directory: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          name: release-snapshot
+          path: release-snapshot
       - name: Promote only after all verification jobs pass
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_ID: ${{ needs.draft.outputs.release_id }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          RUN_ID: ${{ github.run_id }}
+          VERSION: ${{ needs.validate-tag.outputs.version }}
         run: |
           set -euo pipefail
           test -n "$RELEASE_ID"
           release_endpoint="repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"
+          test "$(jq -er .release_id release-snapshot/manifest.json)" = "$RELEASE_ID"
           gh api "$release_endpoint" > "$RUNNER_TEMP/release-before-promote.json"
-          jq -e --arg tag "$GITHUB_REF_NAME" \
-            '.tag_name == $tag and .draft == true and .prerelease == false' \
-            "$RUNNER_TEMP/release-before-promote.json" > /dev/null
+          python3 .github/scripts/release.py verify-release-snapshot \
+            --manifest release-snapshot/manifest.json \
+            --assets release-snapshot/assets \
+            --release "$RUNNER_TEMP/release-before-promote.json" \
+            --repository "$GITHUB_REPOSITORY" \
+            --repository-id "$REPOSITORY_ID" \
+            --run-id "$RUN_ID" \
+            --version "$VERSION" \
+            --source-sha "$GITHUB_SHA"
           jq -n '{draft: false, prerelease: true}' \
             | gh api --method PATCH "$release_endpoint" --input - \
                 > "$RUNNER_TEMP/release-after-promote.json"
-          jq -e --arg tag "$GITHUB_REF_NAME" \
-            '.tag_name == $tag and .draft == false and .prerelease == true' \
-            "$RUNNER_TEMP/release-after-promote.json" > /dev/null
+          python3 .github/scripts/release.py verify-release-snapshot \
+            --manifest release-snapshot/manifest.json \
+            --assets release-snapshot/assets \
+            --release "$RUNNER_TEMP/release-after-promote.json" \
+            --promoted \
+            --repository "$GITHUB_REPOSITORY" \
+            --repository-id "$REPOSITORY_ID" \
+            --run-id "$RUN_ID" \
+            --version "$VERSION" \
+            --source-sha "$GITHUB_SHA"
