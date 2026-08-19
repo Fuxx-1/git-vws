@@ -320,6 +320,7 @@ jobs:
             printf 'Supported hosts: macOS APFS and Linux filesystems that pass FICLONE/FIEMAP validation.\n'
             printf 'No FUSE, kernel extension, administrator installation, daemon, or full-copy fallback is used.\n'
             printf 'Windows remains unsupported in this release.\n\n'
+            printf 'License: GPL-3.0-only.\n\n'
             printf 'Every uploaded release asset is covered by a GitHub artifact attestation signed through the public Sigstore service.\n'
             printf 'The release includes the exact Sigstore bundle as PROVENANCE.sigstore.json.\n\n'
             printf 'Source commit: %s\n' "$GITHUB_SHA"
