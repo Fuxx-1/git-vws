@@ -44,11 +44,13 @@ gh attestation verify '<release-asset>' \
   --signer-workflow Fuxx-1/git-vws/.github/workflows/release-sign.yml \
   --signer-digest '<signer-workflow-commit-from-release-notes>' \
   --source-digest '<source-commit-from-release-notes>' \
-  --source-ref refs/tags/v0.1.0-alpha.7 \
+  --source-ref refs/tags/v0.1.0-alpha.8 \
   --deny-self-hosted-runners
 ```
 
 The annotated tag binds the exact successful pre-release CI run. The attestation binds every release asset digest to the tag source, immutable reusable signer workflow, GitHub-hosted runner, and public transparency log without a repository-managed signing key.
+
+Copyright (C) 2026 git-vws contributors. git-vws is free software licensed under the GNU General Public License, version 3 only (`GPL-3.0-only`), without any warranty. See [`LICENSE`](LICENSE).
 
 After installation, Git discovers the binary as an external subcommand:
 

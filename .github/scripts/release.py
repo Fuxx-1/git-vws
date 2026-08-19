@@ -26,7 +26,7 @@ PROVENANCE_BUNDLE = "PROVENANCE.sigstore.json"
 REMOTE_MANIFEST_SCHEMA = 1
 IN_TOTO_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
 SLSA_PROVENANCE_TYPE = "https://slsa.dev/provenance/v1"
-LICENSE_FILES = ["README.md", "LICENSE", "LICENSE-MIT", "LICENSE-APACHE"]
+LICENSE_FILES = ["README.md", "LICENSE"]
 TARGETS = {
     "aarch64-apple-darwin": ("Darwin", "arm64"),
     "x86_64-apple-darwin": ("Darwin", "x86_64"),
