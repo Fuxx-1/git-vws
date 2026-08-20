@@ -222,12 +222,12 @@ jobs:
               >> runner-evidence/m4-m5-source-contract.log
             test "$actual" = "$expected"
           done <<'EOF'
-          src/authority.rs f924510d658263f350a0d0f34072c6f1965845534f1e67ef0a5c9171f276117d
+          src/authority.rs e69c13544273a4de022f491f472826ae84fde419b5e011061e8b8e750dbcc313
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
-          src/main.rs afcaba036916e06c8ef1f947ec269af31ae4ee14823b9ae7bdc1bfd310ad4b0d
-          src/session.rs 72c853e53d4a374eb74b348ef78bcdab56f73b6e9c31f9788771331d3af580ee
+          src/main.rs 2d90687eaf5f6f4b0ff2f1d3ec88171d6edd2c51d04b51d64ab690e64c0f0a38
+          src/session.rs 1ab75a5daa24ea3a3190e33147e2155403665356978e902e168d7a3324744ce0
           src/storage.rs b1d20dda5f247f6fa2ebc69495b4b070c85ab6ad0188a46f55b2f565d9fc3910
-          src/template.rs 22cafc175926b5ff3ae4660ed73f44f62cf5ff12bd904176b69eaa909dd4bdc9
+          src/template.rs 0d9b3f8273c7c00122268318dd7b732cfabcb60a1bf94376d954a0bf44a7676b
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
           tests/m5_publish.rs c0eff6cdef36e81f8b35fae262037e292d9b3256450d6f85f9982caf7e889057
           tests/m6_maintenance.rs 7f248642c022f64dfcabcbb34c27d3c1817c1fdfa1d24dcd12211dfa780a15b6
@@ -599,12 +599,12 @@ jobs:
               >> runner-evidence/m4-m5-source-contract.log
             test "$actual" = "$expected"
           done <<'EOF'
-          src/authority.rs f924510d658263f350a0d0f34072c6f1965845534f1e67ef0a5c9171f276117d
+          src/authority.rs e69c13544273a4de022f491f472826ae84fde419b5e011061e8b8e750dbcc313
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
-          src/main.rs afcaba036916e06c8ef1f947ec269af31ae4ee14823b9ae7bdc1bfd310ad4b0d
-          src/session.rs 72c853e53d4a374eb74b348ef78bcdab56f73b6e9c31f9788771331d3af580ee
+          src/main.rs 2d90687eaf5f6f4b0ff2f1d3ec88171d6edd2c51d04b51d64ab690e64c0f0a38
+          src/session.rs 1ab75a5daa24ea3a3190e33147e2155403665356978e902e168d7a3324744ce0
           src/storage.rs b1d20dda5f247f6fa2ebc69495b4b070c85ab6ad0188a46f55b2f565d9fc3910
-          src/template.rs 22cafc175926b5ff3ae4660ed73f44f62cf5ff12bd904176b69eaa909dd4bdc9
+          src/template.rs 0d9b3f8273c7c00122268318dd7b732cfabcb60a1bf94376d954a0bf44a7676b
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
           tests/m5_publish.rs c0eff6cdef36e81f8b35fae262037e292d9b3256450d6f85f9982caf7e889057
           tests/m6_maintenance.rs 7f248642c022f64dfcabcbb34c27d3c1817c1fdfa1d24dcd12211dfa780a15b6
