@@ -44,8 +44,8 @@ jobs:
         run: |
           set -euo pipefail
           version="$(python3 -c 'import json,subprocess; data=json.loads(subprocess.check_output(["cargo","metadata","--locked","--no-deps","--format-version","1"])); print(data["packages"][0]["version"])')"
-          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]]; then
-            printf 'release tag is not a semantic prerelease: %s\n' "$GITHUB_REF_NAME" >&2
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([0-9A-Za-z.-]*[0-9A-Za-z])?)?$ ]]; then
+            printf 'release tag is not a semantic version: %s\n' "$GITHUB_REF_NAME" >&2
             exit 1
           fi
           test "$GITHUB_REF_NAME" = "v$version"
@@ -258,7 +258,7 @@ jobs:
       attestations: write
       contents: read
       id-token: write
-    uses: Fuxx-1/git-vws/.github/workflows/release-sign.yml@f95933f61693d240012b9902ffe77fc40a1ae088
+    uses: Fuxx-1/git-vws/.github/workflows/release-sign.yml@42162988f28e6365aceb6b4f25b84e5c94002681
 
   draft:
     name: Create verified draft release
@@ -315,7 +315,7 @@ jobs:
           set -euo pipefail
           notes="$RUNNER_TEMP/release-notes.txt"
           {
-            printf 'Alpha release of git-vws %s.\n\n' "$VERSION"
+            printf 'Stable release of git-vws %s.\n\n' "$VERSION"
             printf 'Implemented commands: init, create, list, exec, remove, publish, gc, doctor.\n'
             printf 'Supported hosts: macOS APFS and Linux filesystems that pass FICLONE/FIEMAP validation.\n'
             printf 'No FUSE, kernel extension, administrator installation, daemon, or full-copy fallback is used.\n'
@@ -325,7 +325,7 @@ jobs:
             printf 'The release includes the exact Sigstore bundle as PROVENANCE.sigstore.json.\n\n'
             printf 'Source commit: %s\n' "$GITHUB_SHA"
             printf 'Signer workflow commit: %s\n' "$SIGNER_SHA"
-            printf 'Pre-release CI run: %s/%s/actions/runs/%s/attempts/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" '${{ needs.validate-tag.outputs.pretag-run-id }}' '${{ needs.validate-tag.outputs.pretag-run-attempt }}'
+            printf 'Pre-tag CI run: %s/%s/actions/runs/%s/attempts/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" '${{ needs.validate-tag.outputs.pretag-run-id }}' '${{ needs.validate-tag.outputs.pretag-run-attempt }}'
             printf 'Release workflow run: %s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
           } > "$notes"
           if gh release view "$GITHUB_REF_NAME" --json isDraft,assets > "$RUNNER_TEMP/release-before.json" 2>/dev/null; then
@@ -522,7 +522,7 @@ jobs:
               --target '${{ matrix.target }}'
 
   promote:
-    name: Promote verified draft to prerelease
+    name: Promote verified draft release
     needs: [validate-tag, draft, snapshot, verify]
     runs-on: ubuntu-latest
     permissions:
@@ -559,7 +559,11 @@ jobs:
             --run-id "$RUN_ID" \
             --version "$VERSION" \
             --source-sha "$GITHUB_SHA"
-          jq -n '{draft: false, prerelease: true}' \
+          prerelease=false
+          if [[ "$VERSION" == *-* ]]; then
+            prerelease=true
+          fi
+          jq -n --argjson prerelease "$prerelease" '{draft: false, prerelease: $prerelease}' \
             | gh api --method PATCH "$release_endpoint" --input - \
                 > "$RUNNER_TEMP/release-after-promote.json"
           python3 .github/scripts/release.py verify-release-snapshot \

@@ -9,20 +9,38 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    mpsc, Arc,
+};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const MAX_RECORD: usize = 16 * 1024;
 const MAX_LS_TREE_RECORD: usize = 1024 * 1024;
 const MAX_SYMLINK: usize = 4096;
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+const TREE_OPERATION_MAX_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const TREE_OPERATION_ENTRY_MILLIS: u64 = 50;
+const TREE_MATERIALIZE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const TREE_MATERIALIZE_QUEUE_DEPTH: usize = 16;
+const TREE_MATERIALIZE_PARALLEL_MIN_ENTRIES: u64 = 128;
+const TREE_MATERIALIZE_MAX_WORKERS: usize = 4;
 const POLICY_VERSION: &[u8] = b"git-vws/checkout-policy/v1";
 #[cfg(target_os = "linux")]
 const SYMLINK_TYPE: u32 = libc::S_IFLNK;
 #[cfg(target_os = "macos")]
 const SYMLINK_TYPE: u32 = libc::S_IFLNK as u32;
 static NEXT_BUILD: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn tree_operation_timeout(entries: u64) -> Duration {
+    GIT_TIMEOUT
+        .saturating_add(Duration::from_millis(
+            entries.saturating_mul(TREE_OPERATION_ENTRY_MILLIS),
+        ))
+        .min(TREE_OPERATION_MAX_TIMEOUT)
+}
 
 pub(crate) struct Template {
     pub(crate) key: String,
@@ -132,6 +150,11 @@ struct ManifestEntry {
     oid: String,
     size: u64,
     path: Vec<u8>,
+}
+
+struct MaterializeWorkerReport {
+    entries: u64,
+    failure: Option<Error>,
 }
 
 pub(crate) fn acquire(
@@ -999,7 +1022,14 @@ fn advance_prepared(
         &materializing.key,
         "materializing-record",
     )?;
-    let second = materialize(&root, root_identity, authority, tree)?;
+    let second = materialize(
+        &root,
+        root_identity,
+        authority,
+        tree,
+        &materializing.manifest,
+        tree_operation_timeout(materializing.manifest.entries),
+    )?;
     if second != materializing.manifest {
         return Err(Error::new(
             "TEMPLATE_INPUT_DRIFT",
@@ -1488,8 +1518,13 @@ fn manifest_pass(authority: &Authority, tree: &str) -> Result<storage::ManifestR
         OsString::from("--long"),
         OsString::from(tree),
     ];
-    let mut child =
-        GitChild::spawn_for(&args, Some(&authority.canonical), GIT_TIMEOUT).map_err(git_error)?;
+    let mut child = GitChild::spawn_for_progress(
+        &args,
+        Some(&authority.canonical),
+        TREE_MATERIALIZE_IDLE_TIMEOUT,
+        TREE_OPERATION_MAX_TIMEOUT,
+    )
+    .map_err(git_error)?;
     let mut hasher = Sha256::new();
     let mut count = 0_u64;
     while let Some(raw) = child
@@ -1568,7 +1603,10 @@ fn materialize(
     root_identity: Identity,
     authority: &Authority,
     tree: &str,
+    expected: &storage::ManifestReceipt,
+    hard_timeout: Duration,
 ) -> Result<storage::ManifestReceipt, Error> {
+    let hard_deadline = Instant::now() + hard_timeout;
     let listing_args = [
         OsString::from("ls-tree"),
         OsString::from("-rz"),
@@ -1576,20 +1614,20 @@ fn materialize(
         OsString::from("--long"),
         OsString::from(tree),
     ];
-    let mut listing = GitChild::spawn_for(&listing_args, Some(&authority.canonical), GIT_TIMEOUT)
-        .map_err(git_error)?;
-    let batch_args = [OsString::from("cat-file"), OsString::from("--batch")];
-    let mut batch = GitChild::spawn_with_env_for(
-        &batch_args,
+    let scan_timeout = hard_deadline.saturating_duration_since(Instant::now());
+    if scan_timeout.is_zero() {
+        return Err(materialize_deadline_error());
+    }
+    let mut listing = GitChild::spawn_for_progress(
+        &listing_args,
         Some(&authority.canonical),
-        &[],
-        true,
-        GIT_TIMEOUT,
-        AuditConfig::Isolated,
+        TREE_MATERIALIZE_IDLE_TIMEOUT,
+        scan_timeout,
     )
     .map_err(git_error)?;
     let mut hasher = Sha256::new();
     let mut count = 0_u64;
+    let mut entries = Vec::new();
     while let Some(raw) = listing
         .read_nul_record(MAX_LS_TREE_RECORD)
         .map_err(git_error)?
@@ -1600,36 +1638,295 @@ fn materialize(
         count = count
             .checked_add(1)
             .ok_or_else(|| Error::new("TEMPLATE_INVALID", "manifest entry count overflow"))?;
-        batch
-            .write_stdin(format!("{}\n", entry.oid).as_bytes())
-            .map_err(git_error)?;
-        let header = batch.read_line_stdout(512).map_err(git_error)?;
-        if header != format!("{} blob {}", entry.oid, entry.size).as_bytes() {
-            return Err(Error::new(
-                "TEMPLATE_INVALID",
-                "cat-file batch header did not match the raw manifest",
-            ));
-        }
-        let parent = destination_parent(root, root_identity, &entry.path)?;
-        let leaf = entry
-            .path
-            .rsplit(|byte| *byte == b'/')
-            .next()
-            .expect("nonempty path");
-        let leaf = cstring(leaf, "template leaf")?;
-        match entry.mode {
-            0o100644 | 0o100755 => write_regular(&mut batch, &parent, &leaf, &entry)?,
-            0o120000 => write_symlink(&mut batch, &parent, &leaf, entry.size)?,
-            _ => unreachable!("manifest parser validates modes"),
-        }
+        entries.push(entry);
     }
     finish_clean(listing, "ls-tree")?;
-    batch.close_stdin();
-    finish_clean(batch, "cat-file")?;
-    Ok(storage::ManifestReceipt {
+    let actual = storage::ManifestReceipt {
         digest: authority::hex(&hasher.finalize()),
         entries: count,
+    };
+    if actual != *expected {
+        return Err(Error::new(
+            "TEMPLATE_INPUT_DRIFT",
+            "raw ls-tree changed between template passes",
+        ));
+    }
+    prepare_destination_skeleton(root, root_identity, &entries)?;
+    materialize_entries(
+        root,
+        root_identity,
+        authority.canonical.clone(),
+        entries,
+        hard_deadline,
+    )?;
+    Ok(actual)
+}
+
+fn prepare_destination_skeleton(
+    root: &File,
+    root_identity: Identity,
+    entries: &[ManifestEntry],
+) -> Result<(), Error> {
+    for entry in entries {
+        let _ = destination_parent(root, root_identity, &entry.path)?;
+        let _ = destination_leaf(&entry.path)?;
+    }
+    root.sync_all().map_err(|error| {
+        Error::io(
+            "TEMPLATE_IO_FAILED",
+            "cannot sync template directory skeleton",
+            error,
+        )
     })
+}
+
+fn materialize_entries(
+    root: &File,
+    root_identity: Identity,
+    authority: PathBuf,
+    entries: Vec<ManifestEntry>,
+    hard_deadline: Instant,
+) -> Result<(), Error> {
+    let expected_entries = u64::try_from(entries.len())
+        .map_err(|_| Error::new("TEMPLATE_INVALID", "manifest entry count exceeds u64"))?;
+    let worker_count = template_worker_count(expected_entries);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut worker_roots = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        worker_roots.push(root.try_clone().map_err(|error| {
+            Error::io(
+                "TEMPLATE_IO_FAILED",
+                "cannot clone template root descriptor for materialization",
+                error,
+            )
+        })?);
+    }
+    let mut senders = Vec::with_capacity(worker_count);
+    let mut receivers = Vec::with_capacity(worker_count);
+    for worker_root in worker_roots {
+        let (sender, receiver) = mpsc::sync_channel(TREE_MATERIALIZE_QUEUE_DEPTH);
+        senders.push(sender);
+        receivers.push((worker_root, receiver));
+    }
+    let mut workers = Vec::with_capacity(worker_count);
+    for (worker_root, receiver) in receivers {
+        let worker_authority = authority.clone();
+        let worker_cancelled = Arc::clone(&cancelled);
+        let spawned = thread::Builder::new()
+            .name("git-vws-template".to_owned())
+            .spawn(move || {
+                materialize_worker(
+                    worker_root,
+                    root_identity,
+                    worker_authority,
+                    receiver,
+                    worker_cancelled,
+                    hard_deadline,
+                )
+            });
+        match spawned {
+            Ok(worker) => workers.push(worker),
+            Err(error) => {
+                cancelled.store(true, Ordering::Release);
+                drop(senders);
+                for worker in workers {
+                    let _ = worker.join();
+                }
+                return Err(Error::io(
+                    "TEMPLATE_IO_FAILED",
+                    "cannot start template materialization worker",
+                    error,
+                ));
+            }
+        }
+    }
+    let mut dispatch_failure = None;
+    for (index, entry) in entries.into_iter().enumerate() {
+        if let Err(error) = enqueue_materialize_entry(
+            &senders[index % worker_count],
+            entry,
+            &cancelled,
+            hard_deadline,
+        ) {
+            dispatch_failure = Some(error);
+            cancelled.store(true, Ordering::Release);
+            break;
+        }
+    }
+    drop(senders);
+    let mut materialized = 0_u64;
+    let mut worker_failure = None;
+    for worker in workers {
+        match worker.join() {
+            Ok(report) => {
+                materialized = materialized.checked_add(report.entries).ok_or_else(|| {
+                    Error::new("TEMPLATE_INVALID", "materialized entry count overflow")
+                })?;
+                if worker_failure.is_none() {
+                    worker_failure = report.failure;
+                }
+            }
+            Err(_) if worker_failure.is_none() => {
+                worker_failure = Some(Error::new(
+                    "TEMPLATE_IO_FAILED",
+                    "template materialization worker panicked",
+                ));
+                cancelled.store(true, Ordering::Release);
+            }
+            Err(_) => {}
+        }
+    }
+    if let Some(error) = worker_failure {
+        return Err(error);
+    }
+    if let Some(error) = dispatch_failure {
+        return Err(error);
+    }
+    if materialized != expected_entries {
+        return Err(Error::new(
+            "TEMPLATE_INVALID",
+            "materialization workers did not account for the full manifest",
+        ));
+    }
+    Ok(())
+}
+
+fn enqueue_materialize_entry(
+    sender: &mpsc::SyncSender<ManifestEntry>,
+    mut entry: ManifestEntry,
+    cancelled: &AtomicBool,
+    hard_deadline: Instant,
+) -> Result<(), Error> {
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(Error::new(
+                "TEMPLATE_IO_FAILED",
+                "template materialization was cancelled after a worker failure",
+            ));
+        }
+        if Instant::now() >= hard_deadline {
+            return Err(materialize_deadline_error());
+        }
+        match sender.try_send(entry) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::TrySendError::Full(returned)) => {
+                entry = returned;
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return Err(Error::new(
+                    "TEMPLATE_IO_FAILED",
+                    "template materialization worker exited before its queue drained",
+                ));
+            }
+        }
+    }
+}
+
+fn materialize_worker(
+    root: File,
+    root_identity: Identity,
+    authority: PathBuf,
+    receiver: mpsc::Receiver<ManifestEntry>,
+    cancelled: Arc<AtomicBool>,
+    hard_deadline: Instant,
+) -> MaterializeWorkerReport {
+    let result = (|| {
+        let remaining = hard_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(materialize_deadline_error());
+        }
+        let batch_args = [OsString::from("cat-file"), OsString::from("--batch")];
+        let mut batch = GitChild::spawn_with_env_for_progress(
+            &batch_args,
+            Some(&authority),
+            &[],
+            true,
+            TREE_MATERIALIZE_IDLE_TIMEOUT,
+            remaining,
+            AuditConfig::Isolated,
+        )
+        .map_err(git_error)?;
+        let mut count = 0_u64;
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return Ok(count);
+            }
+            let remaining = hard_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(materialize_deadline_error());
+            }
+            let entry = match receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                Ok(entry) => entry,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            batch
+                .write_stdin(format!("{}\n", entry.oid).as_bytes())
+                .map_err(git_error)?;
+            let header = batch.read_line_stdout(512).map_err(git_error)?;
+            if header != format!("{} blob {}", entry.oid, entry.size).as_bytes() {
+                return Err(Error::new(
+                    "TEMPLATE_INVALID",
+                    "cat-file batch header did not match the raw manifest",
+                ));
+            }
+            let parent = destination_parent(&root, root_identity, &entry.path)?;
+            let leaf = destination_leaf(&entry.path)?;
+            match entry.mode {
+                0o100644 | 0o100755 => write_regular(&mut batch, &parent, &leaf, &entry)?,
+                0o120000 => write_symlink(&mut batch, &parent, &leaf, entry.size)?,
+                _ => unreachable!("manifest parser validates modes"),
+            }
+            batch.note_progress().map_err(git_error)?;
+            count = count.checked_add(1).ok_or_else(|| {
+                Error::new("TEMPLATE_INVALID", "materialized entry count overflow")
+            })?;
+        }
+        batch.close_stdin();
+        finish_clean(batch, "cat-file")?;
+        Ok(count)
+    })();
+    match result {
+        Ok(entries) => MaterializeWorkerReport {
+            entries,
+            failure: None,
+        },
+        Err(failure) => {
+            cancelled.store(true, Ordering::Release);
+            MaterializeWorkerReport {
+                entries: 0,
+                failure: Some(failure),
+            }
+        }
+    }
+}
+
+fn template_worker_count(entries: u64) -> usize {
+    if entries < TREE_MATERIALIZE_PARALLEL_MIN_ENTRIES {
+        return 1;
+    }
+    let parallelism = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let entries = usize::try_from(entries).unwrap_or(usize::MAX);
+    parallelism
+        .min(TREE_MATERIALIZE_MAX_WORKERS)
+        .min(entries)
+        .max(1)
+}
+
+fn materialize_deadline_error() -> Error {
+    Error::new(
+        "TEMPLATE_IO_FAILED",
+        "template materialization exceeded its hard deadline",
+    )
+}
+
+fn destination_leaf(path: &[u8]) -> Result<CString, Error> {
+    let leaf = path
+        .rsplit(|byte| *byte == b'/')
+        .next()
+        .expect("nonempty validated template path");
+    cstring(leaf, "template leaf")
 }
 
 fn write_regular(
@@ -1675,6 +1972,7 @@ fn write_regular(
                 error,
             )
         })?;
+        child.note_progress().map_err(git_error)?;
         remaining -= length as u64;
     }
     expect_batch_delimiter(child)?;
@@ -1693,6 +1991,7 @@ fn write_regular(
             error,
         )
     })?;
+    child.note_progress().map_err(git_error)?;
     if !storage::sealed_regular(Identity::from_file(&file)?) {
         return Err(Error::new(
             "TEMPLATE_IO_FAILED",
@@ -1728,6 +2027,7 @@ fn write_symlink(child: &mut GitChild, parent: &File, name: &CStr, size: u64) ->
             error,
         ));
     }
+    child.note_progress().map_err(git_error)?;
     let identity = storage::identity_at(parent.as_raw_fd(), name)?;
     if identity.kind != SYMLINK_TYPE || identity.uid != current_uid() || identity.nlink != 1 {
         return Err(Error::new(
@@ -2467,4 +2767,27 @@ fn current_uid() -> u32 {
 fn lp(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tree_operation_timeout_scales_and_caps() {
+        assert_eq!(tree_operation_timeout(0), Duration::from_secs(30));
+        assert_eq!(tree_operation_timeout(1_000), Duration::from_secs(80));
+        assert_eq!(tree_operation_timeout(u64::MAX), TREE_OPERATION_MAX_TIMEOUT);
+    }
+
+    #[test]
+    fn template_worker_count_is_bounded() {
+        assert_eq!(template_worker_count(0), 1);
+        assert_eq!(
+            template_worker_count(TREE_MATERIALIZE_PARALLEL_MIN_ENTRIES - 1),
+            1
+        );
+        assert!(template_worker_count(TREE_MATERIALIZE_PARALLEL_MIN_ENTRIES) <= 4);
+        assert!(template_worker_count(u64::MAX) <= TREE_MATERIALIZE_MAX_WORKERS);
+    }
 }

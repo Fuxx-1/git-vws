@@ -1204,6 +1204,7 @@ fn materialize_session(
     target: &OsStr,
     base: &str,
 ) -> Result<PathBuf, Error> {
+    let tree_timeout = template::tree_operation_timeout(template.sealed.manifest.entries);
     let root_name = transaction.root_name.clone();
     let root_identity = transaction.root_identity;
     #[cfg(git_vws_m4_checkpoint)]
@@ -1242,7 +1243,7 @@ fn materialize_session(
     bind_path(&empty_template_path, &empty_template, "empty Git template")?;
     let common_path = root_path.join("common.git");
     bind_path(root_path, transaction.root(), "session root")?;
-    init_private_common(authority, &common_path, &empty_template_path)?;
+    init_private_common(authority, &common_path, &empty_template_path, tree_timeout)?;
     #[cfg(git_vws_m4_checkpoint)]
     m4("private-git-initialized")?;
     let common = storage::open_directory_at(transaction.root().as_raw_fd(), c"common.git")?;
@@ -1274,7 +1275,7 @@ fn materialize_session(
         authority.canonical.join("objects").as_os_str().as_bytes(),
         &transaction.capability().record,
     )?;
-    configure_private_common(&common_path, &transaction.capability().record)?;
+    configure_private_common(&common_path, &transaction.capability().record, tree_timeout)?;
 
     let worktree_path = root_path.join("worktree");
     bind_path(root_path, transaction.root(), "session root")?;
@@ -1284,6 +1285,7 @@ fn materialize_session(
         target,
         base,
         &transaction.capability().record,
+        tree_timeout,
     )?;
     let worktree = storage::open_directory_at(transaction.root().as_raw_fd(), c"worktree")?;
     let worktree_identity = Identity::from_file(&worktree)?;
@@ -1325,10 +1327,10 @@ fn materialize_session(
             "native COW receipt did not match the template record",
         ));
     }
-    read_tree(&worktree_path)?;
+    read_tree(&worktree_path, tree_timeout)?;
     #[cfg(git_vws_m4_checkpoint)]
     m4("read-tree-complete")?;
-    status_clean(&worktree_path)?;
+    status_clean(&worktree_path, tree_timeout)?;
     sync_tree(&common)?;
     #[cfg(git_vws_m4_checkpoint)]
     m4("common-tree-synced")?;
@@ -1366,7 +1368,14 @@ fn materialize_session(
         root_identity: final_root_identity,
         common_identity: Identity::from_file(&common)?,
         worktree: Box::new(receipt),
-        git: git_metadata(&common, &common_path, &worktree_path, &worktree, target)?,
+        git: git_metadata(
+            &common,
+            &common_path,
+            &worktree_path,
+            &worktree,
+            target,
+            tree_timeout,
+        )?,
     };
     let ready_bytes = encode_record(&materializing)?;
     let capability = replace_record_capability(
@@ -3553,7 +3562,7 @@ fn classify_private_loose(
 }
 
 fn pack_entry_name(name: &[u8], oid_length: usize) -> bool {
-    for suffix in [b".pack".as_slice(), b".idx".as_slice()] {
+    for suffix in [b".pack".as_slice(), b".idx".as_slice(), b".rev".as_slice()] {
         if let Some(oid) = name
             .strip_prefix(b"pack-")
             .and_then(|value| value.strip_suffix(suffix))
@@ -3568,6 +3577,8 @@ fn pack_entry_pair(name: &[u8]) -> Option<Vec<u8>> {
     let (stem, suffix) = if let Some(stem) = name.strip_suffix(b".pack") {
         (stem, b".idx".as_slice())
     } else if let Some(stem) = name.strip_suffix(b".idx") {
+        (stem, b".pack".as_slice())
+    } else if let Some(stem) = name.strip_suffix(b".rev") {
         (stem, b".pack".as_slice())
     } else {
         return None;
@@ -4332,6 +4343,7 @@ fn init_private_common(
     authority: &Authority,
     common: &Path,
     empty_template: &Path,
+    timeout: Duration,
 ) -> Result<(), Error> {
     let mut template = OsString::from("--template=");
     template.push(empty_template.as_os_str());
@@ -4351,7 +4363,7 @@ fn init_private_common(
         args.insert(4, ref_format);
     }
     require_clean(
-        git::capture(&args, None, GIT_TIMEOUT, AuditConfig::Isolated).map_err(git_error)?,
+        git::capture(&args, None, timeout, AuditConfig::Isolated).map_err(git_error)?,
         "initialize private common-dir",
     )
 }
@@ -4408,7 +4420,11 @@ fn write_alternate(
     Ok(())
 }
 
-fn configure_private_common(common: &Path, _record: &SessionRecord) -> Result<(), Error> {
+fn configure_private_common(
+    common: &Path,
+    _record: &SessionRecord,
+    timeout: Duration,
+) -> Result<(), Error> {
     #[cfg(git_vws_m4_checkpoint)]
     let m4 = |stage| session_checkpoint("create", _record, stage);
     for (key, expected) in [("core.filemode", "true"), ("core.symlinks", "true")] {
@@ -4421,7 +4437,7 @@ fn configure_private_common(common: &Path, _record: &SessionRecord) -> Result<()
             OsString::from(expected),
         ];
         require_clean(
-            git::capture(&args, None, GIT_TIMEOUT, AuditConfig::Isolated).map_err(git_error)?,
+            git::capture(&args, None, timeout, AuditConfig::Isolated).map_err(git_error)?,
             "configure private common-dir",
         )?;
         #[cfg(git_vws_m4_checkpoint)]
@@ -4439,7 +4455,7 @@ fn configure_private_common(common: &Path, _record: &SessionRecord) -> Result<()
             OsString::from(key),
         ];
         let output =
-            git::capture(&args, None, GIT_TIMEOUT, AuditConfig::Isolated).map_err(git_error)?;
+            git::capture(&args, None, timeout, AuditConfig::Isolated).map_err(git_error)?;
         if !output.status.success()
             || output.stderr != b""
             || output.stdout != format!("{expected}\n").as_bytes()
@@ -4459,6 +4475,7 @@ fn add_linked_worktree(
     target: &OsStr,
     base: &str,
     _record: &SessionRecord,
+    timeout: Duration,
 ) -> Result<(), Error> {
     let mut git_dir = OsString::from("--git-dir=");
     git_dir.push(common.as_os_str());
@@ -4474,7 +4491,7 @@ fn add_linked_worktree(
         OsString::from(base),
     ];
     require_clean(
-        git::capture(&args, None, GIT_TIMEOUT, AuditConfig::Isolated).map_err(git_error)?,
+        git::capture(&args, None, timeout, AuditConfig::Isolated).map_err(git_error)?,
         "create private linked worktree",
     )?;
     #[cfg(git_vws_m4_checkpoint)]
@@ -4482,27 +4499,26 @@ fn add_linked_worktree(
     Ok(())
 }
 
-fn read_tree(worktree: &Path) -> Result<(), Error> {
+fn read_tree(worktree: &Path, timeout: Duration) -> Result<(), Error> {
     let args = [
         OsString::from("read-tree"),
         OsString::from("--reset"),
         OsString::from("HEAD"),
     ];
     require_clean(
-        git::capture(&args, Some(worktree), GIT_TIMEOUT, AuditConfig::Isolated)
-            .map_err(git_error)?,
+        git::capture(&args, Some(worktree), timeout, AuditConfig::Isolated).map_err(git_error)?,
         "build linked-worktree index",
     )
 }
 
-fn status_clean(worktree: &Path) -> Result<(), Error> {
+fn status_clean(worktree: &Path, timeout: Duration) -> Result<(), Error> {
     let args = [
         OsString::from("status"),
         OsString::from("--porcelain=v1"),
         OsString::from("--untracked-files=all"),
     ];
-    let output = git::capture(&args, Some(worktree), GIT_TIMEOUT, AuditConfig::Isolated)
-        .map_err(git_error)?;
+    let output =
+        git::capture(&args, Some(worktree), timeout, AuditConfig::Isolated).map_err(git_error)?;
     if output.status.success() && output.stderr.is_empty() && output.stdout.is_empty() {
         Ok(())
     } else {
@@ -4519,6 +4535,7 @@ fn git_metadata(
     worktree_path: &Path,
     worktree: &File,
     target: &OsStr,
+    timeout: Duration,
 ) -> Result<GitMetadataReceipt, Error> {
     let dot_git = hash_bytes(&read_regular_at(
         worktree,
@@ -4535,7 +4552,7 @@ fn git_metadata(
                 OsString::from("HEAD"),
             ],
             None,
-            GIT_TIMEOUT,
+            timeout,
             AuditConfig::Isolated,
         )
         .map_err(git_error)?,
@@ -4554,14 +4571,15 @@ fn git_metadata(
                 reference,
             ],
             None,
-            GIT_TIMEOUT,
+            timeout,
             AuditConfig::Isolated,
         )
         .map_err(git_error)?,
         "read private target ref",
     )?);
+    const INDEX_RECEIPT_LIMIT: usize = 4 * 1024 * 1024;
     let index = hash_bytes(&clean_git_output(
-        git::capture(
+        git::capture_with_limit(
             &[
                 OsString::from("-C"),
                 worktree_path.as_os_str().to_os_string(),
@@ -4570,8 +4588,9 @@ fn git_metadata(
                 OsString::from("-z"),
             ],
             None,
-            GIT_TIMEOUT,
+            timeout,
             AuditConfig::Isolated,
+            INDEX_RECEIPT_LIMIT,
         )
         .map_err(git_error)?,
         "read linked-worktree index",
@@ -4585,7 +4604,7 @@ fn git_metadata(
                 OsString::from("--porcelain"),
             ],
             None,
-            GIT_TIMEOUT,
+            timeout,
             AuditConfig::Isolated,
         )
         .map_err(git_error)?,
@@ -5202,5 +5221,17 @@ mod tests {
             "SESSION_CORRUPT",
             "Ready common mode 0755 rejects"
         );
+    }
+
+    #[test]
+    fn pack_reverse_indexes_are_validated_as_pack_metadata() {
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        let rev = format!("pack-{oid}.rev");
+        assert!(pack_entry_name(rev.as_bytes(), oid.len()));
+        assert_eq!(
+            pack_entry_pair(rev.as_bytes()),
+            Some(format!("pack-{oid}.pack").into_bytes())
+        );
+        assert!(!pack_entry_name(b"pack-0123456789abcdef.rev", oid.len()));
     }
 }
