@@ -1077,6 +1077,74 @@ fn create_seals_raw_tree_reuses_ready_receipt_and_isolates_cow() {
 }
 
 #[test]
+fn create_accepts_an_index_receipt_larger_than_the_default_git_output_limit() {
+    require_native_cow();
+    let mut sandbox = Sandbox::new();
+    let bare = fixture_repo(&sandbox, false);
+    let source = sandbox.child("large-index-source");
+    git(
+        &sandbox.path,
+        &[
+            OsString::from("clone"),
+            bare.as_os_str().to_os_string(),
+            source.as_os_str().to_os_string(),
+        ],
+    );
+    git(&source, &git_args(&["config", "user.name", "M2 Test"]));
+    git(
+        &source,
+        &git_args(&["config", "user.email", "m2@example.invalid"]),
+    );
+    for index in 0..400 {
+        fs::write(
+            source.join(format!(
+                "large-index-entry-{index:04}-with-a-production-sized-path.txt"
+            )),
+            b"index receipt fixture\n",
+        )
+        .expect("write large index fixture");
+    }
+    git(&source, &git_args(&["add", "-A"]));
+    git(&source, &git_args(&["commit", "-m", "large index"]));
+    git(&source, &git_args(&["push", "origin", "HEAD:main"]));
+    let index = git(&source, &git_args(&["ls-files", "--stage", "-z"]));
+    assert!(
+        index.stdout.len() > 16 * 1024,
+        "fixture did not exceed the default Git output limit"
+    );
+
+    let home = home(&sandbox);
+    let initialized = vws(
+        &home,
+        vec![OsString::from("init"), bare.as_os_str().to_os_string()],
+    );
+    assert!(initialized.status.success(), "init: {initialized:?}");
+    let created = create(&home, &bare, "large-index");
+    assert!(created.status.success(), "large index create: {created:?}");
+    let session_root = only_child(&home.join(".git-vws/sessions"), ".root");
+    let worktree = session_root.join("worktree");
+    let status = git(
+        &worktree,
+        &git_args(&["status", "--porcelain=v1", "--untracked-files=all"]),
+    );
+    assert!(
+        status.stdout.is_empty(),
+        "large worktree was not clean: {status:?}"
+    );
+    for index in 0..400 {
+        assert_eq!(
+            fs::read(worktree.join(format!(
+                "large-index-entry-{index:04}-with-a-production-sized-path.txt"
+            )))
+            .expect("read parallel materialized file"),
+            b"index receipt fixture\n"
+        );
+    }
+
+    sandbox.cleanup().expect("cleanup large index fixture");
+}
+
+#[test]
 fn unsupported_attributes_reject_create_without_authority_write() {
     let mut sandbox = Sandbox::new();
     let bare = fixture_repo(&sandbox, true);

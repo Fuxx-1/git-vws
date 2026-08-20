@@ -21,12 +21,14 @@ use std::process::{ExitCode, ExitStatus};
     arg_required_else_help = true,
     after_help = r#"
 QUICK START
-  Use `git vws` (Git discovers the `git-vws` executable on PATH). If you already
-  have a bare repository, start at the `init` command.
+  Use `git vws` (Git discovers the `git-vws` executable on PATH). Start with an
+  existing bare repository or a normal project checkout.
 
   git clone --bare <source-url> <repo.git>
   git vws init <repo.git>
+  git vws init <project>
   git vws --repo <repo.git> create feature-a --target feature/a
+  git vws --repo <project> create feature-a --target feature/a
   git vws --repo <repo.git> list
   git vws --repo <repo.git> exec feature-a -- "$SHELL"
   # Edit files and run normal Git commands in the session shell:
@@ -44,7 +46,7 @@ OPERATING MODEL
   Unsupported storage is rejected with STORAGE_UNSUPPORTED.
 
 COMMAND ORDER
-  init       Register and validate an existing bare authority.
+  init       Register and validate an existing Git repository.
   create     Create an isolated session and print its managed session root.
   list       Inspect sessions as one JSON object per line (NDJSON).
   exec       Run a program with the session worktree as its current directory.
@@ -54,10 +56,12 @@ COMMAND ORDER
   gc         Reclaim only state that can be proven safe to remove.
 
 REPOSITORY SELECTION
-  Commands for one authority use --repo <BARE_PATH>; without it, the current
-  directory is used. `init` takes its authority as the positional BARE_PATH.
+  Commands for one authority use --repo <PATH>; without it, the current
+  directory is used. `init` takes a project or bare repository path. Normal
+  project paths are canonicalized to their `.git` directory.
   `list --all`, `doctor`, and `gc` operate on all registered authorities and
-  reject --repo. State is kept under ~/.git-vws.
+  reject --repo. State is kept under $HOME/.git-vws and is shared by all
+  registered repositories.
 
 EDITING AND PUBLISHING
   After create, edit <printed-session-root>/worktree or use exec. Git sees a
@@ -107,8 +111,8 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        value_name = "BARE_PATH",
-        help = "Select an existing bare authority; default: current directory"
+        value_name = "PATH",
+        help = "Select an existing Git repository; default: current directory"
     )]
     repo: Option<PathBuf>,
 
@@ -119,31 +123,36 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     #[command(
-        about = "Register an existing bare Git repository as an authority",
+        about = "Register an existing Git repository as an authority",
         after_help = r#"
 WHAT IT DOES
-  Validates that BARE_PATH is a supported, sole bare repository and records it
-  in the local ~/.git-vws registry. It does not create a repository, clone a
-  repository, or convert a normal working clone into a bare authority.
+  Validates that PATH is a supported, sole Git repository and records it in the
+  local $HOME/.git-vws registry. PATH may be a bare repository, a project root,
+  or its `.git` directory. It does not create or clone a repository.
 
 EXAMPLES
   git clone --bare <source-url> repo.git
   git vws init repo.git
+  git vws init .
   git vws --repo repo.git create feature-a
+  git vws --repo . create feature-a
 
 REQUIREMENTS
-  The authority must have git-dir == common-dir == BARE_PATH, use a supported
-  object/ref format, and be the sole formal Git authority at that path.
+  The authority must have git-dir == common-dir, use a supported object/ref
+  format, and have no linked-worktree registry or object alternates. A bare
+  path must be the Git directory itself; a normal project is recorded by its
+  canonical `.git` directory.
   Initialization is idempotence-checked and fails closed if the path changes.
-  Native COW support for ~/.git-vws is probed when a template is first created.
+  Native COW support for $HOME/.git-vws is probed when a template is first
+  created.
 "#
     )]
     Init {
         #[arg(
-            value_name = "BARE_PATH",
-            help = "Existing bare Git repository to register and validate"
+            value_name = "PATH",
+            help = "Existing Git repository or project to register and validate"
         )]
-        bare_path: PathBuf,
+        repository_path: PathBuf,
     },
     #[command(
         about = "Create an isolated writable session",
@@ -316,8 +325,8 @@ OUTPUT
         about = "Publish committed session work with Git CAS",
         after_help = r#"
 WHAT IT DOES
-  Publishes the session's committed target branch to the registered bare
-  authority. It first verifies the private commit closure, imports missing
+  Publishes the session's committed target branch to the registered authority.
+  It first verifies the private commit closure, imports missing
   objects, and performs an expected-old compare-and-swap on the target ref.
 
 REQUIRED WORKFLOW
@@ -361,7 +370,7 @@ NOTE
         about = "Diagnose all registered state without deleting anything",
         after_help = r#"
 WHAT IT DOES
-  Scans the local ~/.git-vws registry, sessions, templates, bindings, and
+  Scans the local $HOME/.git-vws registry, sessions, templates, bindings, and
   private Git storage. It emits NDJSON item/finding records plus a summary.
   doctor is read-only and never reclaims tombstones or objects.
 
@@ -414,7 +423,9 @@ fn main() -> ExitCode {
     }
     let Cli { repo, command } = Cli::parse();
     let result = match command {
-        Command::Init { bare_path } => authority::init(&bare_path).map(CommandOutput::Text),
+        Command::Init { repository_path } => {
+            authority::init(&repository_path).map(CommandOutput::Text)
+        }
         Command::Create {
             name,
             from,

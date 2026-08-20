@@ -33,7 +33,7 @@ TARGETS = {
     "x86_64-unknown-linux-musl": ("Linux", "x86_64"),
 }
 VERSION_PATTERN = re.compile(
-    r"[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z]+(?:[0-9A-Za-z.-]*[0-9A-Za-z])?"
+    r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[0-9A-Za-z.-]*[0-9A-Za-z])?)?"
 )
 SOURCE_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 GIT_OBJECT_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
@@ -166,11 +166,15 @@ def sha256_file(path: Path) -> str:
 
 def validate_release_identity(version: str, source_sha: str, epoch: int | None = None) -> None:
     if VERSION_PATTERN.fullmatch(version) is None:
-        fail(f"invalid prerelease version: {version}")
+        fail(f"invalid release version: {version}")
     if SOURCE_SHA_PATTERN.fullmatch(source_sha) is None:
         fail(f"invalid source commit digest: {source_sha}")
     if epoch is not None and epoch <= 0:
         fail(f"invalid source date epoch: {epoch}")
+
+
+def is_prerelease(version: str) -> bool:
+    return "-" in version
 
 
 def package_prefix(version: str) -> str:
@@ -760,7 +764,7 @@ def validate_remote_manifest(
         manifest.get("run_attempt"), "release snapshot workflow run attempt"
     )
     if manifest.get("draft") is not True or manifest.get("prerelease") is not False:
-        fail("release snapshot manifest is not a draft prerelease candidate")
+        fail("release snapshot manifest is not a draft release candidate")
     release_id = require_positive_int(manifest.get("release_id"), "release snapshot id")
     raw_assets = manifest.get("assets")
     if not isinstance(raw_assets, list) or any(
@@ -838,7 +842,7 @@ def verify_release_snapshot(args: argparse.Namespace) -> None:
     validate_snapshot_assets(Path(args.assets), manifest)
     if args.release is not None:
         expected_draft = not args.promoted
-        expected_prerelease = args.promoted
+        expected_prerelease = args.promoted and is_prerelease(args.version)
         live = remote_release_manifest(
             read_json(Path(args.release)),
             args,

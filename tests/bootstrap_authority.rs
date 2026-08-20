@@ -815,13 +815,25 @@ fn invalid_authorities_and_external_storage_are_zero_write() {
     symlink(&moved_objects, storage_symlink.join("objects")).expect("objects symlink");
     for (name, authority) in [
         ("plain-home", &plain),
-        ("normal-home", &normal),
         ("registry-home", &registry),
         ("alternates-home", &alternates),
         ("storage-symlink-home", &storage_symlink),
     ] {
         assert_rejected(&home(&sandbox, name), authority);
     }
+    let normal_home = home(&sandbox, "normal-home");
+    let normal_before = snapshot(&normal);
+    let normal_init = init(&normal_home, &normal);
+    assert!(
+        normal_init.status.success(),
+        "normal project init: {normal_init:?}"
+    );
+    assert_eq!(
+        snapshot(&normal),
+        normal_before,
+        "normal project was modified"
+    );
+    assert!(normal_home.join(".git-vws").exists());
     sandbox.cleanup().expect("cleanup");
 }
 

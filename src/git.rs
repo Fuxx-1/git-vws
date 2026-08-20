@@ -68,6 +68,8 @@ pub(crate) struct GitChild {
     stdin: Option<Input>,
     stdout_pending: Vec<u8>,
     deadline: Instant,
+    hard_deadline: Option<Instant>,
+    progress_timeout: Option<Duration>,
     settled: bool,
 }
 
@@ -78,6 +80,23 @@ impl GitChild {
         timeout: Duration,
     ) -> Result<Self, Error> {
         Self::spawn_with_env_for(args, cwd, &[], false, timeout, AuditConfig::Isolated)
+    }
+
+    pub(crate) fn spawn_for_progress(
+        args: &[OsString],
+        cwd: Option<&Path>,
+        idle_timeout: Duration,
+        hard_timeout: Duration,
+    ) -> Result<Self, Error> {
+        Self::spawn_with_env_for_progress(
+            args,
+            cwd,
+            &[],
+            false,
+            idle_timeout,
+            hard_timeout,
+            AuditConfig::Isolated,
+        )
     }
 
     pub(crate) fn spawn_audit(
@@ -138,6 +157,8 @@ impl GitChild {
             stdin: None,
             stdout_pending: Vec::new(),
             deadline: Instant::now() + CLEANUP_TIMEOUT,
+            hard_deadline: None,
+            progress_timeout: None,
             settled: false,
         })
     }
@@ -159,6 +180,30 @@ impl GitChild {
             timeout,
             audit,
         )
+    }
+
+    pub(crate) fn spawn_with_env_for_progress(
+        args: &[OsString],
+        cwd: Option<&Path>,
+        extra_env: &[(OsString, OsString)],
+        piped_stdin: bool,
+        idle_timeout: Duration,
+        hard_timeout: Duration,
+        audit: AuditConfig,
+    ) -> Result<Self, Error> {
+        let hard_deadline = Instant::now() + hard_timeout;
+        let mut child = Self::spawn_with_env_for(
+            args,
+            cwd,
+            extra_env,
+            piped_stdin,
+            idle_timeout.min(hard_timeout),
+            audit,
+        )?;
+        child.deadline = child.deadline.min(hard_deadline);
+        child.hard_deadline = Some(hard_deadline);
+        child.progress_timeout = Some(idle_timeout);
+        Ok(child)
     }
 
     fn spawn_program_with_env_for(
@@ -231,6 +276,8 @@ impl GitChild {
             stdin: None,
             stdout_pending: Vec::new(),
             deadline,
+            hard_deadline: None,
+            progress_timeout: None,
             settled: false,
         };
         let stdout = match spawned.child.stdout.take() {
@@ -426,7 +473,10 @@ impl GitChild {
                         "Git batch stdin closed before a request was written",
                     )));
                 }
-                Ok(count) => written += count,
+                Ok(count) => {
+                    written += count;
+                    self.note_progress()?;
+                }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.wait_batch_write()?;
@@ -448,6 +498,26 @@ impl GitChild {
         self.stdin.take();
     }
 
+    pub(crate) fn note_progress(&mut self) -> Result<(), Error> {
+        if self
+            .hard_deadline
+            .is_some_and(|hard_deadline| Instant::now() >= hard_deadline)
+        {
+            return Err(self.batch_failure(Error::new(
+                "GIT_BATCH_FAILED",
+                "Git batch stream exceeded its hard deadline",
+            )));
+        }
+        let Some(progress_timeout) = self.progress_timeout else {
+            return Ok(());
+        };
+        let deadline = Instant::now() + progress_timeout;
+        self.deadline = self
+            .hard_deadline
+            .map_or(deadline, |hard_deadline| deadline.min(hard_deadline));
+        Ok(())
+    }
+
     pub(crate) fn read_exact_stdout(&mut self, bytes: &mut [u8]) -> Result<(), Error> {
         let mut offset = 0;
         while offset < bytes.len() {
@@ -462,6 +532,7 @@ impl GitChild {
                 bytes[offset..offset + copied].copy_from_slice(&self.stdout_pending[..copied]);
                 self.stdout_pending.drain(..copied);
                 offset += copied;
+                self.note_progress()?;
                 continue;
             }
             let result = self
@@ -477,7 +548,10 @@ impl GitChild {
                         "Git batch output was truncated",
                     )));
                 }
-                Ok(count) => offset += count,
+                Ok(count) => {
+                    offset += count;
+                    self.note_progress()?;
+                }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.wait_batch_activity()?;
@@ -538,7 +612,10 @@ impl GitChild {
                         "Git stream ended with a partial record",
                     )));
                 }
-                Ok(count) => self.stdout_pending.extend_from_slice(&buffer[..count]),
+                Ok(count) => {
+                    self.stdout_pending.extend_from_slice(&buffer[..count]);
+                    self.note_progress()?;
+                }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.wait_batch_activity()?
@@ -682,6 +759,7 @@ impl GitChild {
                         )));
                     }
                     self.stdout_pending.extend_from_slice(&buffer[..count]);
+                    self.note_progress()?;
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
@@ -954,11 +1032,21 @@ pub(crate) fn capture(
     timeout: Duration,
     audit: AuditConfig,
 ) -> Result<Output, Error> {
+    capture_with_limit(args, cwd, timeout, audit, DEFAULT_LIMIT)
+}
+
+pub(crate) fn capture_with_limit(
+    args: &[OsString],
+    cwd: Option<&Path>,
+    timeout: Duration,
+    audit: AuditConfig,
+    limit: usize,
+) -> Result<Output, Error> {
     let child = match audit {
         AuditConfig::Isolated => GitChild::spawn_for(args, cwd, timeout),
         AuditConfig::Authority => GitChild::spawn_audit(args, cwd, timeout),
     }?;
-    child.capture(DEFAULT_LIMIT)
+    child.capture(limit)
 }
 
 impl Drop for GitChild {

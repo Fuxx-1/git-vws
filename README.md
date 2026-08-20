@@ -2,14 +2,14 @@
 
 [![CI](https://github.com/Fuxx-1/git-vws/actions/workflows/ci.yml/badge.svg)](https://github.com/Fuxx-1/git-vws/actions/workflows/ci.yml)
 
-`git-vws` provides native copy-on-write virtual worktrees for bare Git repositories. Each session has private Git metadata, branch state, index, working changes, and build output while unchanged file data is shared through APFS clones on macOS or `FICLONE` on supported Linux filesystems.
+`git-vws` provides native copy-on-write virtual worktrees for Git repositories. Each session has private Git metadata, branch state, index, working changes, and build output while unchanged file data is shared through APFS clones on macOS or `FICLONE` on supported Linux filesystems.
 
-This is an alpha build. Back up important repositories and review command output before removing sessions or publishing branches.
+Version 1.0.0 is the stable release for the supported macOS and Linux filesystems. Review command output before removing sessions or publishing branches.
 
 ## Commands
 
 ```text
-git vws init <bare-path>
+git vws init <repository-or-project>
 git vws create <name> [--from <rev>] [--target <branch>] [--path <managed-path>]
 git vws list [--all]
 git vws exec <name> -- <program> [args...]
@@ -19,7 +19,9 @@ git vws doctor
 git vws gc
 ```
 
-Commands that operate on one repository use the current directory by default. Pass `--repo <bare-path>` before the subcommand to select another authority repository. `list --all`, `doctor`, and `gc` operate on the registered repository set and do not accept `--repo`.
+Commands that operate on one repository use the current directory by default. Pass `--repo <path>` before the subcommand to select another repository or project. For a normal project, git-vws records its canonical `.git` directory. `list --all`, `doctor`, and `gc` operate on the registered repository set and do not accept `--repo`.
+
+All registry, session, template, and cleanup state is stored under `$HOME/.git-vws`; no `.git-vws` directory is created inside a project.
 
 `publish` supports new-target creation, same-tip publication, and fast-forward expected-old CAS. If another writer changes the target first, publication fails without overwriting that update.
 
@@ -44,11 +46,11 @@ gh attestation verify '<release-asset>' \
   --signer-workflow Fuxx-1/git-vws/.github/workflows/release-sign.yml \
   --signer-digest '<signer-workflow-commit-from-release-notes>' \
   --source-digest '<source-commit-from-release-notes>' \
-  --source-ref refs/tags/v0.1.0-alpha.8 \
+  --source-ref refs/tags/v1.0.0 \
   --deny-self-hosted-runners
 ```
 
-The annotated tag binds the exact successful pre-release CI run. The attestation binds every release asset digest to the tag source, immutable reusable signer workflow, GitHub-hosted runner, and public transparency log without a repository-managed signing key.
+The annotated tag binds the exact successful pre-tag CI run. The attestation binds every release asset digest to the tag source, immutable reusable signer workflow, GitHub-hosted runner, and public transparency log without a repository-managed signing key.
 
 Copyright (C) 2026 git-vws contributors. git-vws is free software licensed under the GNU General Public License, version 3 only (`GPL-3.0-only`), without any warranty. See [`LICENSE`](LICENSE).
 

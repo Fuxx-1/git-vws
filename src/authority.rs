@@ -216,7 +216,7 @@ pub(crate) fn init(input: &Path) -> Result<String, Error> {
     let mut state = StateRoot::open()?;
     match transaction(&mut state, &second) {
         Ok(()) => Ok(format!(
-            "initialized bare authority {}",
+            "initialized Git authority {}",
             second.canonical.display()
         )),
         Err(error) if state.committed() || state.preserve_root() => Err(error),
@@ -366,24 +366,30 @@ fn inspect_authority(input: &Path) -> Result<Authority, Error> {
     }
 
     let probe = git_probe(&canonical)?;
-    if probe[0] != "true" {
-        return Err(Error::new(
-            "AUTHORITY_NOT_BARE",
-            "Git did not report a bare repository",
-        ));
-    }
+    let is_bare = match probe[0].as_str() {
+        "true" => true,
+        "false" => false,
+        _ => {
+            return Err(Error::new(
+                "GIT_PROBE_FAILED",
+                "Git reported an invalid bare-repository flag",
+            ))
+        }
+    };
     let git_dir = canonical_git_path(&probe[1], "git-dir")?;
     let common_dir = canonical_git_path(&probe[2], "git-common-dir")?;
     let git_identity = identity_for_path(&git_dir, "git-dir")?;
     let common_identity = identity_for_path(&common_dir, "git-common-dir")?;
-    if canonical != git_dir
-        || git_dir != common_dir
-        || !identity.same_node(git_identity)
-        || !identity.same_node(common_identity)
-    {
+    if git_dir != common_dir || !git_identity.same_node(common_identity) {
         return Err(Error::new(
             "AUTHORITY_NOT_SOLE",
-            "authority, git-dir, and common-dir differ",
+            "git-dir and common-dir differ",
+        ));
+    }
+    if is_bare && (canonical != git_dir || !identity.same_node(git_identity)) {
+        return Err(Error::new(
+            "AUTHORITY_NOT_SOLE",
+            "bare authority, git-dir, and common-dir differ",
         ));
     }
 
@@ -391,8 +397,8 @@ fn inspect_authority(input: &Path) -> Result<Authority, Error> {
     let ref_format = supported_format(&probe[4], &["files", "reftable"], "ref")?;
     verify_storage(&common_dir, &ref_format)?;
     Ok(Authority {
-        canonical,
-        identity,
+        canonical: git_dir,
+        identity: git_identity,
         object_format,
         ref_format,
     })
@@ -425,7 +431,8 @@ fn git_probe(path: &Path) -> Result<Vec<String>, Error> {
         .ok_or_else(|| Error::new("GIT_PROBE_FAILED", "Git probe lacked a final newline"))?;
     let mut fields: Vec<String> = body.split('\n').map(ToOwned::to_owned).collect();
     if fields.len() == 4 {
-        fields.push(detect_ref_format(path)?);
+        let git_dir = canonical_git_path(&fields[1], "git-dir")?;
+        fields.push(detect_ref_format(&git_dir)?);
     }
     if fields.len() != 5
         || fields
