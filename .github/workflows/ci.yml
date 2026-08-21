@@ -225,11 +225,11 @@ jobs:
           src/authority.rs 61af3ffaca3280c701a3e60ec757f983ec425ee928cfe2af2ba59d9568a9f1db
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
           src/main.rs 2d90687eaf5f6f4b0ff2f1d3ec88171d6edd2c51d04b51d64ab690e64c0f0a38
-          src/session.rs 5e456efc17874aab443dab60e76512d4d936f3fb27081f1cac6d8ecbec015392
+          src/session.rs 7940d5a49bba92cacd942c41e64b62b20a4d7d4e05d97100e42459dd99b9a6ff
           src/storage.rs 45f970762596832130f64ebe7c64155972dd98c88483e2a7a99d7fe791ae70de
           src/template.rs 2ac417299ef5b7245826a1ec5e5338c9b91eb30cef16cb591b174efa839de34d
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
-          tests/m5_publish.rs 2b3de1ed3bd07b5bb7a4703d63a691ad60e1665148051d69208b120ace6e39cb
+          tests/m5_publish.rs 88303a90bc26f54f688269bd9bd64d78ee3478be3d5f9b7f307f97158b689e92
           tests/m6_maintenance.rs f9f8a6451c061482d09ba514a6d236885a9bcf4d9d850bf366b911fe19c7d15b
           tests/support/checkpoint.rs c8026cb722d3c0250fc6d403540fd3b78ab18eaac5c881c5e9bb36c8860bef16
           EOF
@@ -602,11 +602,11 @@ jobs:
           src/authority.rs 61af3ffaca3280c701a3e60ec757f983ec425ee928cfe2af2ba59d9568a9f1db
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
           src/main.rs 2d90687eaf5f6f4b0ff2f1d3ec88171d6edd2c51d04b51d64ab690e64c0f0a38
-          src/session.rs 5e456efc17874aab443dab60e76512d4d936f3fb27081f1cac6d8ecbec015392
+          src/session.rs 7940d5a49bba92cacd942c41e64b62b20a4d7d4e05d97100e42459dd99b9a6ff
           src/storage.rs 45f970762596832130f64ebe7c64155972dd98c88483e2a7a99d7fe791ae70de
           src/template.rs 2ac417299ef5b7245826a1ec5e5338c9b91eb30cef16cb591b174efa839de34d
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
-          tests/m5_publish.rs 2b3de1ed3bd07b5bb7a4703d63a691ad60e1665148051d69208b120ace6e39cb
+          tests/m5_publish.rs 88303a90bc26f54f688269bd9bd64d78ee3478be3d5f9b7f307f97158b689e92
           tests/m6_maintenance.rs f9f8a6451c061482d09ba514a6d236885a9bcf4d9d850bf366b911fe19c7d15b
           tests/support/checkpoint.rs c8026cb722d3c0250fc6d403540fd3b78ab18eaac5c881c5e9bb36c8860bef16
           EOF
