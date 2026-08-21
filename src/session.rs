@@ -852,6 +852,7 @@ pub(crate) fn publish(
                     .map_err(publish_recovery)?;
                 return Ok(publish_success(&capability.record, &new));
             }
+            ensure_publish_target_unchecked_out(&context.authority, &target)?;
             ensure_authority_expected_old(&context.authority, &target, expected_old.as_deref())?;
             let prepared = replace_publish_journal(
                 &context.sessions,
@@ -892,6 +893,7 @@ fn publish_prepared(
     let current_config = audit_authority_config(&context.authority)?;
     ensure_authority_config(&current_config, &config_fingerprint)?;
     validate_publish_target(&context.authority, target)?;
+    ensure_publish_target_unchecked_out(&context.authority, target)?;
     ensure_private_target(common_path, target, &context.authority.object_format, &new)?;
     ensure_publish_relation(common_path, expected_old.as_deref(), &new)?;
     if authority_target_commit(&context.authority, target)?.as_deref() != expected_old.as_deref() {
@@ -939,6 +941,7 @@ fn publish_objects_imported(
     if authority_target_commit(&context.authority, target)?.as_deref() != expected_old.as_deref() {
         return abort_publish_conflict(&context.sessions, &capability, &txid);
     }
+    ensure_publish_target_unchecked_out(&context.authority, target)?;
     let attempted = replace_publish_journal(
         &context.sessions,
         &capability,
@@ -3994,6 +3997,41 @@ fn validate_publish_target(authority: &Authority, target: &OsStr) -> Result<(), 
             "session target is not a valid direct branch name",
         ))
     }
+}
+
+fn ensure_publish_target_unchecked_out(authority: &Authority, target: &OsStr) -> Result<(), Error> {
+    let args = [
+        OsString::from("-C"),
+        authority.canonical.as_os_str().to_os_string(),
+        OsString::from("worktree"),
+        OsString::from("list"),
+        OsString::from("--porcelain"),
+    ];
+    let output = git::capture(&args, None, GIT_TIMEOUT, AuditConfig::Authority).map_err(|_| {
+        Error::new(
+            "PUBLISH_VERIFY_FAILED",
+            "cannot inspect authority worktrees",
+        )
+    })?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(Error::new(
+            "PUBLISH_VERIFY_FAILED",
+            "cannot inspect authority worktrees",
+        ));
+    }
+    let mut expected = b"branch refs/heads/".to_vec();
+    expected.extend_from_slice(target.as_bytes());
+    if output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .any(|line| line == expected)
+    {
+        return Err(Error::new(
+            "PUBLISH_TARGET_CHECKED_OUT",
+            "publish target is checked out by an authority worktree",
+        ));
+    }
+    Ok(())
 }
 
 fn audit_authority_config(authority: &Authority) -> Result<String, Error> {

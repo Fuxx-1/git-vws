@@ -964,6 +964,96 @@ fn publish_names_new_fast_forwards_and_private_objects_are_retained() {
     fixture.cleanup();
 }
 
+#[test]
+fn publish_rejects_normal_authority_checked_out_target() {
+    let mut fixture = Fixture::new();
+    fixture.authority = fixture.source.clone();
+    assert_success(
+        &fixture.vws(vec![
+            OsString::from("init"),
+            fixture.authority.as_os_str().to_os_string(),
+        ]),
+        "initialize normal M5 authority",
+    );
+    fixture.trace.clear();
+
+    assert_success(
+        &fixture.create(OsString::from("normal-main"), "main"),
+        "create normal checked-out target session",
+    );
+    let _published = commit_worktree(
+        &fixture.worktree(b"normal-main"),
+        "normal-main.txt",
+        b"normal main publish must stop\n",
+    );
+    let authority_before = snapshot(&fixture.authority);
+    let main_before = object_id(
+        &git_output(
+            &fixture.authority,
+            &git_args(&["rev-parse", "refs/heads/main"]),
+        ),
+        "normal authority main before rejected publish",
+    );
+    fixture.trace.clear();
+    assert_error(
+        &fixture.publish("normal-main"),
+        "PUBLISH_TARGET_CHECKED_OUT",
+        "normal authority checked-out target publish",
+    );
+    assert_eq!(
+        snapshot(&fixture.authority),
+        authority_before,
+        "rejected normal-authority publish changed its project or Git state"
+    );
+    assert_eq!(
+        object_id(
+            &git_output(
+                &fixture.authority,
+                &git_args(&["rev-parse", "refs/heads/main"]),
+            ),
+            "normal authority main after rejected publish",
+        ),
+        main_before,
+        "rejected normal-authority publish changed main"
+    );
+    assert_eq!(
+        fixture.trace.count("fetch"),
+        0,
+        "checked-out target publish imported objects"
+    );
+    assert_eq!(
+        fixture.trace.count("update-ref"),
+        0,
+        "checked-out target publish attempted CAS"
+    );
+    assert_no_publish_journal(&fixture.record(b"normal-main"));
+
+    assert_success(
+        &fixture.create(OsString::from("normal-free"), "normal-free"),
+        "create normal unclaimed target session",
+    );
+    let free = commit_worktree(
+        &fixture.worktree(b"normal-free"),
+        "normal-free.txt",
+        b"normal unclaimed branch publish\n",
+    );
+    fixture.trace.clear();
+    assert_publish_success(&fixture.publish("normal-free"), "normal-free", &free);
+    assert_eq!(
+        object_id(
+            &git_output(
+                &fixture.authority,
+                &git_args(&["rev-parse", "refs/heads/main"]),
+            ),
+            "normal authority main after unclaimed target publish",
+        ),
+        main_before,
+        "unclaimed target publish moved the checked-out branch"
+    );
+    assert_no_publish_journal(&fixture.record(b"normal-free"));
+    fixture.cleanup();
+}
+
 fn wait_for(path: &Path, label: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !path.exists() {

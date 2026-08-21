@@ -23,7 +23,7 @@ Commands that operate on one repository use the current directory by default. Pa
 
 All registry, session, template, and cleanup state is stored under `$HOME/.git-vws`; no `.git-vws` directory is created inside a project.
 
-`publish` supports new-target creation, same-tip publication, and fast-forward expected-old CAS. If another writer changes the target first, publication fails without overwriting that update.
+`publish` supports new-target creation, same-tip publication, and fast-forward expected-old CAS. If another writer changes the target first, publication fails without overwriting that update. For a normal project authority, publish only to a branch that is not checked out by any of that repository's worktrees; use a bare authority when the branch may be concurrently checked out.
 
 ## Requirements
 
