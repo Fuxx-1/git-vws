@@ -3261,13 +3261,7 @@ fn classify_authority_objects(
             "authority object metadata is not an owned same-volume directory",
         )?;
         let children = match entry.as_slice() {
-            b"info" => {
-                require_session(
-                    storage::directory_names(directory.as_raw_fd())?.is_empty(),
-                    "authority object info contains an unrecognized entry",
-                )?;
-                Vec::new()
-            }
+            b"info" => classify_authority_info(&directory, identity, &plan.volume)?,
             b"pack" => classify_pack_entries(
                 &directory,
                 identity,
@@ -3313,6 +3307,36 @@ fn classify_authority_fanout(
     require_session(
         Identity::from_file(fanout)? == fanout_identity,
         "authority loose object fanout changed during classification",
+    )?;
+    Ok(children)
+}
+
+fn classify_authority_info(
+    info: &File,
+    info_identity: Identity,
+    volume: &str,
+) -> Result<Vec<(Vec<u8>, Identity)>, Error> {
+    let mut children = Vec::new();
+    for entry in storage::directory_names(info.as_raw_fd())? {
+        let name = cstring(&entry, "authority object info")?;
+        let identity = storage::identity_at(info.as_raw_fd(), &name)?;
+        require_session(
+            matches!(entry.as_slice(), b"commit-graph" | b"packs"),
+            "authority object info contains an unrecognized entry",
+        )?;
+        validate_authority_regular(
+            info,
+            &name,
+            identity,
+            info_identity,
+            volume,
+            "authority object info has an unsafe identity",
+        )?;
+        children.push((entry, identity));
+    }
+    require_session(
+        Identity::from_file(info)? == info_identity,
+        "authority object info changed during classification",
     )?;
     Ok(children)
 }

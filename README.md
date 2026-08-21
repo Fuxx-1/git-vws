@@ -4,7 +4,7 @@
 
 `git-vws` provides native copy-on-write virtual worktrees for Git repositories. Each session has private Git metadata, branch state, index, working changes, and build output while unchanged file data is shared through APFS clones on macOS or `FICLONE` on supported Linux filesystems.
 
-Version 1.0.1 is the stable release for the supported macOS and Linux filesystems. Review command output before removing sessions or publishing branches.
+Version 1.0.2 is the stable release for the supported macOS and Linux filesystems. Review command output before removing sessions or publishing branches.
 
 ## Commands
 
@@ -46,7 +46,7 @@ gh attestation verify '<release-asset>' \
   --signer-workflow Fuxx-1/git-vws/.github/workflows/release-sign.yml \
   --signer-digest '<signer-workflow-commit-from-release-notes>' \
   --source-digest '<source-commit-from-release-notes>' \
-  --source-ref refs/tags/v1.0.1 \
+  --source-ref refs/tags/v1.0.2 \
   --deny-self-hosted-runners
 ```
 

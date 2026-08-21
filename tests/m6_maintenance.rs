@@ -2170,6 +2170,86 @@ fn gc_tombstones_and_crash_prefix_recover_exactly_once() {
         "completed M6 special tombstone retained a record"
     );
     special_tree.cleanup();
+
+    let mut hard_links = Fixture::new(true);
+    assert_success(
+        &hard_links.create("hard-link-direct", "main"),
+        "create M6 direct hard-link source",
+    );
+    assert_success(
+        &hard_links.create("hard-link-gc", "main"),
+        "create M6 GC hard-link source",
+    );
+    let direct_source = hard_links
+        .worktree(b"hard-link-direct")
+        .join("target/debug/deps/source");
+    let direct = hard_links
+        .worktree(b"hard-link-direct")
+        .join("target/debug/incremental/output");
+    let gc_source = hard_links
+        .worktree(b"hard-link-gc")
+        .join("target/debug/deps/source");
+    let gc = hard_links
+        .worktree(b"hard-link-gc")
+        .join("target/debug/incremental/output");
+    fs::create_dir_all(direct_source.parent().expect("M6 direct hard-link parent"))
+        .expect("create M6 direct hard-link parent");
+    fs::create_dir_all(gc_source.parent().expect("M6 GC hard-link parent"))
+        .expect("create M6 GC hard-link parent");
+    fs::create_dir_all(direct.parent().expect("M6 direct hard-link output parent"))
+        .expect("create M6 direct hard-link output parent");
+    fs::create_dir_all(gc.parent().expect("M6 GC hard-link output parent"))
+        .expect("create M6 GC hard-link output parent");
+    fs::write(&direct_source, b"M6 hard-link source\n").expect("write M6 direct hard-link source");
+    fs::write(&gc_source, b"M6 hard-link source\n").expect("write M6 GC hard-link source");
+    fs::hard_link(&direct_source, &direct).expect("create M6 direct hard-link output");
+    fs::hard_link(&gc_source, &gc).expect("create M6 GC hard-link output");
+    assert_eq!(
+        fs::metadata(&direct_source)
+            .expect("stat M6 direct hard-link source")
+            .nlink(),
+        2,
+        "M6 direct hard-link setup did not create two managed bindings"
+    );
+    assert_eq!(
+        fs::metadata(&gc_source)
+            .expect("stat M6 GC hard-link source")
+            .nlink(),
+        2,
+        "M6 GC hard-link setup did not create two managed bindings"
+    );
+    assert_success(
+        &hard_links.remove("hard-link-direct", true),
+        "force removal accepts a hard-linked build output",
+    );
+    assert!(
+        !direct_source.exists(),
+        "force removal retained a managed hard-link source"
+    );
+    crash_at(
+        &hard_links,
+        &binaries.instrumented,
+        hard_links.remove_args("hard-link-gc", true),
+        "remove",
+        "tombstoned-record-parent-synced",
+    );
+    assert_eq!(
+        payload_state(&hard_links.record(b"hard-link-gc")),
+        "TOMBSTONED"
+    );
+    assert_success(
+        &normal_gc(&hard_links, &binaries.normal),
+        "GC removes a tombstone with a hard-linked build output",
+    );
+    assert!(
+        !gc_source.exists(),
+        "GC retained a managed hard-link source"
+    );
+    assert!(
+        hard_links.records().is_empty(),
+        "hard-link cleanup retained a session record"
+    );
+    hard_links.cleanup();
     artifacts.cleanup().expect("cleanup M6 GC binary artifacts");
 }
 
