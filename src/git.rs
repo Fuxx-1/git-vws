@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 const DEFAULT_LIMIT: usize = 16 * 1024;
 const MAX_PENDING: usize = 1024 * 1024;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
-const ESCAPED_PIPE_GRACE: Duration = Duration::from_millis(25);
+const ESCAPED_PIPE_GRACE: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug)]
@@ -1301,6 +1301,28 @@ mod tests {
             !process_alive(pid),
             "same-group pipe holder survived cleanup"
         );
+    }
+
+    #[test]
+    fn delayed_same_group_pipe_close_is_accepted_within_the_grace_period() {
+        let output = GitChild::spawn_program_with_env_for(
+            OsStr::new("/bin/sh"),
+            &[
+                OsString::from("-c"),
+                OsString::from("sleep 0.1 & exec /usr/bin/true"),
+            ],
+            None,
+            &[],
+            false,
+            Duration::from_secs(2),
+            AuditConfig::Isolated,
+        )
+        .expect("spawn child with a briefly inherited pipe")
+        .capture(DEFAULT_LIMIT)
+        .expect("brief same-group pipe holder must drain within the grace period");
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
     }
 
     #[test]
