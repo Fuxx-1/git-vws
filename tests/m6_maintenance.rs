@@ -5,7 +5,7 @@ use checkpoint::{ArmReply, CheckpointController, CheckpointTarget, ControlRun};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::env;
-use std::ffi::{CStr, CString, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -2171,6 +2171,40 @@ fn gc_tombstones_and_crash_prefix_recover_exactly_once() {
     );
     special_tree.cleanup();
     artifacts.cleanup().expect("cleanup M6 GC binary artifacts");
+}
+
+#[test]
+fn common_desktop_metadata_is_ignored_by_maintenance_censuses() {
+    let mut fixture = Fixture::new(true);
+    assert_success(
+        &fixture.create("metadata", "main"),
+        "create metadata census session",
+    );
+    for container in [fixture.state(), fixture.sessions(), fixture.templates()] {
+        for name in [
+            b".DS_Store".as_slice(),
+            b".directory",
+            b".hidden",
+            b".localized",
+            b"Icon\r",
+            b"._finder-metadata",
+        ] {
+            fs::write(
+                container.join(OsStr::from_bytes(name)),
+                b"desktop metadata\n",
+            )
+            .expect("write maintenance metadata");
+        }
+        fs::create_dir(container.join(".AppleDouble"))
+            .expect("create maintenance metadata directory");
+    }
+    assert_success(
+        &fixture.list(&fixture.authority),
+        "list with desktop metadata",
+    );
+    assert_success(&fixture.doctor(), "doctor with desktop metadata");
+    assert_success(&fixture.gc(), "gc with desktop metadata");
+    fixture.cleanup();
 }
 
 #[test]
