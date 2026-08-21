@@ -1205,6 +1205,51 @@ fn unsupported_filter_config_rejects_create_without_authority_write() {
 }
 
 #[test]
+fn isolated_worktree_config_extension_is_allowed_but_its_file_is_rejected() {
+    require_native_cow();
+    let mut sandbox = Sandbox::new();
+    let bare = fixture_repo(&sandbox, false);
+    let mut git_dir = OsString::from("--git-dir=");
+    git_dir.push(bare.as_os_str());
+    git(
+        &sandbox.path,
+        &[
+            git_dir.clone(),
+            OsString::from("config"),
+            OsString::from("extensions.worktreeConfig"),
+            OsString::from("true"),
+        ],
+    );
+    let home = home(&sandbox);
+    let initialized = vws(
+        &home,
+        vec![OsString::from("init"), bare.as_os_str().to_os_string()],
+    );
+    assert!(initialized.status.success(), "init: {initialized:?}");
+    let accepted = create(&home, &bare, "worktree-config-extension");
+    assert!(
+        accepted.status.success(),
+        "isolated extension create: {accepted:?}"
+    );
+
+    fs::write(bare.join("config.worktree"), b"[core]\n\tautocrlf = true\n")
+        .expect("write unsafe worktree config");
+    let before = snapshot(&bare);
+    let rejected = create(&home, &bare, "worktree-config-file");
+    assert!(
+        !rejected.status.success()
+            && String::from_utf8_lossy(&rejected.stderr).contains("TEMPLATE_UNSUPPORTED"),
+        "unsafe worktree config create: {rejected:?}"
+    );
+    assert_eq!(
+        snapshot(&bare),
+        before,
+        "rejected worktree config create wrote authority"
+    );
+    sandbox.cleanup().expect("cleanup worktree config fixture");
+}
+
+#[test]
 fn create_cleans_known_status_failure_and_retains_unknown_git_failure() {
     require_native_cow();
     for (mode, expected_record, expected_root, code) in [

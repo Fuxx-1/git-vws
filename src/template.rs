@@ -2128,6 +2128,10 @@ fn checkout_audit(authority: &Authority) -> Result<CheckoutAudit, Error> {
         &authority.canonical.join("refs/replace"),
         "replace references",
     )?;
+    reject_present(
+        &authority.canonical.join("config.worktree"),
+        "worktree config",
+    )?;
     reject_promisor_markers(authority)?;
     let config_fingerprint = audit_config(&capture_audit(
         authority,
@@ -2213,7 +2217,6 @@ fn audit_config(raw: &[u8]) -> Result<String, Error> {
             "core.attributesfile"
                 | "core.sparsecheckout"
                 | "core.sparsecheckoutcone"
-                | "extensions.worktreeconfig"
                 | "extensions.partialclone"
                 | "core.autocrlf"
                 | "core.eol"
