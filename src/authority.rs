@@ -1621,6 +1621,29 @@ fn cleanup_new_root(
     })
 }
 
+pub(crate) fn is_ignorable_system_metadata(parent: RawFd, name: &[u8]) -> Result<bool, Error> {
+    if !ignorable_system_metadata_name(name) {
+        return Ok(false);
+    }
+    let basename = cstring(name, "system metadata")?;
+    let identity = Identity::from_stat(&stat_at(parent, &basename, libc::AT_SYMLINK_NOFOLLOW)?);
+    if identity.uid != current_uid() {
+        return Ok(false);
+    }
+    if name == b".AppleDouble" {
+        return Ok(identity.directory() && identity.nlink >= 2);
+    }
+    Ok(identity.regular() && identity.nlink == 1)
+}
+
+fn ignorable_system_metadata_name(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b".DS_Store" | b".directory" | b".hidden" | b".localized" | b"Icon\r"
+    ) || name == b".AppleDouble"
+        || (name.starts_with(b"._") && name.len() > 2)
+}
+
 fn scan_records(state: &StateRoot, authority: &Authority) -> Result<(), Error> {
     let mut names = directory_names(state.root_fd())?;
     if names.is_empty() && !state.created {
@@ -1644,6 +1667,9 @@ fn scan_records(state: &StateRoot, authority: &Authority) -> Result<(), Error> {
                     "state container is not an exact owned directory",
                 ));
             }
+            continue;
+        }
+        if is_ignorable_system_metadata(state.root_fd(), &name)? {
             continue;
         }
         if !name.ends_with(b".record") || name.starts_with(b".") {

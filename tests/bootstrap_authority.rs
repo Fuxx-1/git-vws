@@ -1,5 +1,5 @@
 use std::env;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -878,6 +878,41 @@ fn duplicate_alias_corrupt_state_and_identity_replacement_fail_closed() {
         &["init", "--bare", drift.to_str().expect("utf8")],
     );
     assert_rejected(&drift_home, &drift);
+    sandbox.cleanup().expect("cleanup");
+}
+
+#[test]
+fn common_desktop_metadata_is_ignored_but_unsafe_shapes_fail_closed() {
+    let mut sandbox = Sandbox::new();
+    let home = home(&sandbox, "metadata-home");
+    let authority = bare(&sandbox, "metadata-authority.git");
+    assert!(init(&home, &authority).status.success());
+    let root = home.join(".git-vws");
+    for name in [
+        b".DS_Store".as_slice(),
+        b".directory",
+        b".hidden",
+        b".localized",
+        b"Icon\r",
+        b".AppleDouble",
+        b"._finder-metadata",
+    ] {
+        let path = root.join(OsStr::from_bytes(name));
+        if name == b".AppleDouble" {
+            fs::create_dir(&path).expect("create AppleDouble metadata directory");
+        } else {
+            fs::write(path, b"desktop metadata\n").expect("write desktop metadata");
+        }
+    }
+    assert_duplicate_reopen(&home, &authority, &root);
+
+    let link = root.join(".DS_Store");
+    fs::remove_file(&link).expect("remove regular metadata fixture");
+    symlink(&authority, &link).expect("create metadata symlink");
+    assert_rejected(&home, &authority);
+    fs::remove_file(&link).expect("remove metadata symlink");
+    fs::create_dir(&link).expect("create metadata directory");
+    assert_rejected(&home, &authority);
     sandbox.cleanup().expect("cleanup");
 }
 

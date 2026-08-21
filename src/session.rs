@@ -620,6 +620,15 @@ fn scan_state_root(state: &StateRoot, report: &mut MaintenanceReport) -> bool {
         if name == b"templates" || name == b"sessions" {
             continue;
         }
+        match authority::is_ignorable_system_metadata(state.root_fd(), &name) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(_) => {
+                report.recovery("state", &name, &name, "CORRUPT");
+                safe = false;
+                continue;
+            }
+        }
         if !name.starts_with(b".") && name.ends_with(b".record") {
             match authority::validate_authority_record(state, &name) {
                 Ok(()) => authority_records += 1,
@@ -2710,6 +2719,9 @@ fn session_census(
     }
     for name in names {
         if authorized.contains(&name) {
+            continue;
+        }
+        if authority::is_ignorable_system_metadata(sessions.as_raw_fd(), &name)? {
             continue;
         }
         if name.starts_with(b".") && name.ends_with(b".tmp") {

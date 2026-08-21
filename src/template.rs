@@ -381,6 +381,9 @@ fn template_census(container: &File, report_temporary: bool) -> Result<TemplateC
         if authorized.contains(&name) {
             continue;
         }
+        if authority::is_ignorable_system_metadata(container.as_raw_fd(), &name)? {
+            continue;
+        }
         if name.starts_with(b".") && name.ends_with(b".tmp") {
             match template_predecessor_temporary(container, &name) {
                 Ok(_) => {
