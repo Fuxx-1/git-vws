@@ -222,15 +222,15 @@ jobs:
               >> runner-evidence/m4-m5-source-contract.log
             test "$actual" = "$expected"
           done <<'EOF'
-          src/authority.rs e69c13544273a4de022f491f472826ae84fde419b5e011061e8b8e750dbcc313
+          src/authority.rs 61af3ffaca3280c701a3e60ec757f983ec425ee928cfe2af2ba59d9568a9f1db
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
           src/main.rs 2d90687eaf5f6f4b0ff2f1d3ec88171d6edd2c51d04b51d64ab690e64c0f0a38
-          src/session.rs 1ab75a5daa24ea3a3190e33147e2155403665356978e902e168d7a3324744ce0
+          src/session.rs 99cfd9c3485e1c465c6351740e5f2c58dc6a9ccf896297e2afa2e9f7af2f0825
           src/storage.rs b1d20dda5f247f6fa2ebc69495b4b070c85ab6ad0188a46f55b2f565d9fc3910
-          src/template.rs 0d9b3f8273c7c00122268318dd7b732cfabcb60a1bf94376d954a0bf44a7676b
+          src/template.rs 2ac417299ef5b7245826a1ec5e5338c9b91eb30cef16cb591b174efa839de34d
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
           tests/m5_publish.rs c0eff6cdef36e81f8b35fae262037e292d9b3256450d6f85f9982caf7e889057
-          tests/m6_maintenance.rs 7f248642c022f64dfcabcbb34c27d3c1817c1fdfa1d24dcd12211dfa780a15b6
+          tests/m6_maintenance.rs 0bbe3bb8d8f18e8fab5a67a3a0d9eeb896ee54714abe26b6ae1eb4a8d793e00a
           tests/support/checkpoint.rs c8026cb722d3c0250fc6d403540fd3b78ab18eaac5c881c5e9bb36c8860bef16
           EOF
       - name: Run full test suite
@@ -599,15 +599,15 @@ jobs:
               >> runner-evidence/m4-m5-source-contract.log
             test "$actual" = "$expected"
           done <<'EOF'
-          src/authority.rs e69c13544273a4de022f491f472826ae84fde419b5e011061e8b8e750dbcc313
+          src/authority.rs 61af3ffaca3280c701a3e60ec757f983ec425ee928cfe2af2ba59d9568a9f1db
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
           src/main.rs 2d90687eaf5f6f4b0ff2f1d3ec88171d6edd2c51d04b51d64ab690e64c0f0a38
-          src/session.rs 1ab75a5daa24ea3a3190e33147e2155403665356978e902e168d7a3324744ce0
+          src/session.rs 99cfd9c3485e1c465c6351740e5f2c58dc6a9ccf896297e2afa2e9f7af2f0825
           src/storage.rs b1d20dda5f247f6fa2ebc69495b4b070c85ab6ad0188a46f55b2f565d9fc3910
-          src/template.rs 0d9b3f8273c7c00122268318dd7b732cfabcb60a1bf94376d954a0bf44a7676b
+          src/template.rs 2ac417299ef5b7245826a1ec5e5338c9b91eb30cef16cb591b174efa839de34d
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
           tests/m5_publish.rs c0eff6cdef36e81f8b35fae262037e292d9b3256450d6f85f9982caf7e889057
-          tests/m6_maintenance.rs 7f248642c022f64dfcabcbb34c27d3c1817c1fdfa1d24dcd12211dfa780a15b6
+          tests/m6_maintenance.rs 0bbe3bb8d8f18e8fab5a67a3a0d9eeb896ee54714abe26b6ae1eb4a8d793e00a
           tests/support/checkpoint.rs c8026cb722d3c0250fc6d403540fd3b78ab18eaac5c881c5e9bb36c8860bef16
           EOF
       - name: Run full test suite on XFS reflink
