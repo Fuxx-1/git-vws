@@ -330,7 +330,7 @@ jobs:
             /Running.*tests\/m6_maintenance\.rs/ { runs++; in_m6=1; next }
             in_m6 && /test result:/ {
               summaries++
-              if ($0 ~ /test result: ok[.] 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in [0-9]+([.][0-9]+)?s$/) {
+              if ($0 ~ /test result: ok[.] 5 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in [0-9]+([.][0-9]+)?s$/) {
                 print
                 matches++
               }
@@ -710,7 +710,7 @@ jobs:
             /Running.*tests\/m6_maintenance\.rs/ { runs++; in_m6=1; next }
             in_m6 && /test result:/ {
               summaries++
-              if ($0 ~ /test result: ok[.] 4 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in [0-9]+([.][0-9]+)?s$/) {
+              if ($0 ~ /test result: ok[.] 5 passed; 0 failed; 0 ignored;( 0 measured;)? 0 filtered out; finished in [0-9]+([.][0-9]+)?s$/) {
                 print
                 matches++
               }
