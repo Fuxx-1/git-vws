@@ -965,6 +965,57 @@ fn native_git_runtime_survives_repeated_create_and_lists_ready() {
 }
 
 #[test]
+fn authority_commit_graph_and_pack_advertisement_survive_session_maintenance() {
+    require_native_cow();
+    let mut fixture = Fixture::new();
+    let authority = fixture_repo(&fixture.sandbox, "maintenance.git");
+    let mut git_dir = OsString::from("--git-dir=");
+    git_dir.push(authority.as_os_str());
+    git(
+        &fixture.sandbox.path,
+        &[
+            git_dir.clone(),
+            OsString::from("commit-graph"),
+            OsString::from("write"),
+            OsString::from("--reachable"),
+        ],
+    );
+    git(
+        &fixture.sandbox.path,
+        &[git_dir, OsString::from("update-server-info")],
+    );
+    assert!(
+        authority.join("objects/info/commit-graph").is_file()
+            && authority.join("objects/info/packs").is_file(),
+        "fixture Git maintenance did not create standard object info files"
+    );
+    assert_success(
+        &fixture.vws(vec![
+            OsString::from("init"),
+            authority.as_os_str().to_os_string(),
+        ]),
+        "initialize authority with Git maintenance metadata",
+    );
+    assert_success(
+        &fixture.create_at(&authority, OsString::from("maintained")),
+        "create session from authority with Git maintenance metadata",
+    );
+    assert_success(
+        &fixture.vws(vec![OsString::from("doctor")]),
+        "doctor accepts Git maintenance metadata",
+    );
+    assert_success(
+        &fixture.remove_at(&authority, "maintained", false),
+        "remove clean session with Git maintenance metadata",
+    );
+    assert_success(
+        &fixture.vws(vec![OsString::from("gc")]),
+        "GC accepts Git maintenance metadata",
+    );
+    fixture.cleanup();
+}
+
+#[test]
 fn exec_preserves_direct_process_contract_and_clears_git_routing() {
     require_native_cow();
     let mut fixture = Fixture::new();

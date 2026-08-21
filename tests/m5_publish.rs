@@ -1257,6 +1257,8 @@ fn authority_config_raw(fixture: &Fixture) -> Vec<u8> {
     let output = command
         .current_dir(&fixture.cwd)
         .env("HOME", &fixture.home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .args([
             OsString::from("-C"),
             fixture.authority.as_os_str().to_os_string(),
@@ -1807,6 +1809,35 @@ fn publish_authority_audit_fixed_oid_and_crash_prefix_contract() {
         );
         hostile.cleanup();
     }
+
+    let mut ambient = Fixture::new();
+    fs::write(
+        ambient.home.join(".gitconfig"),
+        b"[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n\tprocess = git-lfs filter-process\n\trequired = true\n",
+    )
+    .expect("write ambient LFS configuration");
+    assert_success(
+        &ambient.create(OsString::from("ambient"), "main"),
+        "create ignores ambient LFS configuration",
+    );
+    let ambient_new = commit_worktree(
+        &ambient.worktree(b"ambient"),
+        "ambient.txt",
+        b"ambient configuration must not alter VWS plumbing\n",
+    );
+    ambient.trace.clear();
+    assert_publish_success(&ambient.publish("ambient"), "main", &ambient_new);
+    assert_eq!(
+        ambient.trace.count("fetch"),
+        1,
+        "ambient LFS configuration blocked fixed-OID import"
+    );
+    assert_eq!(
+        ambient.trace.count("update-ref"),
+        1,
+        "ambient LFS configuration blocked publish CAS"
+    );
+    ambient.cleanup();
 
     let mut hook = Fixture::new();
     assert_success(

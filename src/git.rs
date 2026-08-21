@@ -234,11 +234,13 @@ impl GitChild {
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_NO_LAZY_FETCH", "1")
             .env("GIT_NO_REPLACE_OBJECTS", "1");
-        if matches!(audit, AuditConfig::Isolated) {
+        if matches!(audit, AuditConfig::Isolated | AuditConfig::Authority) {
             command
                 .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_ATTR_NOSYSTEM", "1");
+                .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        }
+        if matches!(audit, AuditConfig::Isolated) {
+            command.env("GIT_ATTR_NOSYSTEM", "1");
         }
         for (name, value) in extra_env {
             command.env(name, value);

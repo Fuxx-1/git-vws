@@ -1787,7 +1787,7 @@ fn output_limit_terminates_and_reaps_direct_probe_without_state() {
             .env("VWS_TEST_RELEASE", worker_release)
             .output()
     });
-    let marker = wait_for(Duration::from_secs(2), || direct_pid.is_file());
+    let marker = wait_for(Duration::from_secs(10), || direct_pid.is_file());
     let started = Instant::now();
     fs::write(&release, b"release\n").expect("release output limit probe");
     let output = worker

@@ -1,6 +1,7 @@
 use crate::authority::{self, Error, Identity};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -10,6 +11,81 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 const MAX_SYMLINK: usize = 4096;
 static NEXT_PROBE: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Default)]
+struct OwnedRegularLinks {
+    entries: BTreeMap<(u64, u64), OwnedRegularLink>,
+}
+
+struct OwnedRegularLink {
+    identity: Identity,
+    remaining: u64,
+}
+
+impl OwnedRegularLinks {
+    fn record(&mut self, identity: Identity) -> bool {
+        let key = (identity.dev, identity.ino);
+        let Some(existing) = self.entries.get_mut(&key) else {
+            if identity.nlink == 1 {
+                return true;
+            }
+            self.entries.insert(
+                key,
+                OwnedRegularLink {
+                    identity,
+                    remaining: 1,
+                },
+            );
+            return true;
+        };
+        if !same_regular_binding(identity, existing.identity)
+            || identity.nlink != existing.identity.nlink
+        {
+            return false;
+        }
+        let Some(remaining) = existing.remaining.checked_add(1) else {
+            return false;
+        };
+        existing.remaining = remaining;
+        true
+    }
+
+    fn fully_contained(&self) -> bool {
+        self.entries
+            .values()
+            .all(|entry| entry.identity.nlink == entry.remaining)
+    }
+
+    fn take_for_cleanup(&mut self, identity: Identity) -> bool {
+        let key = (identity.dev, identity.ino);
+        let Some(existing) = self.entries.get_mut(&key) else {
+            return identity.nlink == 1;
+        };
+        if !same_regular_binding(identity, existing.identity)
+            || identity.nlink != existing.remaining
+            || existing.remaining == 0
+        {
+            return false;
+        }
+        existing.remaining -= 1;
+        true
+    }
+
+    fn drained(&self) -> bool {
+        self.entries.values().all(|entry| entry.remaining == 0)
+    }
+}
+
+fn same_regular_binding(current: Identity, expected: Identity) -> bool {
+    current.regular()
+        && expected.regular()
+        && current.dev == expected.dev
+        && current.ino == expected.ino
+        && current.uid == expected.uid
+        && current.mode == expected.mode
+        && current.kind == expected.kind
+}
+
 #[cfg(target_os = "linux")]
 const DIRECTORY_TYPE: u32 = libc::S_IFDIR;
 #[cfg(target_os = "linux")]
@@ -1670,8 +1746,21 @@ fn remove_owned_tree_inner(
             "owned tree moved to a different volume before cleanup",
         ));
     }
-    if reject_special {
-        reject_special_entries(&root, expected, expected.dev, &volume, sealed_cleanup)?;
+    let mut regular_links = OwnedRegularLinks::default();
+    preflight_owned_tree(
+        &root,
+        expected,
+        expected.dev,
+        &volume,
+        sealed_cleanup,
+        reject_special,
+        &mut regular_links,
+    )?;
+    if !regular_links.fully_contained() {
+        return Err(Error::new(
+            "STORAGE_RECOVERY_REQUIRED",
+            "owned tree regular links are not fully contained",
+        ));
     }
     remove_owned_children(
         &root,
@@ -1680,7 +1769,14 @@ fn remove_owned_tree_inner(
         &volume,
         sealed_cleanup,
         reject_special,
+        &mut regular_links,
     )?;
+    if !regular_links.drained() {
+        return Err(Error::new(
+            "STORAGE_RECOVERY_REQUIRED",
+            "owned tree regular-link cleanup was incomplete",
+        ));
+    }
     let entry = identity_at(parent.as_raw_fd(), name)?;
     let descriptor = Identity::from_file(&root)?;
     let bound = if sealed_cleanup {
@@ -1935,6 +2031,7 @@ fn remove_owned_children(
     volume: &str,
     sealed_cleanup: bool,
     reject_special: bool,
+    regular_links: &mut OwnedRegularLinks,
 ) -> Result<(), Error> {
     let directory_identity = Identity::from_file(directory)?;
     if sealed_cleanup {
@@ -1987,6 +2084,7 @@ fn remove_owned_children(
                     volume,
                     sealed_cleanup,
                     reject_special,
+                    regular_links,
                 )?;
                 let child_entry = identity_at(directory.as_raw_fd(), &name)?;
                 let child_descriptor = Identity::from_file(&child)?;
@@ -2012,7 +2110,20 @@ fn remove_owned_children(
                     return Err(storage_io("cannot remove owned tree directory"));
                 }
             }
-            kind if kind == REGULAR_TYPE || kind == SYMLINK_TYPE => {
+            kind if kind == REGULAR_TYPE => {
+                if identity_at(directory.as_raw_fd(), &name)? != entry
+                    || !regular_links.take_for_cleanup(entry)
+                {
+                    return Err(Error::new(
+                        "STORAGE_RECOVERY_REQUIRED",
+                        "owned tree entry binding changed before cleanup",
+                    ));
+                }
+                if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                    return Err(storage_io("cannot remove owned tree entry"));
+                }
+            }
+            kind if kind == SYMLINK_TYPE => {
                 if entry.nlink != 1 || identity_at(directory.as_raw_fd(), &name)? != entry {
                     return Err(Error::new(
                         "STORAGE_RECOVERY_REQUIRED",
@@ -2051,12 +2162,14 @@ fn remove_owned_children(
     })
 }
 
-fn reject_special_entries(
+fn preflight_owned_tree(
     directory: &File,
     expected: Identity,
     device: u64,
     volume: &str,
     sealed_cleanup: bool,
+    reject_special: bool,
+    regular_links: &mut OwnedRegularLinks,
 ) -> Result<(), Error> {
     let identity = Identity::from_file(directory)?;
     let bound = if sealed_cleanup {
@@ -2095,9 +2208,27 @@ fn reject_special_entries(
                         "owned tree child changed during special-entry preflight",
                     ));
                 }
-                reject_special_entries(&child, entry, device, volume, sealed_cleanup)?;
+                preflight_owned_tree(
+                    &child,
+                    entry,
+                    device,
+                    volume,
+                    sealed_cleanup,
+                    reject_special,
+                    regular_links,
+                )?;
             }
-            kind if kind == REGULAR_TYPE || kind == SYMLINK_TYPE => {
+            kind if kind == REGULAR_TYPE => {
+                if identity_at(directory.as_raw_fd(), &name)? != entry
+                    || !regular_links.record(entry)
+                {
+                    return Err(Error::new(
+                        "STORAGE_RECOVERY_REQUIRED",
+                        "owned tree entry changed during cleanup preflight",
+                    ));
+                }
+            }
+            kind if kind == SYMLINK_TYPE => {
                 if entry.nlink != 1 || identity_at(directory.as_raw_fd(), &name)? != entry {
                     return Err(Error::new(
                         "STORAGE_RECOVERY_REQUIRED",
@@ -2106,10 +2237,18 @@ fn reject_special_entries(
                 }
             }
             _ => {
-                return Err(Error::new(
-                    "STORAGE_RECOVERY_REQUIRED",
-                    "owned tree contains a special entry",
-                ));
+                if reject_special {
+                    return Err(Error::new(
+                        "STORAGE_RECOVERY_REQUIRED",
+                        "owned tree contains a special entry",
+                    ));
+                }
+                if entry.nlink != 1 || identity_at(directory.as_raw_fd(), &name)? != entry {
+                    return Err(Error::new(
+                        "STORAGE_RECOVERY_REQUIRED",
+                        "owned tree special entry changed during cleanup preflight",
+                    ));
+                }
             }
         }
     }
