@@ -1,0 +1,24 @@
+src/cache.rs
+  s_dcd472b79184c9::t_25069143ffb501 743,747-750,778
+  s_dcd472b79184c9::t_bdb17cd87318fd 690,722-742,744-746,751-752,776-777,780-786,788-793,796-808
+  s_dcd472b79184c9::t_3ae9505fc1bd11 660
+  s_dcd472b79184c9::t_ee04cd40e29cf1 774-775
+  s_dcd472b79184c9::t_4e5b0d14088932 753-773,779,787,794-795
+  s_dcd472b79184c9::t_29a973f46b5b78 809
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "d0a150d2a6e638f24e3f8c589669320f153ecaca",
+  "prompts": {},
+  "sessions": {
+    "s_dcd472b79184c9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ff8c3-623a-7f61-881b-ed0472c09e7f",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Fuxx-1 <583742849@qq.com>"
+    }
+  }
+}
