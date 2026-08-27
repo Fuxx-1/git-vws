@@ -730,7 +730,7 @@ impl StateRoot {
     }
 
     pub(crate) fn container_path(&self, name: &str) -> Result<PathBuf, Error> {
-        if name != "templates" && name != "sessions" {
+        if !matches!(name, "templates" | "sessions" | "caches") {
             return Err(Error::new("STATE_CORRUPT", "unknown state container"));
         }
         Ok(self.root_path.join(name))
@@ -738,32 +738,40 @@ impl StateRoot {
 
     pub(crate) fn ensure_containers(&self) -> Result<(), Error> {
         for name in [b"templates".as_slice(), b"sessions".as_slice()] {
-            let name = cstring(name, "state container")?;
-            let result = unsafe { libc::mkdirat(self.root_fd(), name.as_ptr(), 0o700) };
-            if result != 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::AlreadyExists {
-                    return Err(Error::io(
-                        "STATE_UNAVAILABLE",
-                        "cannot create state container",
-                        error,
-                    ));
-                }
-            }
-            let directory = open_directory_at(self.root_fd(), &name, "state container")?;
-            let identity = Identity::from_file(&directory)?;
-            if identity.dev != self.identity.dev || !valid_state_container(identity) {
-                return Err(Error::new(
-                    "STATE_CORRUPT",
-                    "state container is not an owner-only directory on the state volume",
-                ));
-            }
+            self.ensure_container(name)?;
         }
         self.root
             .as_ref()
             .expect("state root open")
             .sync_all()
             .map_err(|error| Error::io("STATE_UNAVAILABLE", "cannot sync state containers", error))
+    }
+
+    pub(crate) fn ensure_container(&self, raw_name: &[u8]) -> Result<File, Error> {
+        let name = match raw_name {
+            b"templates" | b"sessions" | b"caches" => cstring(raw_name, "state container")?,
+            _ => return Err(Error::new("STATE_CORRUPT", "unknown state container")),
+        };
+        let result = unsafe { libc::mkdirat(self.root_fd(), name.as_ptr(), 0o700) };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(Error::io(
+                    "STATE_UNAVAILABLE",
+                    "cannot create state container",
+                    error,
+                ));
+            }
+        }
+        let directory = open_directory_at(self.root_fd(), &name, "state container")?;
+        let identity = Identity::from_file(&directory)?;
+        if identity.dev != self.identity.dev || !valid_state_container(identity) {
+            return Err(Error::new(
+                "STATE_CORRUPT",
+                "state container is not an owner-only directory on the state volume",
+            ));
+        }
+        Ok(directory)
     }
 
     pub(crate) fn open_container(&self, name: &[u8]) -> Result<File, Error> {
@@ -1654,7 +1662,7 @@ fn scan_records(state: &StateRoot, authority: &Authority) -> Result<(), Error> {
     }
     names.sort();
     for name in names {
-        if name == b"templates" || name == b"sessions" {
+        if name == b"templates" || name == b"sessions" || name == b"caches" {
             let container = cstring(&name, "state container")?;
             let identity = Identity::from_stat(&stat_at(
                 state.root_fd(),

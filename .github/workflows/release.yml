@@ -316,7 +316,7 @@ jobs:
           notes="$RUNNER_TEMP/release-notes.txt"
           {
             printf 'Stable release of git-vws %s.\n\n' "$VERSION"
-            printf 'Implemented commands: init, create, list, exec, remove, publish, gc, doctor.\n'
+            printf 'Implemented commands: init, create, list, exec, cache, remove, publish, gc, doctor.\n'
             printf 'Supported hosts: macOS APFS and Linux filesystems that pass FICLONE/FIEMAP validation.\n'
             printf 'No FUSE, kernel extension, administrator installation, daemon, or full-copy fallback is used.\n'
             printf 'Windows remains unsupported in this release.\n\n'

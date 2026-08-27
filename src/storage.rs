@@ -1,7 +1,6 @@
 use crate::authority::{self, Error, Identity};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -11,81 +10,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 const MAX_SYMLINK: usize = 4096;
 static NEXT_PROBE: AtomicUsize = AtomicUsize::new(0);
-
-#[derive(Default)]
-struct OwnedRegularLinks {
-    entries: BTreeMap<(u64, u64), OwnedRegularLink>,
-}
-
-struct OwnedRegularLink {
-    identity: Identity,
-    remaining: u64,
-}
-
-impl OwnedRegularLinks {
-    fn record(&mut self, identity: Identity) -> bool {
-        let key = (identity.dev, identity.ino);
-        let Some(existing) = self.entries.get_mut(&key) else {
-            if identity.nlink == 1 {
-                return true;
-            }
-            self.entries.insert(
-                key,
-                OwnedRegularLink {
-                    identity,
-                    remaining: 1,
-                },
-            );
-            return true;
-        };
-        if !same_regular_binding(identity, existing.identity)
-            || identity.nlink != existing.identity.nlink
-        {
-            return false;
-        }
-        let Some(remaining) = existing.remaining.checked_add(1) else {
-            return false;
-        };
-        existing.remaining = remaining;
-        true
-    }
-
-    fn fully_contained(&self) -> bool {
-        self.entries
-            .values()
-            .all(|entry| entry.identity.nlink == entry.remaining)
-    }
-
-    fn take_for_cleanup(&mut self, identity: Identity) -> bool {
-        let key = (identity.dev, identity.ino);
-        let Some(existing) = self.entries.get_mut(&key) else {
-            return identity.nlink == 1;
-        };
-        if !same_regular_binding(identity, existing.identity)
-            || identity.nlink != existing.remaining
-            || existing.remaining == 0
-        {
-            return false;
-        }
-        existing.remaining -= 1;
-        true
-    }
-
-    fn drained(&self) -> bool {
-        self.entries.values().all(|entry| entry.remaining == 0)
-    }
-}
-
-fn same_regular_binding(current: Identity, expected: Identity) -> bool {
-    current.regular()
-        && expected.regular()
-        && current.dev == expected.dev
-        && current.ino == expected.ino
-        && current.uid == expected.uid
-        && current.mode == expected.mode
-        && current.kind == expected.kind
-}
-
 #[cfg(target_os = "linux")]
 const DIRECTORY_TYPE: u32 = libc::S_IFDIR;
 #[cfg(target_os = "linux")]
@@ -179,6 +103,14 @@ pub(crate) struct CowPlan<'a> {
 }
 
 pub(crate) fn cow_clone(plan: CowPlan<'_>) -> Result<CowReceipt, Error> {
+    cow_clone_inner(plan, true)
+}
+
+pub(crate) fn cow_clone_subtree(plan: CowPlan<'_>) -> Result<CowReceipt, Error> {
+    cow_clone_inner(plan, false)
+}
+
+fn cow_clone_inner(plan: CowPlan<'_>, require_linked_worktree: bool) -> Result<CowReceipt, Error> {
     if !valid_digest(&plan.source_receipt.manifest.digest)
         || !valid_digest(&plan.source_receipt.content_digest)
     {
@@ -206,7 +138,7 @@ pub(crate) fn cow_clone(plan: CowPlan<'_>) -> Result<CowReceipt, Error> {
         || destination_volume != plan.source_receipt.volume
         || !sealed_directory(source)
         || !clone_destination_directory(plan.destination_identity)
-        || !linked_worktree_metadata(&destination)?
+        || (require_linked_worktree && !linked_worktree_metadata(&destination)?)
     {
         return Err(Error::new(
             "STORAGE_UNSUPPORTED",
@@ -268,6 +200,68 @@ pub(crate) fn cow_clone(plan: CowPlan<'_>) -> Result<CowReceipt, Error> {
         source: plan.source_receipt.clone(),
         destination: final_destination,
     })
+}
+
+pub(crate) fn snapshot_tree(source: &File, destination: &File) -> Result<SealedTreeReceipt, Error> {
+    let source_identity = Identity::from_file(source)?;
+    let destination_identity = Identity::from_file(destination)?;
+    let source_volume = volume_id(source)?;
+    let destination_volume = volume_id(destination)?;
+    if !snapshot_directory(source_identity)
+        || !private_directory(destination_identity)
+        || source_volume != destination_volume
+        || metadata_present_fd(source.as_raw_fd())?
+        || metadata_present_fd(destination.as_raw_fd())?
+    {
+        return Err(Error::new(
+            "CACHE_UNSUPPORTED",
+            "cache source and destination are not safe native-COW directories",
+        ));
+    }
+    let mut hasher = content_hasher();
+    let mut entries = 0;
+    snapshot_walk(
+        source,
+        destination,
+        &[],
+        &mut hasher,
+        &mut entries,
+        source_identity.dev,
+    )?;
+    chmod(destination, 0o555)?;
+    destination.sync_all().map_err(|error| {
+        Error::io(
+            "CACHE_RECOVERY_REQUIRED",
+            "cannot sync sealed cache snapshot",
+            error,
+        )
+    })?;
+    let final_source = Identity::from_file(source)?;
+    let final_destination = Identity::from_file(destination)?;
+    if !final_source.same_node(source_identity) || !sealed_directory(final_destination) {
+        return Err(Error::new(
+            "CACHE_RECOVERY_REQUIRED",
+            "cache source or snapshot changed while sealing",
+        ));
+    }
+    let content_digest = authority::hex(&hasher.finalize());
+    let manifest_digest = authority::hex(&Sha256::digest(content_digest.as_bytes()));
+    let receipt = SealedTreeReceipt {
+        root: final_destination,
+        volume: destination_volume,
+        manifest: ManifestReceipt {
+            digest: manifest_digest,
+            entries,
+        },
+        content_digest,
+    };
+    verify_sealed_tree(destination, &receipt).map_err(|_| {
+        Error::new(
+            "CACHE_RECOVERY_REQUIRED",
+            "sealed cache snapshot failed its final verification",
+        )
+    })?;
+    Ok(receipt)
 }
 
 pub(crate) fn seal_tree(
@@ -899,6 +893,185 @@ fn clone_regular(
         .map_err(|error| Error::io("STORAGE_UNSUPPORTED", "cannot sync cloned file", error))
 }
 
+fn snapshot_walk(
+    source: &File,
+    destination: &File,
+    prefix: &[u8],
+    hasher: &mut Sha256,
+    entries: &mut u64,
+    source_device: u64,
+) -> Result<(), Error> {
+    let source_identity = Identity::from_file(source)?;
+    if !snapshot_directory(source_identity)
+        || source_identity.dev != source_device
+        || metadata_present_fd(source.as_raw_fd())?
+        || !clone_destination_directory(Identity::from_file(destination)?)
+        || metadata_present_fd(destination.as_raw_fd())?
+    {
+        return Err(Error::new(
+            "CACHE_UNSUPPORTED",
+            "cache tree contains an unsafe directory binding",
+        ));
+    }
+    for bytes in directory_names(source.as_raw_fd())? {
+        validate_basename(&bytes)?;
+        let name = cstring(&bytes)?;
+        let stat = stat_at(source.as_raw_fd(), &name)?;
+        let entry = Identity::from_stat(&stat);
+        if entry.uid != current_uid() || entry.dev != source_device {
+            return Err(Error::new(
+                "CACHE_UNSUPPORTED",
+                "cache tree entry changed ownership or volume",
+            ));
+        }
+        let mut path = prefix.to_vec();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(&bytes);
+        match entry.kind {
+            kind if kind == DIRECTORY_TYPE => {
+                let child = open_directory_at(source.as_raw_fd(), &name)?;
+                if Identity::from_file(&child)? != entry {
+                    return Err(Error::new(
+                        "CACHE_UNSUPPORTED",
+                        "cache source directory changed while opening",
+                    ));
+                }
+                mkdirat(destination.as_raw_fd(), &name, 0o755)?;
+                let destination_child = open_directory_at(destination.as_raw_fd(), &name)?;
+                snapshot_walk(
+                    &child,
+                    &destination_child,
+                    &path,
+                    hasher,
+                    entries,
+                    source_device,
+                )?;
+                destination_child.sync_all().map_err(|error| {
+                    Error::io(
+                        "CACHE_RECOVERY_REQUIRED",
+                        "cannot sync cache snapshot directory",
+                        error,
+                    )
+                })?;
+            }
+            kind if kind == REGULAR_TYPE => {
+                if entry.nlink != 1
+                    || metadata_present_fd(
+                        open_regular_at(source.as_raw_fd(), &name, libc::O_RDONLY)?.as_raw_fd(),
+                    )?
+                {
+                    return Err(Error::new(
+                        "CACHE_UNSUPPORTED",
+                        "cache source file has unsupported links or metadata",
+                    ));
+                }
+                let file = open_regular_at(source.as_raw_fd(), &name, libc::O_RDONLY)?;
+                if Identity::from_file(&file)? != entry {
+                    return Err(Error::new(
+                        "CACHE_UNSUPPORTED",
+                        "cache source file changed while opening",
+                    ));
+                }
+                let mode = cache_mode(entry.mode);
+                hash_regular(&file, entry, mode, &path, hasher)?;
+                let cloned = native_clone_file(
+                    source.as_raw_fd(),
+                    destination.as_raw_fd(),
+                    &name,
+                    &name,
+                    &file,
+                    entry,
+                    mode,
+                )?;
+                chmod(&cloned, mode)?;
+                let cloned_identity = Identity::from_file(&cloned)?;
+                if cloned_identity.dev != entry.dev
+                    || cloned_identity.ino == entry.ino
+                    || cloned_identity.uid != current_uid()
+                    || cloned_identity.nlink != 1
+                    || !cloned_identity.regular()
+                    || cloned_identity.mode != mode
+                    || metadata_present_fd(cloned.as_raw_fd())?
+                {
+                    return Err(Error::new(
+                        "CACHE_UNSUPPORTED",
+                        "cache snapshot file did not retain a native COW binding",
+                    ));
+                }
+                cloned.sync_all().map_err(|error| {
+                    Error::io(
+                        "CACHE_RECOVERY_REQUIRED",
+                        "cannot sync cache snapshot file",
+                        error,
+                    )
+                })?;
+                *entries = entries
+                    .checked_add(1)
+                    .ok_or_else(|| Error::new("CACHE_UNSUPPORTED", "cache entry count overflow"))?;
+            }
+            kind if kind == SYMLINK_TYPE => {
+                if entry.nlink != 1 || link_metadata_present(source.as_raw_fd(), &name, &stat)? {
+                    return Err(Error::new(
+                        "CACHE_UNSUPPORTED",
+                        "cache symbolic link has unsupported metadata",
+                    ));
+                }
+                let target = read_link_at(source.as_raw_fd(), &name)?;
+                if unsafe {
+                    libc::symlinkat(target.as_ptr(), destination.as_raw_fd(), name.as_ptr())
+                } != 0
+                {
+                    return Err(storage_io("cannot clone cache symbolic link"));
+                }
+                let destination_stat = stat_at(destination.as_raw_fd(), &name)?;
+                if Identity::from_stat(&destination_stat).kind != SYMLINK_TYPE
+                    || read_link_at(destination.as_raw_fd(), &name)? != target
+                {
+                    return Err(Error::new(
+                        "CACHE_UNSUPPORTED",
+                        "cache symbolic link binding changed",
+                    ));
+                }
+                hash_symlink(target.to_bytes(), &path, hasher);
+                *entries = entries
+                    .checked_add(1)
+                    .ok_or_else(|| Error::new("CACHE_UNSUPPORTED", "cache entry count overflow"))?;
+            }
+            _ => {
+                return Err(Error::new(
+                    "CACHE_UNSUPPORTED",
+                    "cache tree contains a special file",
+                ));
+            }
+        }
+    }
+    chmod(destination, 0o555)?;
+    if !sealed_directory(Identity::from_file(destination)?) {
+        return Err(Error::new(
+            "CACHE_RECOVERY_REQUIRED",
+            "cache snapshot directory was not sealed",
+        ));
+    }
+    lp(hasher, b"directory");
+    lp(hasher, prefix);
+    lp(hasher, b"555");
+    Ok(())
+}
+
+fn snapshot_directory(identity: Identity) -> bool {
+    identity.directory() && identity.uid == current_uid() && identity.mode & 0o022 == 0
+}
+
+fn cache_mode(source_mode: u32) -> u32 {
+    if source_mode & 0o111 != 0 {
+        0o555
+    } else {
+        0o444
+    }
+}
+
 fn native_clone_file(
     source_parent: RawFd,
     destination_parent: RawFd,
@@ -1239,11 +1412,29 @@ pub(crate) fn sealed_regular(identity: Identity) -> bool {
         && matches!(identity.mode, 0o444 | 0o555)
 }
 
-fn worktree_directory(identity: Identity) -> bool {
+pub(crate) fn worktree_directory(identity: Identity) -> bool {
     identity.directory()
         && identity.uid == current_uid()
         && identity.mode == 0o755
         && supported_directory_nlink(identity.nlink)
+}
+
+pub(crate) fn create_worktree_directory(parent: &File, name: &CStr) -> Result<File, Error> {
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) } != 0 {
+        return Err(storage_io("cannot create cached worktree directory"));
+    }
+    let directory = open_directory_at(parent.as_raw_fd(), name)?;
+    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o755) } != 0 {
+        return Err(storage_io("cannot protect cached worktree directory"));
+    }
+    let identity = Identity::from_file(&directory)?;
+    if !worktree_directory(identity) || !directory_names(directory.as_raw_fd())?.is_empty() {
+        return Err(Error::new(
+            "CACHE_RECOVERY_REQUIRED",
+            "cached worktree directory has an invalid initial binding",
+        ));
+    }
+    Ok(directory)
 }
 
 fn clone_destination_directory(identity: Identity) -> bool {
@@ -1374,6 +1565,35 @@ fn open_regular_at(parent: RawFd, name: &CStr, access: libc::c_int) -> Result<Fi
     } else {
         Ok(unsafe { File::from_raw_fd(raw) })
     }
+}
+
+pub(crate) fn read_regular_at(parent: RawFd, name: &CStr, limit: usize) -> Result<Vec<u8>, Error> {
+    let expected = identity_at(parent, name)?;
+    if !expected.regular() || expected.uid != current_uid() || expected.nlink != 1 {
+        return Err(Error::new(
+            "CACHE_RECOVERY_REQUIRED",
+            "cache record is not an owned regular file",
+        ));
+    }
+    let mut file = open_regular_at(parent, name, libc::O_RDONLY)?;
+    if Identity::from_file(&file)? != expected {
+        return Err(Error::new(
+            "CACHE_RECOVERY_REQUIRED",
+            "cache record changed while opening",
+        ));
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take((limit.saturating_add(1)) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| Error::io("CACHE_RECOVERY_REQUIRED", "cannot read cache record", error))?;
+    if bytes.len() > limit || Identity::from_file(&file)? != expected {
+        return Err(Error::new(
+            "CACHE_RECOVERY_REQUIRED",
+            "cache record changed while reading",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn mkdirat(parent: RawFd, name: &CStr, mode: u32) -> Result<(), Error> {
@@ -1746,21 +1966,8 @@ fn remove_owned_tree_inner(
             "owned tree moved to a different volume before cleanup",
         ));
     }
-    let mut regular_links = OwnedRegularLinks::default();
-    preflight_owned_tree(
-        &root,
-        expected,
-        expected.dev,
-        &volume,
-        sealed_cleanup,
-        reject_special,
-        &mut regular_links,
-    )?;
-    if !regular_links.fully_contained() {
-        return Err(Error::new(
-            "STORAGE_RECOVERY_REQUIRED",
-            "owned tree regular links are not fully contained",
-        ));
+    if reject_special {
+        reject_special_entries(&root, expected, expected.dev, &volume, sealed_cleanup)?;
     }
     remove_owned_children(
         &root,
@@ -1769,14 +1976,7 @@ fn remove_owned_tree_inner(
         &volume,
         sealed_cleanup,
         reject_special,
-        &mut regular_links,
     )?;
-    if !regular_links.drained() {
-        return Err(Error::new(
-            "STORAGE_RECOVERY_REQUIRED",
-            "owned tree regular-link cleanup was incomplete",
-        ));
-    }
     let entry = identity_at(parent.as_raw_fd(), name)?;
     let descriptor = Identity::from_file(&root)?;
     let bound = if sealed_cleanup {
@@ -2031,7 +2231,6 @@ fn remove_owned_children(
     volume: &str,
     sealed_cleanup: bool,
     reject_special: bool,
-    regular_links: &mut OwnedRegularLinks,
 ) -> Result<(), Error> {
     let directory_identity = Identity::from_file(directory)?;
     if sealed_cleanup {
@@ -2084,7 +2283,6 @@ fn remove_owned_children(
                     volume,
                     sealed_cleanup,
                     reject_special,
-                    regular_links,
                 )?;
                 let child_entry = identity_at(directory.as_raw_fd(), &name)?;
                 let child_descriptor = Identity::from_file(&child)?;
@@ -2110,20 +2308,7 @@ fn remove_owned_children(
                     return Err(storage_io("cannot remove owned tree directory"));
                 }
             }
-            kind if kind == REGULAR_TYPE => {
-                if identity_at(directory.as_raw_fd(), &name)? != entry
-                    || !regular_links.take_for_cleanup(entry)
-                {
-                    return Err(Error::new(
-                        "STORAGE_RECOVERY_REQUIRED",
-                        "owned tree entry binding changed before cleanup",
-                    ));
-                }
-                if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-                    return Err(storage_io("cannot remove owned tree entry"));
-                }
-            }
-            kind if kind == SYMLINK_TYPE => {
+            kind if kind == REGULAR_TYPE || kind == SYMLINK_TYPE => {
                 if entry.nlink != 1 || identity_at(directory.as_raw_fd(), &name)? != entry {
                     return Err(Error::new(
                         "STORAGE_RECOVERY_REQUIRED",
@@ -2162,14 +2347,12 @@ fn remove_owned_children(
     })
 }
 
-fn preflight_owned_tree(
+fn reject_special_entries(
     directory: &File,
     expected: Identity,
     device: u64,
     volume: &str,
     sealed_cleanup: bool,
-    reject_special: bool,
-    regular_links: &mut OwnedRegularLinks,
 ) -> Result<(), Error> {
     let identity = Identity::from_file(directory)?;
     let bound = if sealed_cleanup {
@@ -2208,27 +2391,9 @@ fn preflight_owned_tree(
                         "owned tree child changed during special-entry preflight",
                     ));
                 }
-                preflight_owned_tree(
-                    &child,
-                    entry,
-                    device,
-                    volume,
-                    sealed_cleanup,
-                    reject_special,
-                    regular_links,
-                )?;
+                reject_special_entries(&child, entry, device, volume, sealed_cleanup)?;
             }
-            kind if kind == REGULAR_TYPE => {
-                if identity_at(directory.as_raw_fd(), &name)? != entry
-                    || !regular_links.record(entry)
-                {
-                    return Err(Error::new(
-                        "STORAGE_RECOVERY_REQUIRED",
-                        "owned tree entry changed during cleanup preflight",
-                    ));
-                }
-            }
-            kind if kind == SYMLINK_TYPE => {
+            kind if kind == REGULAR_TYPE || kind == SYMLINK_TYPE => {
                 if entry.nlink != 1 || identity_at(directory.as_raw_fd(), &name)? != entry {
                     return Err(Error::new(
                         "STORAGE_RECOVERY_REQUIRED",
@@ -2237,18 +2402,10 @@ fn preflight_owned_tree(
                 }
             }
             _ => {
-                if reject_special {
-                    return Err(Error::new(
-                        "STORAGE_RECOVERY_REQUIRED",
-                        "owned tree contains a special entry",
-                    ));
-                }
-                if entry.nlink != 1 || identity_at(directory.as_raw_fd(), &name)? != entry {
-                    return Err(Error::new(
-                        "STORAGE_RECOVERY_REQUIRED",
-                        "owned tree special entry changed during cleanup preflight",
-                    ));
-                }
+                return Err(Error::new(
+                    "STORAGE_RECOVERY_REQUIRED",
+                    "owned tree contains a special entry",
+                ));
             }
         }
     }

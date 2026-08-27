@@ -1,4 +1,5 @@
 use crate::authority::{self, Authority, Error, Identity, StateRoot};
+use crate::cache;
 use crate::git::{self, AuditConfig, Output};
 use crate::storage::{self, CowPlan};
 use crate::template::{self, MaintenanceReport};
@@ -175,6 +176,8 @@ struct SessionRecord {
     template: storage::SealedTreeReceipt,
     container_identity: Identity,
     volume: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cached: Option<cache::SessionCacheReceipt>,
     payload: SessionPayload,
     #[serde(default, skip_serializing_if = "publish_journal_is_idle")]
     journal: PublishJournal,
@@ -219,6 +222,8 @@ struct RemoveEvent {
 
 struct SessionCensus {
     reachable_templates: BTreeSet<String>,
+    reachable_caches: BTreeSet<String>,
+    reachable_cache_scopes: BTreeSet<String>,
     capabilities: Vec<CensusCapability>,
     temporaries: Vec<Vec<u8>>,
     report: MaintenanceReport,
@@ -522,6 +527,7 @@ fn maintain(cleanup: bool) -> Result<(), Error> {
     }
     let templates = maintenance_container(&state, b"templates", &mut report);
     let sessions = maintenance_container(&state, b"sessions", &mut report);
+    let caches = maintenance_container(&state, b"caches", &mut report);
     let (Some(templates), Some(sessions)) = (templates.as_ref(), sessions.as_ref()) else {
         if templates.is_none() && sessions.is_none() {
             return finish_maintenance(report, cleanup);
@@ -563,7 +569,26 @@ fn maintain(cleanup: bool) -> Result<(), Error> {
     if !cleanup || !template_safe {
         merge_maintenance(&mut report, &mut template_report);
     }
-    if !cleanup || !session_safe || !template_safe || report.recovery_required {
+    let mut cache_report = match caches.as_ref() {
+        Some(caches) => match cache::maintenance(
+            caches,
+            &census.reachable_caches,
+            &census.reachable_cache_scopes,
+            false,
+        ) {
+            Ok(report) => report,
+            Err(_) => {
+                report.recovery("cache", b"", b"", "CORRUPT");
+                MaintenanceReport::default()
+            }
+        },
+        None => MaintenanceReport::default(),
+    };
+    let cache_safe = !cache_report.recovery_required;
+    if !cleanup || !cache_safe {
+        merge_maintenance(&mut report, &mut cache_report);
+    }
+    if !cleanup || !session_safe || !template_safe || !cache_safe || report.recovery_required {
         return finish_maintenance(report, cleanup);
     }
     let mut template_report = match template::gc(templates, || {
@@ -589,6 +614,27 @@ fn maintain(cleanup: bool) -> Result<(), Error> {
     }
     let mut session_report = gc_sessions(sessions, &sessions_path, &census);
     merge_maintenance(&mut report, &mut session_report);
+    if report.recovery_required {
+        return finish_maintenance(report, cleanup);
+    }
+    if let Some(caches) = caches.as_ref() {
+        let after = match session_census(templates, sessions, &sessions_path, false) {
+            Ok(census) if !census.report.recovery_required => census,
+            _ => {
+                report.recovery("cache", b"", b"", "SESSION_CENSUS");
+                return finish_maintenance(report, cleanup);
+            }
+        };
+        match cache::maintenance(
+            caches,
+            &after.reachable_caches,
+            &after.reachable_cache_scopes,
+            true,
+        ) {
+            Ok(mut cache_report) => merge_maintenance(&mut report, &mut cache_report),
+            Err(_) => report.recovery("cache", b"", b"", "GC"),
+        }
+    }
     finish_maintenance(report, cleanup)
 }
 
@@ -617,7 +663,7 @@ fn scan_state_root(state: &StateRoot, report: &mut MaintenanceReport) -> bool {
     let mut safe = true;
     let mut authority_records = 0_usize;
     for name in names {
-        if name == b"templates" || name == b"sessions" {
+        if name == b"templates" || name == b"sessions" || name == b"caches" {
             continue;
         }
         match authority::is_ignorable_system_metadata(state.root_fd(), &name) {
@@ -782,6 +828,63 @@ pub(crate) fn exec(
     .map_err(git_error)?
     .wait_direct()
     .map_err(git_error)
+}
+
+pub(crate) fn cache(
+    repository: &Path,
+    raw_name: Option<OsString>,
+    name_hex: Option<String>,
+) -> Result<String, Error> {
+    let name = selected_name(raw_name, name_hex)?;
+    let authority = authority::inspect(repository)?;
+    let state = registered(&authority)?;
+    let sessions = state.open_container(b"sessions")?;
+    let sessions_path = state.container_path("sessions")?;
+    let sid = session_id(&authority, &name);
+    let record_name = record_name(&sid);
+    let capability = required_record(&sessions, &record_name, &authority)?;
+    ensure_publish_idle(&capability.record)?;
+    let ready = load_ready_capability(&sessions, &sessions_path, &authority, &capability)?;
+    acquire_lease(&ready.root, true)?;
+    let capability = revalidate_ready_lease(
+        &SessionContext {
+            authority: authority.clone(),
+            sessions: sessions.try_clone().map_err(|error| {
+                Error::io(
+                    "CACHE_CAPTURE_FAILED",
+                    "cannot retain session container for cache capture",
+                    error,
+                )
+            })?,
+            sessions_path: sessions_path.clone(),
+        },
+        &capability,
+        &ready,
+    )?;
+    let receipt = capability.record.cached.clone().ok_or_else(|| {
+        Error::new(
+            "CACHE_CONFIG_ABSENT",
+            "the session was created without a .vwscached configuration",
+        )
+    })?;
+    status_clean(&ready.worktree_path, GIT_TIMEOUT)?;
+    let head = current_head(&ready.worktree_path, &authority.object_format)?;
+    let caches = state.ensure_container(b"caches")?;
+    let updated = cache::capture(&caches, &authority, &head, &ready.worktree_path, &receipt)?;
+    if updated != receipt {
+        let mut record = capability.record.clone();
+        record.cached = Some(updated);
+        let bytes = encode_record(&record)?;
+        replace_record_capability(
+            &sessions,
+            &capability,
+            &bytes,
+            "cache",
+            &record.template_key,
+            "cache-record",
+        )?;
+    }
+    Ok(format!("cached {}", authority::hex(name.as_bytes())))
 }
 
 pub(crate) fn publish(
@@ -1102,6 +1205,7 @@ pub(crate) fn create(repository: &Path, request: CreateRequest) -> Result<PathBu
     };
     let tree = resolve_tree(&authority, &base)?;
     let template = template::acquire(&state, &authority, &tree)?;
+    let cache_plan = cache::prepare(&state, repository, &authority, &base)?;
     state.ensure_containers()?;
     let sessions = state.open_container(b"sessions")?;
     let container_identity = Identity::from_file(&sessions)?;
@@ -1139,6 +1243,7 @@ pub(crate) fn create(repository: &Path, request: CreateRequest) -> Result<PathBu
         template: template.sealed.clone(),
         container_identity,
         volume,
+        cached: cache_plan.receipt.clone(),
         payload: SessionPayload::Prepared {
             root_name: root_name.clone(),
         },
@@ -1198,6 +1303,7 @@ pub(crate) fn create(repository: &Path, request: CreateRequest) -> Result<PathBu
         &root_path,
         &target,
         &base,
+        &cache_plan,
     );
     match result {
         Ok(path) => {
@@ -1215,6 +1321,7 @@ fn materialize_session(
     root_path: &Path,
     target: &OsStr,
     base: &str,
+    cache_plan: &cache::CachePlan,
 ) -> Result<PathBuf, Error> {
     let tree_timeout = template::tree_operation_timeout(template.sealed.manifest.entries);
     let root_name = transaction.root_name.clone();
@@ -1338,6 +1445,13 @@ fn materialize_session(
             "SESSION_IO_FAILED",
             "native COW receipt did not match the template record",
         ));
+    }
+    if let (Some(caches), Some(cached)) =
+        (cache_plan.container.as_ref(), cache_plan.receipt.as_ref())
+    {
+        cache::materialize(caches, &worktree, cached)?;
+        let excludes = cache::write_excludes(root_path, cached)?;
+        configure_cache_excludes(&common_path, &excludes, tree_timeout)?;
     }
     read_tree(&worktree_path, tree_timeout)?;
     #[cfg(git_vws_m4_checkpoint)]
@@ -2217,19 +2331,32 @@ fn session_checkpoint(operation: &str, record: &SessionRecord, stage: &str) -> R
 }
 
 fn ensure_discard_safe(ready: &ReadySession, record: &SessionRecord) -> Result<(), Error> {
+    let args = vec![
+        OsString::from("status"),
+        OsString::from("--porcelain=v1"),
+        OsString::from("-z"),
+        OsString::from("--untracked-files=all"),
+        OsString::from("--ignored=matching"),
+    ];
+    let mut cached_paths = Vec::new();
+    if let Some(cached) = &record.cached {
+        for configured in &cached.paths {
+            let path = decode_hex(&configured.path_hex)
+                .map_err(|_| discard_risk("cached path receipt is invalid"))?;
+            cached_paths.push(path);
+        }
+    }
     let output = git::capture(
-        &[
-            OsString::from("status"),
-            OsString::from("--porcelain=v1"),
-            OsString::from("--untracked-files=all"),
-            OsString::from("--ignored=matching"),
-        ],
+        &args,
         Some(&ready.worktree_path),
         GIT_TIMEOUT,
         AuditConfig::Isolated,
     )
     .map_err(|_| discard_risk("cannot inspect worktree changes"))?;
-    if !output.status.success() || !output.stderr.is_empty() || !output.stdout.is_empty() {
+    if !output.status.success()
+        || !output.stderr.is_empty()
+        || worktree_has_discardable_changes(&output.stdout, &cached_paths)?
+    {
         return Err(discard_risk(
             "worktree has tracked, untracked, or ignored changes",
         ));
@@ -2238,6 +2365,27 @@ fn ensure_discard_safe(ready: &ReadySession, record: &SessionRecord) -> Result<(
     ensure_private_object_store_empty(&ready.common)?;
     ensure_no_unreachable_private_closure(&ready.common, &ready.root_path, record)?;
     Ok(())
+}
+
+fn worktree_has_discardable_changes(
+    output: &[u8],
+    cached_paths: &[Vec<u8>],
+) -> Result<bool, Error> {
+    for record in output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        if record.len() < 3 || record[2] != b' ' {
+            return Err(discard_risk("Git status output was malformed"));
+        }
+        let path = record[3..].strip_suffix(b"/").unwrap_or(&record[3..]);
+        if !cached_paths.iter().any(|cached| {
+            path == cached || path.starts_with(cached) && path.get(cached.len()) == Some(&b'/')
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn discard_risk(detail: impl Into<String>) -> Error {
@@ -2527,6 +2675,7 @@ fn matches_existing(existing: &SessionRecord, prepared: &SessionRecord) -> bool 
             .container_identity
             .same_node(prepared.container_identity)
         && existing.volume == prepared.volume
+        && existing.cached == prepared.cached
 }
 
 struct ReadySession {
@@ -2635,6 +2784,8 @@ fn session_census(
     let names = storage::directory_names(sessions.as_raw_fd())?;
     let mut census = SessionCensus {
         reachable_templates: BTreeSet::new(),
+        reachable_caches: BTreeSet::new(),
+        reachable_cache_scopes: BTreeSet::new(),
         capabilities: Vec::new(),
         temporaries: Vec::new(),
         report: MaintenanceReport::default(),
@@ -2670,12 +2821,21 @@ fn session_census(
                     SessionPayload::Tombstoned { .. } => "TOMBSTONED",
                 };
                 let private_objects: Result<Option<PrivateObjectPlan>, Error> = (|| {
+                    let authority = authority_from_record(&capability.record)?;
+                    if let Some(cached) = &capability.record.cached {
+                        cache::reference_receipt(
+                            cached,
+                            &authority,
+                            &capability.record.volume,
+                            &mut census.reachable_caches,
+                            &mut census.reachable_cache_scopes,
+                        )?;
+                    }
                     template::validate_session_template(
                         templates,
                         &capability.record.template_key,
                         &capability.record.template,
                     )?;
-                    let authority = authority_from_record(&capability.record)?;
                     if !matches!(capability.record.payload, SessionPayload::Ready { .. }) {
                         diagnose_list_record(sessions, sessions_path, &authority, &capability)?;
                         return Ok(None);
@@ -3264,7 +3424,13 @@ fn classify_authority_objects(
             "authority object metadata is not an owned same-volume directory",
         )?;
         let children = match entry.as_slice() {
-            b"info" => classify_authority_info(&directory, identity, &plan.volume)?,
+            b"info" => {
+                require_session(
+                    storage::directory_names(directory.as_raw_fd())?.is_empty(),
+                    "authority object info contains an unrecognized entry",
+                )?;
+                Vec::new()
+            }
             b"pack" => classify_pack_entries(
                 &directory,
                 identity,
@@ -3310,36 +3476,6 @@ fn classify_authority_fanout(
     require_session(
         Identity::from_file(fanout)? == fanout_identity,
         "authority loose object fanout changed during classification",
-    )?;
-    Ok(children)
-}
-
-fn classify_authority_info(
-    info: &File,
-    info_identity: Identity,
-    volume: &str,
-) -> Result<Vec<(Vec<u8>, Identity)>, Error> {
-    let mut children = Vec::new();
-    for entry in storage::directory_names(info.as_raw_fd())? {
-        let name = cstring(&entry, "authority object info")?;
-        let identity = storage::identity_at(info.as_raw_fd(), &name)?;
-        require_session(
-            matches!(entry.as_slice(), b"commit-graph" | b"packs"),
-            "authority object info contains an unrecognized entry",
-        )?;
-        validate_authority_regular(
-            info,
-            &name,
-            identity,
-            info_identity,
-            volume,
-            "authority object info has an unsafe identity",
-        )?;
-        children.push((entry, identity));
-    }
-    require_session(
-        Identity::from_file(info)? == info_identity,
-        "authority object info changed during classification",
     )?;
     Ok(children)
 }
@@ -3924,6 +4060,27 @@ fn resolve_commit(authority: &Authority, revision: &OsStr) -> Result<String, Err
         ));
     }
     parse_oid_output(&output.stdout, &authority.object_format)
+}
+
+fn current_head(worktree: &Path, object_format: &str) -> Result<String, Error> {
+    let output = git::capture(
+        &[
+            OsString::from("rev-parse"),
+            OsString::from("--verify"),
+            OsString::from("HEAD"),
+        ],
+        Some(worktree),
+        GIT_TIMEOUT,
+        AuditConfig::Isolated,
+    )
+    .map_err(git_error)?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(Error::new(
+            "CACHE_CAPTURE_FAILED",
+            "session HEAD does not resolve to a commit",
+        ));
+    }
+    parse_oid_output(&output.stdout, object_format)
 }
 
 fn resolve_tree(authority: &Authority, base: &str) -> Result<String, Error> {
@@ -4543,6 +4700,25 @@ fn configure_private_common(
     Ok(())
 }
 
+fn configure_cache_excludes(
+    common: &Path,
+    excludes: &Path,
+    timeout: Duration,
+) -> Result<(), Error> {
+    let mut git_dir = OsString::from("--git-dir=");
+    git_dir.push(common.as_os_str());
+    let args = [
+        git_dir,
+        OsString::from("config"),
+        OsString::from("core.excludesFile"),
+        excludes.as_os_str().to_os_string(),
+    ];
+    require_clean(
+        git::capture(&args, None, timeout, AuditConfig::Isolated).map_err(git_error)?,
+        "configure .vwscached excludes",
+    )
+}
+
 fn add_linked_worktree(
     common: &Path,
     worktree: &Path,
@@ -4818,6 +4994,10 @@ fn validate_record(record: &SessionRecord) -> Result<(), Error> {
         || !storage::private_directory(record.container_identity)
         || record.volume.is_empty()
         || record.template.volume != record.volume
+        || record
+            .cached
+            .as_ref()
+            .is_some_and(|cached| cache::validate_receipt(cached).is_err())
         || record
             .expected_old
             .as_deref()
@@ -5214,6 +5394,7 @@ mod tests {
             },
             container_identity: directory,
             volume: "volume".to_owned(),
+            cached: None,
             payload: SessionPayload::Prepared {
                 root_name: root_name(&sid),
             },

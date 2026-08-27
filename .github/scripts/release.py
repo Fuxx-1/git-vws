@@ -442,7 +442,17 @@ def validate_binary(binary: Path, target: str, version: str) -> dict[str, object
             fail(f"release binary reported an unexpected version: {version_result!r}")
         help_result = run(["git", "vws", "-h"], cwd=Path(home), env=safe_env)
         help_text = help_result.stdout + help_result.stderr
-        for command in ["init", "create", "list", "exec", "remove", "publish", "doctor", "gc"]:
+        for command in [
+            "init",
+            "create",
+            "list",
+            "exec",
+            "cache",
+            "remove",
+            "publish",
+            "doctor",
+            "gc",
+        ]:
             if command not in help_text:
                 fail(f"git vws help omitted command: {command}")
     return {

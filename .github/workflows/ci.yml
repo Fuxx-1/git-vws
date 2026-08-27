@@ -222,15 +222,15 @@ jobs:
               >> runner-evidence/m4-m5-source-contract.log
             test "$actual" = "$expected"
           done <<'EOF'
-          src/authority.rs 61af3ffaca3280c701a3e60ec757f983ec425ee928cfe2af2ba59d9568a9f1db
+          src/authority.rs 3b4a65e8d672f07908c2bd53bd7c86be9f1ace5ca7acbdea9a9ca4b0b4d7b80d
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
-          src/main.rs 2d90687eaf5f6f4b0ff2f1d3ec88171d6edd2c51d04b51d64ab690e64c0f0a38
-          src/session.rs 7940d5a49bba92cacd942c41e64b62b20a4d7d4e05d97100e42459dd99b9a6ff
-          src/storage.rs 45f970762596832130f64ebe7c64155972dd98c88483e2a7a99d7fe791ae70de
+          src/main.rs 2dabdba0aa8921346754b18a7ef3590c35c023b44fa286d7a51cbaac4e464135
+          src/session.rs 5711a261cce9dc8c4ae68ec69a3a4f652663a024a6d6b403d56bda51a6f56a61
+          src/storage.rs a5fb685393e3db47d262ecce4d091e0cf95f4783911974071cb49cac407a5949
           src/template.rs 2ac417299ef5b7245826a1ec5e5338c9b91eb30cef16cb591b174efa839de34d
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
-          tests/m5_publish.rs 88303a90bc26f54f688269bd9bd64d78ee3478be3d5f9b7f307f97158b689e92
-          tests/m6_maintenance.rs f9f8a6451c061482d09ba514a6d236885a9bcf4d9d850bf366b911fe19c7d15b
+          tests/m5_publish.rs d203653156ba0aecadee2b074e2de47b744b473293e5334cdb61e54de98e49c8
+          tests/m6_maintenance.rs 0bbe3bb8d8f18e8fab5a67a3a0d9eeb896ee54714abe26b6ae1eb4a8d793e00a
           tests/support/checkpoint.rs c8026cb722d3c0250fc6d403540fd3b78ab18eaac5c881c5e9bb36c8860bef16
           EOF
       - name: Run full test suite
@@ -323,10 +323,10 @@ jobs:
             printf 'M5 publish_checkpoints=23\n'
           } > runner-evidence/m5-gates.log
           : > runner-evidence/m6-gates.log
-          for name in global_maintenance_cli_and_doctor_are_readonly census_and_leases_fail_closed_without_mutation gc_tombstones_and_crash_prefix_recover_exactly_once private_loose_and_predecessor_temporary_gc_contract; do
+          for name in global_maintenance_cli_and_doctor_are_readonly census_and_leases_fail_closed_without_mutation gc_tombstones_and_crash_prefix_recover_exactly_once private_loose_and_predecessor_temporary_gc_contract common_desktop_metadata_is_ignored_by_maintenance_censuses; do
             grep -F "test $name ..." runner-evidence/tests.log >> runner-evidence/m6-gates.log
           done
-          test "$(wc -l < runner-evidence/m6-gates.log | tr -d ' ')" = 4
+          test "$(wc -l < runner-evidence/m6-gates.log | tr -d ' ')" = 5
           awk '
             /Running.*tests\/m6_maintenance\.rs/ { runs++; in_m6=1; next }
             in_m6 && /test result:/ {
@@ -600,15 +600,15 @@ jobs:
               >> runner-evidence/m4-m5-source-contract.log
             test "$actual" = "$expected"
           done <<'EOF'
-          src/authority.rs 61af3ffaca3280c701a3e60ec757f983ec425ee928cfe2af2ba59d9568a9f1db
+          src/authority.rs 3b4a65e8d672f07908c2bd53bd7c86be9f1ace5ca7acbdea9a9ca4b0b4d7b80d
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
-          src/main.rs 2d90687eaf5f6f4b0ff2f1d3ec88171d6edd2c51d04b51d64ab690e64c0f0a38
-          src/session.rs 7940d5a49bba92cacd942c41e64b62b20a4d7d4e05d97100e42459dd99b9a6ff
-          src/storage.rs 45f970762596832130f64ebe7c64155972dd98c88483e2a7a99d7fe791ae70de
+          src/main.rs 2dabdba0aa8921346754b18a7ef3590c35c023b44fa286d7a51cbaac4e464135
+          src/session.rs 5711a261cce9dc8c4ae68ec69a3a4f652663a024a6d6b403d56bda51a6f56a61
+          src/storage.rs a5fb685393e3db47d262ecce4d091e0cf95f4783911974071cb49cac407a5949
           src/template.rs 2ac417299ef5b7245826a1ec5e5338c9b91eb30cef16cb591b174efa839de34d
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
-          tests/m5_publish.rs 88303a90bc26f54f688269bd9bd64d78ee3478be3d5f9b7f307f97158b689e92
-          tests/m6_maintenance.rs f9f8a6451c061482d09ba514a6d236885a9bcf4d9d850bf366b911fe19c7d15b
+          tests/m5_publish.rs d203653156ba0aecadee2b074e2de47b744b473293e5334cdb61e54de98e49c8
+          tests/m6_maintenance.rs 0bbe3bb8d8f18e8fab5a67a3a0d9eeb896ee54714abe26b6ae1eb4a8d793e00a
           tests/support/checkpoint.rs c8026cb722d3c0250fc6d403540fd3b78ab18eaac5c881c5e9bb36c8860bef16
           EOF
       - name: Run full test suite on XFS reflink
@@ -704,10 +704,10 @@ jobs:
             printf 'M5 publish_checkpoints=23\n'
           } > runner-evidence/m5-gates.log
           : > runner-evidence/m6-gates.log
-          for name in global_maintenance_cli_and_doctor_are_readonly census_and_leases_fail_closed_without_mutation gc_tombstones_and_crash_prefix_recover_exactly_once private_loose_and_predecessor_temporary_gc_contract; do
+          for name in global_maintenance_cli_and_doctor_are_readonly census_and_leases_fail_closed_without_mutation gc_tombstones_and_crash_prefix_recover_exactly_once private_loose_and_predecessor_temporary_gc_contract common_desktop_metadata_is_ignored_by_maintenance_censuses; do
             grep -F "test $name ..." runner-evidence/tests.log >> runner-evidence/m6-gates.log
           done
-          test "$(wc -l < runner-evidence/m6-gates.log | tr -d ' ')" = 4
+          test "$(wc -l < runner-evidence/m6-gates.log | tr -d ' ')" = 5
           awk '
             /Running.*tests\/m6_maintenance\.rs/ { runs++; in_m6=1; next }
             in_m6 && /test result:/ {

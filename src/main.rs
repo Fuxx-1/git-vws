@@ -1,4 +1,5 @@
 mod authority;
+mod cache;
 mod git;
 #[cfg(git_vws_m4_checkpoint)]
 mod m4_checkpoint;
@@ -33,6 +34,7 @@ QUICK START
   git vws --repo <repo.git> exec feature-a -- "$SHELL"
   # Edit files and run normal Git commands in the session shell:
   #   git status; git add .; git commit
+  git vws --repo <repo.git> cache feature-a
   git vws --repo <repo.git> publish feature-a
   git vws --repo <repo.git> remove feature-a
   git vws gc
@@ -50,6 +52,7 @@ COMMAND ORDER
   create     Create an isolated session and print its managed session root.
   list       Inspect sessions as one JSON object per line (NDJSON).
   exec       Run a program with the session worktree as its current directory.
+  cache      Capture configured non-Git directories into the shared COW cache.
   publish    Publish committed session work using expected-old fast-forward CAS.
   remove     Safely discard a session; --force permits destructive removal.
   doctor     Diagnose all registered state without reclaiming anything.
@@ -280,6 +283,54 @@ SYNTAX
         program: Vec<OsString>,
     },
     #[command(
+        about = "Capture configured non-Git directories into shared COW cache",
+        after_help = r#"
+WHAT IT DOES
+  Captures the configured directories from a clean session into an immutable
+  shared snapshot. The project root reads `.vwscached`, one repository-relative
+  directory per line; blank lines and lines beginning with `#` are ignored.
+  A later session created from the same commit and configuration reuses the
+  snapshot, then receives its own writable copy-on-write directory.
+
+REQUIRED WORKFLOW
+  1. Add paths such as `target/` or `node_modules/` to `.vwscached` in the
+     project root and create or recreate the session.
+  2. Build or otherwise populate those directories in the session.
+  3. Ensure the session has no Git changes, then capture it:
+     `git vws --repo repo.git cache feature-a`.
+  4. Run `git vws gc` after removing sessions to reclaim unreferenced snapshots.
+
+EXAMPLES
+  printf 'target/\nnode_modules/\n' > .vwscached
+  git vws --repo repo.git create feature-a
+  git vws --repo repo.git exec feature-a -- cargo build
+  git vws --repo repo.git cache feature-a
+  git vws --repo repo.git list
+
+SAFETY AND SCOPE
+  The command refuses dirty Git state and never captures `.git`, symlinks,
+  files, overlapping paths, globs, or paths outside the project. Cache data is
+  not a Git commit and is not published; each session gets an independent
+  writable directory. A non-zero result or CACHE_RECOVERY_REQUIRED means keep
+  the state intact and inspect it with `git vws doctor`.
+"#
+    )]
+    Cache {
+        #[arg(
+            value_name = "NAME",
+            required_unless_present = "name_hex",
+            conflicts_with = "name_hex",
+            help = "Session name"
+        )]
+        name: Option<OsString>,
+        #[arg(
+            long,
+            value_name = "HEX",
+            help = "Exact lowercase hexadecimal session-name bytes"
+        )]
+        name_hex: Option<String>,
+    },
+    #[command(
         about = "Safely remove a managed session",
         after_help = r#"
 DEFAULT BEHAVIOR
@@ -468,6 +519,9 @@ fn main() -> ExitCode {
         } => repository(repo)
             .and_then(|repository| session::exec(&repository, name, name_hex, program))
             .map(CommandOutput::Exit),
+        Command::Cache { name, name_hex } => repository(repo)
+            .and_then(|repository| session::cache(&repository, name, name_hex))
+            .map(CommandOutput::Text),
         Command::Remove {
             name,
             name_hex,
@@ -564,6 +618,7 @@ mod tests {
             "git vws init <repo.git>",
             "git vws --repo <repo.git> create feature-a --target feature/a",
             "git vws --repo <repo.git> exec feature-a -- \"$SHELL\"",
+            "git vws --repo <repo.git> cache feature-a",
             "git vws --repo <repo.git> publish feature-a",
             "git vws --repo <repo.git> remove feature-a",
             "git vws gc",
@@ -588,7 +643,7 @@ mod tests {
     #[test]
     fn every_public_subcommand_has_reference_help_and_examples() {
         for name in [
-            "init", "create", "list", "exec", "remove", "publish", "doctor", "gc",
+            "init", "create", "list", "exec", "remove", "publish", "doctor", "gc", "cache",
         ] {
             let help = rendered_help(Some(name));
             assert!(
@@ -652,5 +707,10 @@ mod tests {
         let gc = normalized_help("gc");
         assert!(gc.contains("fail-closed"));
         assert!(gc.contains("--repo is rejected"));
+
+        let cache = normalized_help("cache");
+        assert!(cache.contains(".vwscached"));
+        assert!(cache.contains("clean session"));
+        assert!(cache.contains("independent writable directory"));
     }
 }
