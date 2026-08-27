@@ -657,7 +657,7 @@ fn create_snapshot(
             path_hex: authority::hex(path),
             volume: volume.to_owned(),
             root_name: final_name,
-            tree,
+            tree: tree.clone(),
         };
         let bytes = serde_json::to_vec(&record).map_err(|error| {
             Error::new(
@@ -687,13 +687,7 @@ fn create_snapshot(
                 tree: stored.tree,
             });
         }
-        authority::rename_no_replace(caches.as_raw_fd(), &temp_c, &final_c).map_err(|error| {
-            Error::io(
-                "CACHE_RECOVERY_REQUIRED",
-                "cannot publish cache snapshot",
-                error,
-            )
-        })?;
+        publish_snapshot_tree(caches, &temp, &temp_c, &final_c, &tree)?;
         caches.sync_all().map_err(|error| {
             Error::io(
                 "CACHE_RECOVERY_REQUIRED",
@@ -723,6 +717,94 @@ fn create_snapshot(
             Err(error)
         }
     }
+}
+
+fn publish_snapshot_tree(
+    caches: &File,
+    tree: &File,
+    temporary: &CStr,
+    final_name: &CStr,
+    receipt: &storage::SealedTreeReceipt,
+) -> Result<(), Error> {
+    prepare_snapshot_rename(tree, receipt)?;
+    match authority::rename_no_replace(caches.as_raw_fd(), temporary, final_name) {
+        Ok(()) => restore_snapshot_seal(tree, receipt),
+        Err(error) => {
+            restore_snapshot_seal(tree, receipt)?;
+            Err(Error::io(
+                "CACHE_RECOVERY_REQUIRED",
+                "cannot publish cache snapshot",
+                error,
+            ))
+        }
+    }
+}
+
+fn prepare_snapshot_rename(tree: &File, receipt: &storage::SealedTreeReceipt) -> Result<(), Error> {
+    storage::verify_sealed_tree(tree, receipt).map_err(|error| {
+        Error::new(
+            "CACHE_RECOVERY_REQUIRED",
+            format!(
+                "cache snapshot changed before publication: {}",
+                error.detail
+            ),
+        )
+    })?;
+    #[cfg(target_os = "macos")]
+    {
+        set_snapshot_root_mode(tree, 0o755)?;
+        if let Err(error) = storage::verify_publishing_tree(tree, receipt) {
+            restore_snapshot_seal(tree, receipt)?;
+            return Err(Error::new(
+                "CACHE_RECOVERY_REQUIRED",
+                format!(
+                    "cache snapshot changed before publication: {}",
+                    error.detail
+                ),
+            ));
+        }
+        if let Err(error) = tree.sync_all() {
+            restore_snapshot_seal(tree, receipt)?;
+            return Err(Error::io(
+                "CACHE_RECOVERY_REQUIRED",
+                "cannot sync cache snapshot before publication",
+                error,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn restore_snapshot_seal(tree: &File, receipt: &storage::SealedTreeReceipt) -> Result<(), Error> {
+    #[cfg(target_os = "macos")]
+    set_snapshot_root_mode(tree, 0o555)?;
+    storage::verify_sealed_tree(tree, receipt).map_err(|error| {
+        Error::new(
+            "CACHE_RECOVERY_REQUIRED",
+            format!("cache snapshot changed while publishing: {}", error.detail),
+        )
+    })?;
+    #[cfg(target_os = "macos")]
+    tree.sync_all().map_err(|error| {
+        Error::io(
+            "CACHE_RECOVERY_REQUIRED",
+            "cannot sync sealed cache snapshot",
+            error,
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn set_snapshot_root_mode(tree: &File, mode: libc::mode_t) -> Result<(), Error> {
+    if unsafe { libc::fchmod(tree.as_raw_fd(), mode) } != 0 {
+        return Err(Error::io(
+            "CACHE_RECOVERY_REQUIRED",
+            "cannot change cache snapshot root mode",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
 }
 
 fn cleanup_snapshot_temp(caches: &File, name: &CStr, temp: &File) -> Result<(), Error> {
