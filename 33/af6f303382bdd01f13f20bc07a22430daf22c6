@@ -1,0 +1,70 @@
+.github/workflows/release.yml
+  s_dcd472b79184c9::t_de3281b3dab226 319
+src/session.rs
+  s_dcd472b79184c9::t_e4f75fbb6b142a 1449-1451
+  s_dcd472b79184c9::t_6ad8b42df0b8ff 2,179-180,225-226,530,572-591,617-637,666,833-889,1208,1246,1452-1455,2334-2348,2350,2356-2359,2370-2390,2678,2787-2788,2824-2833,3427-3433,4065-4085,4703-4721,4997-5000,5397
+  s_dcd472b79184c9::t_260f616f0d1af8 1306,1324
+src/authority.rs
+  s_dcd472b79184c9::t_6ad8b42df0b8ff 733,741,750-776,1665
+tests/bootstrap_authority.rs
+  s_dcd472b79184c9::t_6ad8b42df0b8ff 1790
+docs/zh/configuration.md
+  s_dcd472b79184c9::t_a157c8435d107b 1-58
+docs/zh/development.md
+  s_dcd472b79184c9::t_a157c8435d107b 1-59
+docs/en/development.md
+  s_dcd472b79184c9::t_a157c8435d107b 1-59
+src/main.rs
+  s_dcd472b79184c9::t_6ad8b42df0b8ff 2,37,55,285-332,522-524,621,646,710-714
+src/storage.rs
+  s_dcd472b79184c9::t_6ad8b42df0b8ff 106-113,141,205-266,896-1074,1415,1422-1439,1570-1598,1969-1970,2311,2350,2394,2396,2405-2408
+src/git.rs
+  s_dcd472b79184c9::t_6ad8b42df0b8ff 15,237,240-241
+.github/workflows/ci.yml
+  s_dcd472b79184c9::t_cdcd498e82c70a 228,606
+  s_dcd472b79184c9::t_059c5c41b5a976 326,329,707,710
+  s_dcd472b79184c9::t_6ad8b42df0b8ff 233,611
+  s_dcd472b79184c9::t_e054e7556687cc 225,227,603,605
+  s_dcd472b79184c9::t_72f3b96ae59ec8 229,232,607,610
+docs/zh/operations.md
+  s_dcd472b79184c9::t_a157c8435d107b 1-77
+Cargo.toml
+  s_dcd472b79184c9::t_de3281b3dab226 3
+docs/en/operations.md
+  s_dcd472b79184c9::t_a157c8435d107b 1-77
+.github/scripts/release.py
+  s_dcd472b79184c9::t_de3281b3dab226 445-455
+docs/en/configuration.md
+  s_dcd472b79184c9::t_a157c8435d107b 1-58
+README.md
+  s_dcd472b79184c9::t_6ad8b42df0b8ff 4,6,8,10-79,86,93-95,97-99,103,105,107-113,115,117,119,128,132,134
+  s_dcd472b79184c9::t_72f3b96ae59ec8 101
+Cargo.lock
+  s_dcd472b79184c9::t_6545b0d1ff6922 157
+docs/en/README.md
+  s_dcd472b79184c9::t_fa7e2c2bae2f2f 1-115
+docs/en/architecture.md
+  s_dcd472b79184c9::t_56a7e3915979c8 1-67
+docs/zh/architecture.md
+  s_dcd472b79184c9::t_7561672ac50abb 1-67
+src/cache.rs
+  s_dcd472b79184c9::t_2dd45e33fdb9c0 1-1341
+tests/m7_cache.rs
+  s_dcd472b79184c9::t_f40e7139b06c53 1-362
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "33af6f303382bdd01f13f20bc07a22430daf22c6",
+  "prompts": {},
+  "sessions": {
+    "s_dcd472b79184c9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ff8c3-623a-7f61-881b-ed0472c09e7f",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Fuxx-1 <583742849@qq.com>"
+    }
+  }
+}
