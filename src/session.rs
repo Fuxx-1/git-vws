@@ -4639,7 +4639,7 @@ fn owned_worktree(identity: Identity) -> bool {
     identity.directory()
         && identity.uid == current_uid()
         && identity.mode == 0o755
-        && identity.nlink >= 2
+        && directory_link_count_ok(identity.nlink)
 }
 
 fn verify_runtime_topology(
@@ -4755,7 +4755,7 @@ fn private_git_metadata_directory(identity: Identity) -> bool {
     identity.directory()
         && identity.uid == current_uid()
         && identity.mode & 0o022 == 0
-        && identity.nlink >= 2
+        && directory_link_count_ok(identity.nlink)
 }
 
 fn resolve_target(authority: &Authority, target: &OsStr) -> Result<Option<String>, Error> {
@@ -6030,7 +6030,13 @@ fn record_name(sid: &str) -> Vec<u8> {
 }
 
 fn owned_directory(identity: Identity) -> bool {
-    identity.directory() && identity.uid == current_uid() && identity.nlink >= 2
+    identity.directory() && identity.uid == current_uid() && directory_link_count_ok(identity.nlink)
+}
+
+/// btrfs keeps a constant link count of 1 for directories instead of the
+/// "2 + subdirectory count" convention used by ext4 and XFS.
+fn directory_link_count_ok(nlink: u64) -> bool {
+    nlink >= 1
 }
 
 fn valid_hash(value: &str) -> bool {
