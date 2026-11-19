@@ -1,7 +1,6 @@
 use std::env;
 use std::fs::{self, File};
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -23,6 +22,8 @@ pub(crate) struct LoopPlan {
     pub(crate) mount: PathBuf,
     pub(crate) state: PathBuf,
     pub(crate) size: String,
+    /// Previous state root contents waiting to be copied into the image.
+    pub(crate) staged: Option<PathBuf>,
 }
 
 impl LoopPlan {
@@ -31,9 +32,10 @@ impl LoopPlan {
         Ok(Self {
             image: home.join(IMAGE_NAME),
             mount: home.join(MOUNT_NAME),
-            state: home.join(MOUNT_NAME).join(STATE_NAME),
+            state: home.join(MOUNT_NAME),
             home,
             size: size.unwrap_or(DEFAULT_SIZE).to_owned(),
+            staged: None,
         })
     }
 
@@ -161,6 +163,40 @@ pub(crate) fn setup(plan: &LoopPlan, adopt: bool) -> Result<String, Error> {
             .arg(&plan.image),
         "mkfs.btrfs",
     )?;
+    // A previous state root would be hidden by the mount, so move it aside
+    // before mounting and copy it in afterwards.
+    let mut plan = LoopPlan {
+        staged: None,
+        ..LoopPlan::discover(Some(&plan.size))?
+    };
+    let previous = plan.home.join(STATE_NAME);
+    if previous.is_dir() {
+        if !adopt {
+            return Err(Error::new(
+                "STATE_UNAVAILABLE",
+                format!(
+                    "{} already holds state; re-run with --adopt to move it into the image, \
+                     or move it away first",
+                    previous.display()
+                ),
+            ));
+        }
+        let staged = plan.home.join(".git-vws.adopting");
+        if staged.exists() {
+            return Err(Error::new(
+                "STATE_UNAVAILABLE",
+                format!("{} already exists; inspect it before retrying", staged.display()),
+            ));
+        }
+        fs::rename(&previous, &staged).map_err(|error| {
+            Error::io(
+                "STATE_UNAVAILABLE",
+                "cannot move the previous state root aside",
+                error,
+            )
+        })?;
+        plan.staged = Some(staged);
+    }
     fs::create_dir_all(&plan.mount)
         .map_err(|error| Error::io("STATE_UNAVAILABLE", "cannot create the mount point", error))?;
     run(
@@ -182,32 +218,25 @@ pub(crate) fn setup(plan: &LoopPlan, adopt: bool) -> Result<String, Error> {
     }
 
     let mut notes = Vec::new();
-    let existing = plan.home.join(STATE_NAME);
-    if existing.is_dir() && !is_same_directory(&existing, &plan.mount) {
-        if !adopt {
-            notes.push(format!(
-                "{} still holds your previous state; re-run with --adopt to move it into the image",
-                existing.display()
-            ));
-        } else {
-            adopt_existing(&existing, &plan.mount)?;
-            notes.push(format!("moved {} into the image", existing.display()));
-        }
+    // The mount point is the state root, so any previous contents must already
+    // have been moved aside before mounting. setup() stages them first.
+    if let Some(staged) = &plan.staged {
+        copy_tree(staged, &plan.mount)?;
+        notes.push(format!(
+            "moved the previous state root from {} into the image",
+            staged.display()
+        ));
     }
-    if !adopt || !existing.is_dir() {
-        fs::create_dir_all(&plan.state).map_err(|error| {
-            Error::io("STATE_UNAVAILABLE", "cannot create the state root", error)
-        })?;
-        if let Some((uid, gid)) = owner {
-            run(
-                Command::new("chown")
-                    .arg(format!("{uid}:{gid}"))
-                    .arg(&plan.state),
-                "chown of the state root",
-            )?;
-        }
+    if let Some((uid, gid)) = owner {
+        run(
+            Command::new("chown")
+                .arg("-R")
+                .arg(format!("{uid}:{gid}"))
+                .arg(&plan.mount),
+            "chown of the state root",
+        )?;
     }
-    let fstab = install_fstab(plan)?;
+    let fstab = install_fstab(&plan)?;
     notes.push(fstab);
     notes.push(format!(
         "state root is {} on a {} image at {}",
@@ -234,43 +263,6 @@ fn current_owner() -> Option<(u32, u32)> {
     Some((uid, gid))
 }
 
-fn is_same_directory(left: &Path, right: &Path) -> bool {
-    match (fs::metadata(left), fs::metadata(right)) {
-        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
-        _ => false,
-    }
-}
-
-/// Move the previous state root into the mounted image, preserving ownership.
-fn adopt_existing(existing: &Path, mount: &Path) -> Result<(), Error> {
-    let staged = mount.join(".git-vws.adopting");
-    if staged.exists() {
-        return Err(Error::new(
-            "STATE_UNAVAILABLE",
-            format!(
-                "{} already exists; inspect it before retrying",
-                staged.display()
-            ),
-        ));
-    }
-    copy_tree(existing, &staged)?;
-    let backup = existing.with_extension("pre-loop");
-    fs::rename(existing, &backup).map_err(|error| {
-        Error::io(
-            "STATE_UNAVAILABLE",
-            "cannot move the previous state root aside",
-            error,
-        )
-    })?;
-    fs::rename(&staged, existing).map_err(|error| {
-        Error::io(
-            "STATE_UNAVAILABLE",
-            "cannot place the adopted state root",
-            error,
-        )
-    })?;
-    Ok(())
-}
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<(), Error> {
     fs::create_dir_all(destination).map_err(|error| {
