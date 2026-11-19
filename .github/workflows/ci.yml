@@ -937,11 +937,13 @@ jobs:
           printf 'create exit=%s\n' "$create_status" | tee -a "$evidence/create-alpha.log"
           test "$create_status" -eq 0
           "$binary" --repo "$mountpoint/repo.git" exec alpha -- sh -c \
-            'echo alpha > alpha.txt; git add -A; git commit -qm alpha'
+            'git config user.email ci@example.invalid; git config user.name CI; \
+             echo alpha > alpha.txt; git add -A; git commit -qm alpha'
           "$binary" --repo "$mountpoint/repo.git" create beta --target feature/beta \
             | tee "$evidence/create-beta.log"
           "$binary" --repo "$mountpoint/repo.git" exec beta -- sh -c \
-            'echo beta > beta.txt; git add -A; git commit -qm beta'
+            'git config user.email ci@example.invalid; git config user.name CI; \
+             echo beta > beta.txt; git add -A; git commit -qm beta'
           "$binary" --repo "$mountpoint/repo.git" list --human | tee "$evidence/list.log"
           "$binary" --repo "$mountpoint/repo.git" publish alpha | tee "$evidence/publish-alpha.log"
           "$binary" --repo "$mountpoint/repo.git" publish beta | tee "$evidence/publish-beta.log"
