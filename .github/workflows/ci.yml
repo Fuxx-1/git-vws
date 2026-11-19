@@ -832,6 +832,12 @@ jobs:
   linux-ext4-loop:
     name: Linux ext4 loop-backed state root
     runs-on: ubuntu-latest
+    env:
+      # The hosted runner ships a global config with includes, which git-vws
+      # rejects by design; isolate it for every step so the repository and the
+      # lifecycle are exercised against the same clean configuration.
+      GIT_CONFIG_NOSYSTEM: "1"
+      GIT_CONFIG_GLOBAL: /dev/null
     steps:
       - uses: actions/checkout@v5
         with:
@@ -884,12 +890,6 @@ jobs:
           grep -F 'reflink' "$evidence/create.log"
       - name: Set up a loop-backed state root and run the full lifecycle
         shell: bash
-        env:
-          # The hosted runner ships a global config with includes, which
-          # git-vws rejects by design; isolate it so the lifecycle is tested
-          # against the same clean configuration as the macOS job.
-          GIT_CONFIG_NOSYSTEM: "1"
-          GIT_CONFIG_GLOBAL: /dev/null
         run: |
           set -euo pipefail
           evidence="$RUNNER_TEMP/ext4-evidence"
