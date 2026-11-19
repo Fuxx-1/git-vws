@@ -507,6 +507,7 @@ jobs:
             PATH="$PATH" \
             HOME="$verify_home" \
             TMPDIR="$verify_tmp" \
+            VWS_RELEASE_REPOSITORY="$GITHUB_REPOSITORY" \
             LANG=C \
             LC_ALL=C \
             GIT_CONFIG_NOSYSTEM=1 \
@@ -519,7 +520,8 @@ jobs:
               --directory release-snapshot/assets \
               --version '${{ needs.validate-tag.outputs.version }}' \
               --source-sha "$GITHUB_SHA" \
-              --target '${{ matrix.target }}'
+              --target '${{ matrix.target }}' \
+              --repository "$VWS_RELEASE_REPOSITORY"
 
   promote:
     name: Promote verified draft release

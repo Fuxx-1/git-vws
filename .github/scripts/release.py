@@ -582,7 +582,9 @@ def create_package(args: argparse.Namespace) -> None:
     )
 
 
-def validate_common(directory: Path, version: str, source_sha: str) -> None:
+def validate_common(
+    directory: Path, version: str, source_sha: str, repository: str | None = None
+) -> None:
     licenses = directory / "THIRD-PARTY-LICENSES.txt"
     if not licenses.is_file() or "Third-party Rust dependencies" not in licenses.read_text(
         encoding="utf-8"
@@ -593,8 +595,9 @@ def validate_common(directory: Path, version: str, source_sha: str) -> None:
         fail("release SBOM is not SPDX 2.3")
     if sbom.get("dataLicense") != "CC0-1.0" or not sbom.get("packages"):
         fail("release SBOM omitted packages or document license")
+    expected_namespace = f"{repository or REPOSITORY}/sbom/{package_prefix(version)}/{source_sha}"
     if sbom.get("name") != package_prefix(version) or sbom.get("documentNamespace") != (
-        f"{REPOSITORY}/sbom/{package_prefix(version)}/{source_sha}"
+        expected_namespace
     ):
         fail("release SBOM identity does not match the release source")
 
@@ -1275,7 +1278,17 @@ def verify_assets(args: argparse.Namespace) -> None:
     expected = expected_release_assets(args.version)
     if actual != expected:
         fail(f"release asset set mismatch: actual={sorted(actual)} expected={sorted(expected)}")
-    validate_common(directory, args.version, args.source_sha)
+    repository = getattr(args, "repository", None)
+    if repository:
+        repository = (
+            repository
+            if repository.startswith(("http://", "https://"))
+            else "{}/{}".format(
+                os.environ.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/"),
+                repository,
+            )
+        )
+    validate_common(directory, args.version, args.source_sha, repository)
 
     expected_sums = [
         f"{sha256_file(directory / name)}  {name}"
@@ -1464,6 +1477,7 @@ def parser() -> argparse.ArgumentParser:
     verify.add_argument("--version", required=True)
     verify.add_argument("--source-sha", required=True)
     verify.add_argument("--target", required=True)
+    verify.add_argument("--repository")
     verify.set_defaults(function=verify_assets)
     return result
 
