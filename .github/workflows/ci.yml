@@ -886,6 +886,8 @@ jobs:
           df -T "$HOME/.git-vws" | tee "$evidence/mounted.log"
           grep -F 'btrfs' "$evidence/mounted.log"
           grep -F 'git-vws loop state root' /etc/fstab | tee "$evidence/fstab.log"
+          ls -la "$HOME/.git-vws" | tee "$evidence/state-root-contents.log"
+          stat -c '%a %U' "$HOME/.git-vws" | tee -a "$evidence/state-root-contents.log"
           "$binary" doctor --human | tee "$evidence/doctor-setup.log"
           "$binary" --repo "$mountpoint/repo.git" create alpha --target feature/alpha \
             | tee "$evidence/create-alpha.log"
