@@ -1,0 +1,21 @@
+README.md
+  s_03ec0c49d99533::t_011b4c43910d57 3,10,84,87,89-92,95-99,123,130-131
+docs/en/README.md
+  s_03ec0c49d99533::t_011b4c43910d57 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "165d214cc9528208687ecb24b998a17ab82dae35",
+  "prompts": {},
+  "sessions": {
+    "s_03ec0c49d99533": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08997-97a5-7bc2-af29-8e779cf78f37",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Fuxx-1 <583742849@qq.com>"
+    }
+  }
+}
