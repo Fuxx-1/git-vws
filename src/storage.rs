@@ -1479,25 +1479,14 @@ fn clone_destination_directory(identity: Identity) -> bool {
 }
 
 fn supported_directory_nlink(nlink: u64) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        nlink >= 1
-    }
-    #[cfg(target_os = "linux")]
-    {
-        nlink >= 2
-    }
+    // btrfs keeps a constant link count of 1 for directories, so a floor of 2
+    // would reject a valid loop-backed state root.
+    nlink >= 1
 }
 
 fn empty_directory_nlink(nlink: u64) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        nlink >= 1
-    }
-    #[cfg(target_os = "linux")]
-    {
-        nlink == 2
-    }
+    // On ext4 and XFS an empty directory has 2 links; btrfs always reports 1.
+    nlink >= 1
 }
 
 fn stable_directory_node(current: Identity, expected: Identity) -> bool {

@@ -2075,25 +2075,39 @@ fn record_name(path: &Path) -> CString {
         .expect("fixed record basename")
 }
 
+/// btrfs reports a constant link count of 1 for directories instead of the
+/// "2 + subdirectory count" convention used by ext4 and XFS, so the link-count
+/// floor has to follow the platform rather than assume one convention.
+fn directory_link_floor() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        1
+    }
+    #[cfg(target_os = "macos")]
+    {
+        2
+    }
+}
+
 fn valid_state_root(identity: Identity) -> bool {
     identity.directory()
         && identity.uid == current_uid()
         && identity.mode == 0o700
-        && identity.nlink >= 2
+        && identity.nlink >= directory_link_floor()
 }
 
 fn valid_state_container(identity: Identity) -> bool {
     identity.directory()
         && identity.uid == current_uid()
         && identity.mode == 0o700
-        && identity.nlink >= 2
+        && identity.nlink >= directory_link_floor()
 }
 
 fn safe_new_root(identity: Identity) -> bool {
     identity.directory()
         && identity.uid == current_uid()
         && identity.mode & 0o077 == 0
-        && identity.nlink >= 2
+        && identity.nlink >= directory_link_floor()
 }
 
 fn valid_record(identity: Identity) -> bool {
