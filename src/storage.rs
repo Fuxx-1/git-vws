@@ -2506,6 +2506,9 @@ fn fiemap_proves_shared(source: &File, destination: &File) -> Result<bool, Error
     const ENCODED: u32 = 0x0000_0008;
     const DATA_ENCRYPTED: u32 = 0x0000_0080;
     const NOT_ALIGNED: u32 = 0x0000_0100;
+    // Kept for reference: btrfs reports INLINE for small files, and those are
+    // accepted because a reflinked inline extent is still shared COW data.
+    #[allow(dead_code)]
     const INLINE: u32 = 0x0000_0200;
     const TAIL: u32 = 0x0000_0400;
     const UNWRITTEN: u32 = 0x0000_0800;
@@ -2531,8 +2534,10 @@ fn fiemap_proves_shared(source: &File, destination: &File) -> Result<bool, Error
     if source_size == 0 {
         return Ok(true);
     }
-    let forbidden =
-        UNKNOWN | DELALLOC | ENCODED | DATA_ENCRYPTED | NOT_ALIGNED | INLINE | TAIL | UNWRITTEN;
+    // INLINE is not forbidden: btrfs stores small files inside the inode, and a
+    // reflinked inline file is still shared copy-on-write data. Only flags that
+    // make the extent unverifiable (or plaintext-readable) are rejected.
+    let forbidden = UNKNOWN | DELALLOC | ENCODED | DATA_ENCRYPTED | NOT_ALIGNED | TAIL | UNWRITTEN;
     let mut covered = 0_u64;
     while covered < source_size {
         let mut source_map: Buffer = unsafe { std::mem::zeroed() };

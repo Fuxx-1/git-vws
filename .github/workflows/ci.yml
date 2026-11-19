@@ -236,7 +236,7 @@ jobs:
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
           src/main.rs 7c00ff425ef673c84cc195754c2361632785a00465c8e5c7defc65a5005397b7
           src/session.rs 1b33aa53d1fa875c981b833d42900a0c162109cff15e99e6bffc3c90016ceaeb
-          src/storage.rs 421ae1130dd3dfb509b2f1eeb0eb681a36a5e2e1bfe8a7502292a0ca6a701c78
+          src/storage.rs cd5fa5c033eaa8232cca4d8de8933bea4cfd818fce78d30c68f35735193fda10
           src/template.rs 82baebc408696e9ec49c1039d113902dc37ccdf8f2b485d90b7516bf1d7a0a9a
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
           tests/m5_publish.rs 7064c13fb5e6f61468781c4f91f26836b9fcc2edebdbedb9617d6a4433ea2343
@@ -614,7 +614,7 @@ jobs:
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
           src/main.rs 7c00ff425ef673c84cc195754c2361632785a00465c8e5c7defc65a5005397b7
           src/session.rs 1b33aa53d1fa875c981b833d42900a0c162109cff15e99e6bffc3c90016ceaeb
-          src/storage.rs 421ae1130dd3dfb509b2f1eeb0eb681a36a5e2e1bfe8a7502292a0ca6a701c78
+          src/storage.rs cd5fa5c033eaa8232cca4d8de8933bea4cfd818fce78d30c68f35735193fda10
           src/template.rs 82baebc408696e9ec49c1039d113902dc37ccdf8f2b485d90b7516bf1d7a0a9a
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
           tests/m5_publish.rs 7064c13fb5e6f61468781c4f91f26836b9fcc2edebdbedb9617d6a4433ea2343
