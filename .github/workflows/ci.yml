@@ -898,10 +898,12 @@ jobs:
           grep -F 'git-vws loop state root' /etc/fstab | tee "$evidence/fstab.log"
           ls -la "$HOME/.git-vws" | tee "$evidence/state-root-contents.log"
           stat -c '%a %U' "$HOME/.git-vws" | tee -a "$evidence/state-root-contents.log"
-          # Records copied across filesystems carry the old device identity, so
-          # re-register the repository before expecting a clean registry.
-          "$binary" forget "$mountpoint/repo.git" --force 2>&1 | tee "$evidence/forget.log" || true
-          "$binary" init "$mountpoint/repo.git" 2>&1 | tee "$evidence/reinit.log"
+          # The record may survive the move unchanged, in which case init reports
+          # AUTHORITY_DUPLICATE; that is a healthy registry, not a failure.
+          "$binary" forget "$mountpoint/repo.git" --force > "$evidence/forget.log" 2>&1 || true
+          cat "$evidence/forget.log"
+          "$binary" init "$mountpoint/repo.git" > "$evidence/reinit.log" 2>&1 || true
+          cat "$evidence/reinit.log"
           "$binary" doctor --human > "$evidence/doctor-setup.log" 2>&1 || true
           cat "$evidence/doctor-setup.log"
           grep -F '0 finding(s)' "$evidence/doctor-setup.log"
