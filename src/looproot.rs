@@ -185,7 +185,10 @@ pub(crate) fn setup(plan: &LoopPlan, adopt: bool) -> Result<String, Error> {
         if staged.exists() {
             return Err(Error::new(
                 "STATE_UNAVAILABLE",
-                format!("{} already exists; inspect it before retrying", staged.display()),
+                format!(
+                    "{} already exists; inspect it before retrying",
+                    staged.display()
+                ),
             ));
         }
         fs::rename(&previous, &staged).map_err(|error| {
@@ -236,6 +239,12 @@ pub(crate) fn setup(plan: &LoopPlan, adopt: bool) -> Result<String, Error> {
             "chown of the state root",
         )?;
     }
+    // The state root must be owner-only (0700); chown preserves the mode but a
+    // freshly formatted mount point is 0755, so set it explicitly.
+    run(
+        Command::new("chmod").arg("700").arg(&plan.mount),
+        "chmod of the state root",
+    )?;
     let fstab = install_fstab(&plan)?;
     notes.push(fstab);
     notes.push(format!(
@@ -262,7 +271,6 @@ fn current_owner() -> Option<(u32, u32)> {
     let gid = env::var("SUDO_GID").ok()?.parse().ok()?;
     Some((uid, gid))
 }
-
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<(), Error> {
     fs::create_dir_all(destination).map_err(|error| {

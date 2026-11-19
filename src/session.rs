@@ -733,6 +733,13 @@ fn maintenance_container(
 ) -> Option<File> {
     match state.open_container_if_present(name) {
         Ok(container) => container,
+        Err(error) if error.code == "STATE_UNAVAILABLE" => {
+            // A container that does not exist yet means the registry is empty,
+            // which is what a freshly prepared state root looks like. It is not
+            // corruption, so report nothing and let the caller treat the
+            // registry as empty.
+            None
+        }
         Err(_) => {
             report.recovery("state", b"", name, "CORRUPT");
             None
