@@ -963,11 +963,17 @@ jobs:
           mountpoint="$RUNNER_TEMP/ext4"
           export HOME="$mountpoint/home"
           binary="$GITHUB_WORKSPACE/target/release/git-vws"
-          head -c 4194304 /dev/urandom > "$mountpoint/repo.git/large.bin"
-          git --git-dir="$mountpoint/repo.git" --work-tree="$mountpoint" add -f large.bin
-          tree=$(git --git-dir="$mountpoint/repo.git" write-tree)
-          commit=$(git --git-dir="$mountpoint/repo.git" commit-tree "$tree" -m "add large file")
-          git --git-dir="$mountpoint/repo.git" update-ref refs/heads/main "$commit"
+          # Commit a 4 MiB file through a scratch worktree so two sessions can
+          # be created from a base commit that contains real data.
+          scratch="$RUNNER_TEMP/scratch"
+          rm -rf "$scratch"
+          git clone -q "$mountpoint/repo.git" "$scratch"
+          cd "$scratch"
+          head -c 4194304 /dev/urandom > large.bin
+          git add large.bin
+          git -c user.email=ci@example.invalid -c user.name=CI commit -qm "add large file"
+          git push -q origin HEAD:main
+          cd "$GITHUB_WORKSPACE"
           before=$(df -k --output=used "$HOME/.git-vws" | tail -1 | tr -d ' ')
           "$binary" --repo "$mountpoint/repo.git" create shared-a --target feature/shared \
             | tee "$evidence/create-shared-a.log"
