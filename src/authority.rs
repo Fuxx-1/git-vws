@@ -105,7 +105,13 @@ pub(crate) struct Identity {
 impl Identity {
     pub(crate) fn from_stat(stat: &libc::stat) -> Self {
         #[cfg(target_os = "linux")]
-        let (dev, mode, nlink) = (stat.st_dev, stat.st_mode, stat.st_nlink);
+        // nlink_t differs across Linux libc flavours and architectures, so
+        // normalize explicitly instead of relying on the raw field type.
+        let (dev, mode, nlink) = (
+            stat.st_dev as u64,
+            stat.st_mode as u32,
+            stat.st_nlink as u64,
+        );
         #[cfg(target_os = "macos")]
         let (dev, mode, nlink) = (
             stat.st_dev as u64,

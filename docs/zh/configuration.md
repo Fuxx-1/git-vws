@@ -51,6 +51,17 @@ git vws cache 会拒绝 dirty Git 状态、不安全条目和不一致 receipt�
 
 状态根和所有 native-COW 树必须位于同一个受支持的 volume。macOS 要求 APFS，并使用系统 clone 原语；Linux 要求 FICLONE 以及可验证共享 extent 的 FIEMAP 结果。不支持的文件系统返回 STORAGE_UNSUPPORTED，不会静默退化为完整复制。
 
+Linux 上的实测结论：
+
+| 文件系统 | 是否支持 | 说明 |
+| --- | --- | --- |
+| XFS | 支持 | 需以 `mkfs.xfs -m reflink=1` 创建 |
+| btrfs | 支持 | 原生 reflink |
+| **ext4** | **不支持** | 内核未实现 reflink，`FICLONE` 返回 `EOPNOTSUPP`（errno 95） |
+| tmpfs / NFS / overlayfs | 不支持 | 无 reflink 能力 |
+
+`init` 不检测存储能力；第一次 `create` 触发 COW 探测时才失败。若状态根落在 ext4 上，把 `$HOME/.git-vws` 移到 XFS 或 btrfs 卷即可。
+
 当前版本拒绝 LFS、submodule、sparse 或 partial clone、clean/smudge filter，以及不支持的 ACL、xattr、file flag、特殊文件或 hard link 组合。
 
 ## 名称与机器输出

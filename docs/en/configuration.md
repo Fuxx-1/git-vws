@@ -51,6 +51,17 @@ git vws cache rejects dirty Git state, unsafe entries, and inconsistent receipts
 
 The state root and all native-COW trees must be on one supported volume. macOS requires APFS and uses the platform clone primitive. Linux requires FICLONE plus verified shared FIEMAP extents. Unsupported filesystems return STORAGE_UNSUPPORTED; git-vws does not silently perform a full copy.
 
+Measured on Linux:
+
+| Filesystem | Supported | Notes |
+| --- | --- | --- |
+| XFS | Yes | Must be created with `mkfs.xfs -m reflink=1` |
+| btrfs | Yes | Native reflink |
+| **ext4** | **No** | The kernel has no reflink support, so FICLONE returns EOPNOTSUPP (errno 95) |
+| tmpfs / NFS / overlayfs | No | No reflink capability |
+
+init does not probe storage; the first create fails when COW is probed. If the state root lands on ext4, move $HOME/.git-vws to an XFS or btrfs volume.
+
 The current release rejects LFS, submodules, sparse or partial clone layouts, clean/smudge filters, and unsupported ACL, xattr, file-flag, special-file, or hard-link combinations.
 
 ## Names and machine output

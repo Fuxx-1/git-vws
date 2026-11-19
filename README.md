@@ -102,6 +102,7 @@ git-vws man [--install]
 
 - Git 2.34 或更新版本，构建需要 Rust 1.85 或更新版本。
 - macOS 的 APFS，或同时提供 FICLONE 和可验证共享 FIEMAP extent 的 Linux 文件系统。
+- Linux 上实测可用：XFS（`mkfs.xfs -m reflink=1`）、btrfs。**ext4 不支持**——它没有 reflink 能力，`FICLONE` 返回 `EOPNOTSUPP`；tmpfs、NFS、overlayfs 同样不支持。
 - 不支持 Windows、LFS、submodule、sparse/partial clone、clean/smudge filter，以及不受支持的 ACL、xattr 或文件 flag 组合。
 
 普通项目作为 authority 时，`publish` 只能更新该仓库所有 worktree 都未检出的分支；若目标可能被并发检出，请使用 bare authority。

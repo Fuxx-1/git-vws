@@ -222,11 +222,11 @@ jobs:
               >> runner-evidence/m4-m5-source-contract.log
             test "$actual" = "$expected"
           done <<'EOF'
-          src/authority.rs 2a8ca54910c2a13f63a1eafad5b2a2c6658351cabea183030e6bbfabe6c30fa8
+          src/authority.rs 12a3260bea88e226a806bc3d7331b7dc8f2b76baa196affd27c7cfbbeb0a7f2a
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
           src/main.rs ae0b1942511650882ae7a8b62d9a35154c7e8f72b211d39b3283435b26a35a2b
           src/session.rs d1fdcec461d6b20e653884655e921f1dd8766972b9304aa6200fd9b4d488ad27
-          src/storage.rs ae27f81307678d0910e96487d37880e200e5282d6e0543ec40e1998f66ca9511
+          src/storage.rs a93306fbf0c95f6ce8929294fa64eee1a1bec661b5d9045c499d3c109a1c4f24
           src/template.rs 82baebc408696e9ec49c1039d113902dc37ccdf8f2b485d90b7516bf1d7a0a9a
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
           tests/m5_publish.rs 7064c13fb5e6f61468781c4f91f26836b9fcc2edebdbedb9617d6a4433ea2343
@@ -600,11 +600,11 @@ jobs:
               >> runner-evidence/m4-m5-source-contract.log
             test "$actual" = "$expected"
           done <<'EOF'
-          src/authority.rs 2a8ca54910c2a13f63a1eafad5b2a2c6658351cabea183030e6bbfabe6c30fa8
+          src/authority.rs 12a3260bea88e226a806bc3d7331b7dc8f2b76baa196affd27c7cfbbeb0a7f2a
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
           src/main.rs ae0b1942511650882ae7a8b62d9a35154c7e8f72b211d39b3283435b26a35a2b
           src/session.rs d1fdcec461d6b20e653884655e921f1dd8766972b9304aa6200fd9b4d488ad27
-          src/storage.rs ae27f81307678d0910e96487d37880e200e5282d6e0543ec40e1998f66ca9511
+          src/storage.rs a93306fbf0c95f6ce8929294fa64eee1a1bec661b5d9045c499d3c109a1c4f24
           src/template.rs 82baebc408696e9ec49c1039d113902dc37ccdf8f2b485d90b7516bf1d7a0a9a
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
           tests/m5_publish.rs 7064c13fb5e6f61468781c4f91f26836b9fcc2edebdbedb9617d6a4433ea2343

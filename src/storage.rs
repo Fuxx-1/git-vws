@@ -1174,8 +1174,17 @@ fn native_clone_file(
             )
         } != 0
         {
-            return Err(cleanup(storage_io(
-                "FICLONE cannot provide native copy-on-write",
+            // EOPNOTSUPP here means the filesystem has no reflink support at
+            // all, which is the common case on ext4. Name it so the user is not
+            // left guessing why an ordinary-looking Linux disk was rejected.
+            let error = io::Error::last_os_error();
+            let filesystem = filesystem_name_at(destination_parent).unwrap_or("this filesystem");
+            return Err(cleanup(Error::new(
+                "STORAGE_UNSUPPORTED",
+                format!(
+                    "{filesystem} cannot hold copy-on-write trees: FICLONE is unsupported \
+                     ({error}); move $HOME/.git-vws to an XFS volume with reflink=1, or to btrfs"
+                ),
             )));
         }
         if let Err(error) = destination.sync_all() {
@@ -1328,10 +1337,40 @@ fn filesystem_kind(directory: &File) -> Result<String, Error> {
         if matches!(kind, 0x0102_1994 | 0x6969 | 0x794c_7630) {
             return Err(Error::new(
                 "STORAGE_UNSUPPORTED",
-                "native COW is unavailable on this Linux filesystem",
+                format!(
+                    "{} cannot hold the state root: it does not support copy-on-write reflinks; \
+                     move $HOME/.git-vws to an XFS volume with reflink=1, or to btrfs",
+                    linux_filesystem_name(kind)
+                ),
             ));
         }
         Ok(format!("linux-{kind:x}:{fsid:016x}"))
+    }
+}
+
+/// Best-effort filesystem name for a directory, used to explain a rejection.
+#[cfg(target_os = "linux")]
+fn filesystem_name_at(directory: RawFd) -> Result<&'static str, Error> {
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(directory, &mut stat) } != 0 {
+        return Err(storage_io("cannot inspect native COW filesystem"));
+    }
+    Ok(linux_filesystem_name(stat.f_type as u64))
+}
+
+/// Name the common Linux filesystems so an unsupported-volume error can say
+/// which one was found instead of leaving the user to decode a hex type code.
+#[cfg(target_os = "linux")]
+fn linux_filesystem_name(kind: u64) -> &'static str {
+    match kind {
+        0x0102_1994 => "tmpfs",
+        0x6969 => "NFS",
+        0x794c_7630 => "overlayfs",
+        0xef53 => "ext2/ext3/ext4",
+        0x5846_5342 => "XFS",
+        0x9123_683e => "btrfs",
+        0xf2f5_2010 => "FUSE",
+        _ => "this filesystem",
     }
 }
 
