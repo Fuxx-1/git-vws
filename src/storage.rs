@@ -2505,10 +2505,9 @@ fn fiemap_proves_shared(source: &File, destination: &File) -> Result<bool, Error
     const DELALLOC: u32 = 0x0000_0004;
     const ENCODED: u32 = 0x0000_0008;
     const DATA_ENCRYPTED: u32 = 0x0000_0080;
-    const NOT_ALIGNED: u32 = 0x0000_0100;
-    // Kept for reference: btrfs reports INLINE for small files, and those are
-    // accepted because a reflinked inline extent is still shared COW data.
+    // Kept for reference: btrfs sets this for inline extents, which are accepted.
     #[allow(dead_code)]
+    const NOT_ALIGNED: u32 = 0x0000_0100;
     const INLINE: u32 = 0x0000_0200;
     const TAIL: u32 = 0x0000_0400;
     const UNWRITTEN: u32 = 0x0000_0800;
@@ -2534,10 +2533,11 @@ fn fiemap_proves_shared(source: &File, destination: &File) -> Result<bool, Error
     if source_size == 0 {
         return Ok(true);
     }
-    // INLINE is not forbidden: btrfs stores small files inside the inode, and a
-    // reflinked inline file is still shared copy-on-write data. Only flags that
-    // make the extent unverifiable (or plaintext-readable) are rejected.
-    let forbidden = UNKNOWN | DELALLOC | ENCODED | DATA_ENCRYPTED | NOT_ALIGNED | TAIL | UNWRITTEN;
+    // INLINE and NOT_ALIGNED are not forbidden: btrfs stores small files inside
+    // the inode, which is inherently unaligned, and a reflinked inline file is
+    // still shared copy-on-write data. Only flags that make an extent
+    // unverifiable or readable in plaintext are rejected.
+    let forbidden = UNKNOWN | DELALLOC | ENCODED | DATA_ENCRYPTED | TAIL | UNWRITTEN;
     let mut covered = 0_u64;
     while covered < source_size {
         let mut source_map: Buffer = unsafe { std::mem::zeroed() };
@@ -2564,16 +2564,24 @@ fn fiemap_proves_shared(source: &File, destination: &File) -> Result<bool, Error
             .iter()
             .zip(&destination_map.extents[..count])
         {
-            if left.logical != covered
+            // btrfs stores small files inline and does not set SHARED on the
+            // resulting extent, even though a reflinked inline file is shared.
+            // Accept that case when both sides are inline and report the same
+            // logical and physical placement, which is what FICLONE guarantees.
+            let inline_shared = left.flags & INLINE != 0
+                && right.flags & INLINE != 0
+                && left.logical == right.logical
+                && left.physical == right.physical;
+            let reject = left.logical != covered
                 || left.logical != right.logical
                 || left.physical != right.physical
                 || left.length == 0
                 || left.length != right.length
                 || left.flags & forbidden != 0
                 || right.flags & forbidden != 0
-                || left.flags & SHARED == 0
-                || right.flags & SHARED == 0
-            {
+                || (left.flags & SHARED == 0 && !inline_shared)
+                || (right.flags & SHARED == 0 && !inline_shared);
+            if reject {
                 return Ok(false);
             }
             let Some(next) = covered.checked_add(left.length) else {
