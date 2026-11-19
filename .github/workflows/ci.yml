@@ -902,7 +902,8 @@ jobs:
           # re-register the repository before expecting a clean registry.
           "$binary" forget "$mountpoint/repo.git" --force 2>&1 | tee "$evidence/forget.log" || true
           "$binary" init "$mountpoint/repo.git" 2>&1 | tee "$evidence/reinit.log"
-          "$binary" doctor --human | tee "$evidence/doctor-setup.log"
+          "$binary" doctor --human > "$evidence/doctor-setup.log" 2>&1 || true
+          cat "$evidence/doctor-setup.log"
           grep -F '0 finding(s)' "$evidence/doctor-setup.log"
           "$binary" --repo "$mountpoint/repo.git" create alpha --target feature/alpha \
             | tee "$evidence/create-alpha.log"
@@ -920,7 +921,8 @@ jobs:
           "$binary" --repo "$mountpoint/repo.git" remove alpha | tee "$evidence/remove-alpha.log"
           "$binary" --repo "$mountpoint/repo.git" remove beta | tee "$evidence/remove-beta.log"
           "$binary" gc --human | tee "$evidence/gc.log"
-          "$binary" doctor --human | tee "$evidence/doctor-final.log"
+          "$binary" doctor --human > "$evidence/doctor-final.log" 2>&1 || true
+          cat "$evidence/doctor-final.log"
           grep -F '0 finding(s)' "$evidence/doctor-final.log"
       - name: Verify sessions share physical data through reflinks
         shell: bash
@@ -959,7 +961,8 @@ jobs:
           sudo -E env "PATH=$PATH" "HOME=$HOME" "$binary" loop-resize --size 2G \
             | tee "$evidence/resize.log"
           df -h "$HOME/.git-vws" | tee "$evidence/resized.log"
-          "$binary" doctor --human | tee "$evidence/doctor-resized.log"
+          "$binary" doctor --human > "$evidence/doctor-resized.log" 2>&1 || true
+          cat "$evidence/doctor-resized.log"
           grep -F '0 finding(s)' "$evidence/doctor-resized.log"
       - name: Unmount and confirm doctor explains the missing state root
         shell: bash
@@ -978,7 +981,8 @@ jobs:
           grep -F 'not mounted' "$evidence/doctor-unmounted.log" \
             | tee "$evidence/unmounted.log"
           sudo mount "$HOME/.git-vws"
-          "$binary" doctor --human | tee "$evidence/doctor-remounted.log"
+          "$binary" doctor --human > "$evidence/doctor-remounted.log" 2>&1 || true
+          cat "$evidence/doctor-remounted.log"
           grep -F '0 finding(s)' "$evidence/doctor-remounted.log"
       - name: Remove loop artifacts
         if: always()
