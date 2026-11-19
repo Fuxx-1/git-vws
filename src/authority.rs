@@ -105,8 +105,10 @@ pub(crate) struct Identity {
 impl Identity {
     pub(crate) fn from_stat(stat: &libc::stat) -> Self {
         #[cfg(target_os = "linux")]
-        // nlink_t differs across Linux libc flavours and architectures, so
-        // normalize explicitly instead of relying on the raw field type.
+        // nlink_t and dev_t differ across Linux libc flavours and architectures,
+        // so normalize explicitly. The casts are redundant on targets where the
+        // field already has the target type, which clippy flags per-platform.
+        #[allow(clippy::unnecessary_cast)]
         let (dev, mode, nlink) = (
             stat.st_dev as u64,
             stat.st_mode as u32,

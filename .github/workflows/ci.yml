@@ -232,7 +232,7 @@ jobs:
               >> runner-evidence/m4-m5-source-contract.log
             test "$actual" = "$expected"
           done <<'EOF'
-          src/authority.rs dad07f80e9aa1a152d569e2ed24231a883f71423449146871a1137773d877d43
+          src/authority.rs d633629b0a9861407392b39b75d5ba2950b491dd94d6d38ed0eb5fff851406ff
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
           src/main.rs 7c00ff425ef673c84cc195754c2361632785a00465c8e5c7defc65a5005397b7
           src/session.rs be665c9ce91fe29f4b880a96d58e8795ce32c3cc71b0d829d3769b4e5722b192
@@ -610,7 +610,7 @@ jobs:
               >> runner-evidence/m4-m5-source-contract.log
             test "$actual" = "$expected"
           done <<'EOF'
-          src/authority.rs dad07f80e9aa1a152d569e2ed24231a883f71423449146871a1137773d877d43
+          src/authority.rs d633629b0a9861407392b39b75d5ba2950b491dd94d6d38ed0eb5fff851406ff
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
           src/main.rs 7c00ff425ef673c84cc195754c2361632785a00465c8e5c7defc65a5005397b7
           src/session.rs be665c9ce91fe29f4b880a96d58e8795ce32c3cc71b0d829d3769b4e5722b192
