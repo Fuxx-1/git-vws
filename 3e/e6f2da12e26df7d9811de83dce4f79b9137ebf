@@ -1,0 +1,14 @@
+.github/scripts/release.py
+  h_e59efd41e8686d 24-54
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3ee6f2da12e26df7d9811de83dce4f79b9137ebf",
+  "prompts": {},
+  "humans": {
+    "h_e59efd41e8686d": {
+      "author": "Fuxx-1 <583742849@qq.com>"
+    }
+  }
+}
