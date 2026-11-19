@@ -20,7 +20,12 @@ from pathlib import Path, PurePosixPath
 
 
 PACKAGE = "git-vws"
-REPOSITORY = "https://github.com/Fuxx-1/git-vws"
+DEFAULT_REPOSITORY_SLUG = "owner/git-vws"
+REPOSITORY_SLUG = os.environ.get("GITHUB_REPOSITORY") or DEFAULT_REPOSITORY_SLUG
+REPOSITORY = "{}/{}".format(
+    os.environ.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/"),
+    REPOSITORY_SLUG,
+)
 CI_WORKFLOW = ".github/workflows/ci.yml"
 PROVENANCE_BUNDLE = "PROVENANCE.sigstore.json"
 REMOTE_MANIFEST_SCHEMA = 1
@@ -65,7 +70,6 @@ REMOTE_MANIFEST_KEYS = {
     "version",
 }
 REMOTE_ASSET_KEYS = {"digest", "id", "name", "size", "state", "updated_at"}
-REPOSITORY_SLUG = "Fuxx-1/git-vws"
 RUNTIME_TOKEN_ENV_NAMES = {
     "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
     "ACTIONS_ID_TOKEN_REQUEST_URL",
@@ -1090,13 +1094,32 @@ def validate_tag(args: argparse.Namespace) -> None:
             "HOST_SETUP_REQUIRED: replace the release signer anchor placeholder "
             "with the first immutable signer commit SHA"
         )
-    matches = re.findall(
-        r"^\s*uses:\s*Fuxx-1/git-vws/\.github/workflows/release-sign\.yml@([^\s#]+)\s*$",
+    # The signer may be referenced as a local workflow in the same commit or as
+    # a repository workflow pinned to an immutable commit SHA. A local reference
+    # is bound to the source commit by definition, so it needs no separate SHA.
+    local_matches = re.findall(
+        r"^\s*uses:\s*\./\.github/workflows/release-sign\.yml\s*$",
         workflow,
         flags=re.MULTILINE,
     )
-    if len(matches) != 1 or GIT_OBJECT_SHA_PATTERN.fullmatch(matches[0]) is None:
-        fail("release signer workflow must be pinned to one complete commit SHA")
+    remote_matches = re.findall(
+        r"^\s*uses:\s*[^\s@]+/\.github/workflows/release-sign\.yml@([^\s#]+)\s*$",
+        workflow,
+        flags=re.MULTILINE,
+    )
+    if len(local_matches) == 1 and not remote_matches:
+        signer_workflow_sha = args.source_sha
+    elif (
+        not local_matches
+        and len(remote_matches) == 1
+        and GIT_OBJECT_SHA_PATTERN.fullmatch(remote_matches[0]) is not None
+    ):
+        signer_workflow_sha = remote_matches[0]
+    else:
+        fail(
+            "release signer workflow must be either the local workflow or one "
+            "repository workflow pinned to a complete commit SHA"
+        )
     write_json(
         Path(args.output),
         {
@@ -1106,7 +1129,7 @@ def validate_tag(args: argparse.Namespace) -> None:
             "tag_object_sha": tag_object_sha,
             "pretag_run_id": pretag_run_id,
             "pretag_run_attempt": pretag_run_attempt,
-            "signer_workflow_sha": matches[0],
+            "signer_workflow_sha": signer_workflow_sha,
         },
     )
 

@@ -30,7 +30,7 @@ jobs:
           REPOSITORY_VISIBILITY: ${{ github.repository_visibility }}
         run: |
           set -euo pipefail
-          test "$GITHUB_REPOSITORY" = Fuxx-1/git-vws
+          [[ "$GITHUB_REPOSITORY" =~ ^[^/]+/git-vws$ ]]
           test "$GITHUB_EVENT_NAME" = push
           test "$REPOSITORY_VISIBILITY" = public
           [[ "$GITHUB_REF" == refs/tags/v* ]]
