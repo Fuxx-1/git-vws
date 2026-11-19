@@ -1,0 +1,16 @@
+.github/workflows/ci.yml
+  h_e59efd41e8686d 238,616
+src/session.rs
+  h_e59efd41e8686d 4642,4758,6033-6039
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "15cfe1240203942f4e81234534ca38877aed9b76",
+  "prompts": {},
+  "humans": {
+    "h_e59efd41e8686d": {
+      "author": "Fuxx-1 <583742849@qq.com>"
+    }
+  }
+}
