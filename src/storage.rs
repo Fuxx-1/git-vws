@@ -1518,10 +1518,10 @@ fn stable_directory_node_allows_only_link_count_drift() {
     assert!(stable_directory_node(link_drift, expected));
     assert!(supported_directory_nlink(2));
     assert!(empty_directory_nlink(2));
-    #[cfg(target_os = "macos")]
+    // btrfs reports a constant link count of 1 for directories, so a link
+    // count of 1 must be accepted on both platforms.
     assert!(supported_directory_nlink(1) && empty_directory_nlink(1));
-    #[cfg(target_os = "linux")]
-    assert!(!supported_directory_nlink(1) && !empty_directory_nlink(1));
+    assert!(!supported_directory_nlink(0) && !empty_directory_nlink(0));
     for current in [
         Identity { dev: 4, ..expected },
         Identity { ino: 4, ..expected },
