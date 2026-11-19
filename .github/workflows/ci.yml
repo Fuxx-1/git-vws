@@ -900,7 +900,8 @@ jobs:
           stat -c '%a %U' "$HOME/.git-vws" | tee -a "$evidence/state-root-contents.log"
           # Records copied across filesystems carry the old device identity, so
           # re-register the repository before expecting a clean registry.
-          "$binary" init "$mountpoint/repo.git" | tee "$evidence/reinit.log"
+          "$binary" forget "$mountpoint/repo.git" --force 2>&1 | tee "$evidence/forget.log" || true
+          "$binary" init "$mountpoint/repo.git" 2>&1 | tee "$evidence/reinit.log"
           "$binary" doctor --human | tee "$evidence/doctor-setup.log"
           grep -F '0 finding(s)' "$evidence/doctor-setup.log"
           "$binary" --repo "$mountpoint/repo.git" create alpha --target feature/alpha \
