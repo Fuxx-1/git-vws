@@ -913,6 +913,10 @@ jobs:
           "$binary" doctor --human > "$evidence/doctor-setup.log" 2>&1 || true
           cat "$evidence/doctor-setup.log"
           grep -F '0 finding(s)' "$evidence/doctor-setup.log"
+          echo "--- config diagnostics ---" | tee "$evidence/config-diag.log"
+          git --git-dir="$mountpoint/repo.git" config --list --show-origin 2>&1 \
+            | tee -a "$evidence/config-diag.log"
+          env | grep -E '^GIT_' | tee -a "$evidence/config-diag.log" || true
           set +e
           "$binary" --repo "$mountpoint/repo.git" create alpha --target feature/alpha \
             > "$evidence/create-alpha.log" 2>&1
