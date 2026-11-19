@@ -32,7 +32,17 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
       - run: cargo check --locked --all-targets
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Run clippy
+        run: |
+          set -o pipefail
+          cargo clippy --locked --all-targets --all-features -- -D warnings 2>&1 \
+            | tee clippy.log
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: ci-clippy
+          path: clippy.log
+          if-no-files-found: warn
 
   linux-musl:
     name: Linux musl release build
@@ -888,7 +898,11 @@ jobs:
           grep -F 'git-vws loop state root' /etc/fstab | tee "$evidence/fstab.log"
           ls -la "$HOME/.git-vws" | tee "$evidence/state-root-contents.log"
           stat -c '%a %U' "$HOME/.git-vws" | tee -a "$evidence/state-root-contents.log"
+          # Records copied across filesystems carry the old device identity, so
+          # re-register the repository before expecting a clean registry.
+          "$binary" init "$mountpoint/repo.git" | tee "$evidence/reinit.log"
           "$binary" doctor --human | tee "$evidence/doctor-setup.log"
+          grep -F '0 finding(s)' "$evidence/doctor-setup.log"
           "$binary" --repo "$mountpoint/repo.git" create alpha --target feature/alpha \
             | tee "$evidence/create-alpha.log"
           "$binary" --repo "$mountpoint/repo.git" exec alpha -- sh -c \

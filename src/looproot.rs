@@ -253,7 +253,12 @@ pub(crate) fn setup(plan: &LoopPlan, adopt: bool) -> Result<String, Error> {
         plan.size,
         plan.image.display()
     ));
-    notes.push("run `git vws doctor` to confirm the new state root is healthy".to_owned());
+    notes.push(
+        "authority records copied from the old filesystem no longer match their new \
+         device identity; re-run `git vws init <repository>` for each repository you \
+         still use, then `git vws doctor`"
+            .to_owned(),
+    );
     Ok(notes.join("\n"))
 }
 
