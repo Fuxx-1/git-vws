@@ -21,7 +21,37 @@ from pathlib import Path, PurePosixPath
 
 PACKAGE = "git-vws"
 DEFAULT_REPOSITORY_SLUG = "owner/git-vws"
-REPOSITORY_SLUG = os.environ.get("GITHUB_REPOSITORY") or DEFAULT_REPOSITORY_SLUG
+
+
+def detect_repository_slug() -> str:
+    """Resolve the repository slug.
+
+    The verify job runs under `env -i`, so GITHUB_REPOSITORY is absent there
+    even though the SBOM was generated with it. Fall back to the origin remote
+    so both phases agree on the same identity.
+    """
+    from_env = os.environ.get("GITHUB_REPOSITORY")
+    if from_env:
+        return from_env
+    try:
+        url = subprocess.check_output(
+            ["git", "config", "--get", "remote.origin.url"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return DEFAULT_REPOSITORY_SLUG
+    if url.endswith(".git"):
+        url = url[: -len(".git")]
+    for separator in ("://", ":"):
+        if separator in url:
+            candidate = url.rsplit(separator, 1)[-1]
+            if candidate.count("/") == 1:
+                return candidate
+    return DEFAULT_REPOSITORY_SLUG
+
+
+REPOSITORY_SLUG = detect_repository_slug()
 REPOSITORY = "{}/{}".format(
     os.environ.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/"),
     REPOSITORY_SLUG,
