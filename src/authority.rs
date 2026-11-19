@@ -18,6 +18,9 @@ const STATE_ROOT: &[u8] = b".git-vws";
 const MAX_GIT_OUTPUT: usize = 1024;
 const MAX_RECORD_BYTES: usize = 4096;
 const GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const HOME_LEASE_TIMEOUT: Duration = Duration::from_secs(5);
+const STATE_ROOT_LEASE_TIMEOUT: Duration = Duration::from_secs(10);
+const LEASE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 #[cfg(target_os = "linux")]
 const FILE_TYPE_MASK: u32 = libc::S_IFMT;
 #[cfg(target_os = "linux")]
@@ -239,12 +242,165 @@ pub(crate) fn inspect(input: &Path) -> Result<Authority, Error> {
     Ok(second)
 }
 
-pub(crate) fn open_state() -> Result<StateRoot, Error> {
-    StateRoot::open()
-}
-
 pub(crate) fn open_existing_state() -> Result<StateRoot, Error> {
     StateRoot::open_existing()
+}
+
+/// Forget a stale authority record whose repository no longer exists at the
+/// recorded canonical path, so the path can be registered again.
+pub(crate) fn forget(input: &Path, discard: bool) -> Result<String, Error> {
+    let canonical = canonical_forget_target(input)?;
+    let mut state = StateRoot::open_existing()?;
+    state.lock()?;
+    let (name, record) = match find_registered_record(&state, &canonical)? {
+        Some(found) => found,
+        None => {
+            return Err(Error::new(
+                "AUTHORITY_UNREGISTERED",
+                format!(
+                    "no registered authority record for {}; run `git vws doctor` to list registered paths",
+                    canonical.display()
+                ),
+            ))
+        }
+    };
+    if name.to_bytes() != record_name(&record.canonical).as_bytes() {
+        return Err(Error::new(
+            "STATE_CORRUPT",
+            "state record filename does not match its canonical path",
+        ));
+    }
+    let canonical = record.canonical.clone();
+    // Forget is safe when the recorded identity no longer matches reality: the
+    // repository may be gone, or it may still exist on a different device after
+    // the volume was remounted or migrated. In both cases the record is stale
+    // and the path has to be registered again from scratch.
+    if let Ok(live) = inspect_authority(&canonical) {
+        if live.identity.same_node(record.identity) {
+            return Err(Error::new(
+                "AUTHORITY_IN_USE",
+                format!(
+                    "{} is still a live authority; run `git vws --repo {} remove <session>` for each remaining session, then retry forget",
+                    canonical.display(),
+                    canonical.display()
+                ),
+            ));
+        }
+    }
+    let authority_path = hex(record.canonical.as_os_str().as_bytes());
+    let reclaimed = crate::session::reclaim_orphan_sessions(&authority_path, discard)?;
+    if let Some(sessions) = state.open_container_if_present(b"sessions")? {
+        if let Some(name) = orphan_session_record(&sessions, &authority_path)? {
+            return Err(Error::new(
+                "SESSION_DISCARD_RISK",
+                format!(
+                    "session {} still holds work that was never published; inspect it before forgetting {}",
+                    String::from_utf8_lossy(&name),
+                    canonical.display()
+                ),
+            ));
+        }
+    }
+    let binding = read_file_binding(
+        state.root_fd(),
+        name.as_bytes(),
+        record.encode().len().max(MAX_RECORD_BYTES),
+    )?;
+    let unlink_name = cstring(name.to_bytes(), "record")?;
+    unlink_capability(state.root_fd(), &unlink_name, binding.identity)?;
+    sync_record_parent(state.root_file())?;
+    Ok(match reclaimed {
+        0 => format!("forgot Git authority {}", canonical.display()),
+        count => format!(
+            "forgot Git authority {} and reclaimed {count} orphaned session(s)",
+            canonical.display()
+        ),
+    })
+}
+
+/// Locate the registry record for a path, tolerating the path shapes init
+/// accepts: a project root, its `.git` directory, or a bare repository. The
+/// recorded canonical path is the single source of truth, so a project root and
+/// its `.git` directory resolve to the same record.
+fn find_registered_record(
+    state: &StateRoot,
+    requested: &Path,
+) -> Result<Option<(CString, Record)>, Error> {
+    let direct = record_name(requested);
+    if let Ok(record) = read_record_at(state.root_fd(), direct.as_bytes()) {
+        return Ok(Some((direct, record)));
+    }
+    let candidates = [
+        requested.to_path_buf(),
+        requested.join(".git"),
+        requested.with_file_name(".git"),
+    ];
+    for name in directory_names(state.root_fd())? {
+        if !name.ends_with(b".record") || name.starts_with(b".") {
+            continue;
+        }
+        let Ok(record) = read_record_at(state.root_fd(), &name) else {
+            continue;
+        };
+        let matches = candidates.iter().any(|candidate| {
+            candidate == &record.canonical
+                || candidate.strip_prefix(&record.canonical).is_ok()
+                || record.canonical.strip_prefix(candidate).is_ok()
+        });
+        if matches {
+            let basename = cstring(&name, "record")?;
+            return Ok(Some((basename, record)));
+        }
+    }
+    Ok(None)
+}
+
+fn canonical_forget_target(input: &Path) -> Result<PathBuf, Error> {
+    if let Ok(path) = fs::canonicalize(input) {
+        return Ok(path);
+    }
+    // The repository is usually gone by the time forget runs, so canonicalize
+    // is unavailable. Accept the same path shapes init accepts: a project root,
+    // its `.git` directory, or a bare repository, resolved as an absolute path.
+    let absolute = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(|error| {
+                Error::io(
+                    "AUTHORITY_INVALID",
+                    "cannot determine current directory",
+                    error,
+                )
+            })?
+            .join(input)
+    };
+    if absolute.file_name().is_some_and(|name| name == ".git") {
+        return Ok(absolute);
+    }
+    let dot_git = absolute.join(".git");
+    if dot_git.is_dir() {
+        return Ok(dot_git);
+    }
+    Ok(absolute)
+}
+
+fn orphan_session_record(sessions: &File, authority_path: &str) -> Result<Option<Vec<u8>>, Error> {
+    for name in directory_names(sessions.as_raw_fd())? {
+        if !name.starts_with(b"session-") || !name.ends_with(b".record") {
+            continue;
+        }
+        let Ok(binding) = read_file_binding(sessions.as_raw_fd(), &name, MAX_RECORD_BYTES) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&binding.bytes) else {
+            continue;
+        };
+        if value.get("authority_path").and_then(|v| v.as_str()) == Some(authority_path) {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn authority_record_present(
@@ -257,6 +413,15 @@ pub(crate) fn authority_record_present(
         Err(error) if error.code == "STATE_UNAVAILABLE" => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+/// Read the canonical repository path recorded in a state record, so callers
+/// can tell the user which path to forget. Returns None when the record itself
+/// cannot be parsed.
+pub(crate) fn recorded_authority_path(state: &StateRoot, name: &[u8]) -> Option<PathBuf> {
+    read_record_at(state.root_fd(), name)
+        .ok()
+        .map(|record| record.canonical)
 }
 
 pub(crate) fn validate_authority_record(state: &StateRoot, name: &[u8]) -> Result<(), Error> {
@@ -422,10 +587,31 @@ fn git_probe(path: &Path) -> Result<Vec<String>, Error> {
         .capture(MAX_GIT_OUTPUT)
         .map_err(from_git_error)?;
     if !output.status.success() || !output.stderr.is_empty() {
-        return Err(Error::probe_failed("Git probe did not complete cleanly"));
+        // Surface Git's own diagnostic: the probe failure is usually caused by
+        // repository state the user can fix, and hiding it leaves them stuck.
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = detail.trim();
+        let guidance = "run this inside a repository, or pass `--repo <path>`";
+        let message = if detail.is_empty() {
+            format!(
+                "Git refused to describe {} ({}); {guidance}",
+                path.display(),
+                output.status
+            )
+        } else {
+            format!(
+                "Git refused to describe {}: {detail}; {guidance}",
+                path.display()
+            )
+        };
+        return Err(Error::new("GIT_PROBE_FAILED", message));
     }
-    let text = String::from_utf8(output.stdout)
-        .map_err(|_| Error::new("GIT_PROBE_FAILED", "Git probe output was not UTF-8"))?;
+    let text = String::from_utf8(output.stdout).map_err(|_| {
+        Error::new(
+            "GIT_PROBE_FAILED",
+            format!("Git described {} in non-UTF-8 output", path.display()),
+        )
+    })?;
     let body = text
         .strip_suffix('\n')
         .ok_or_else(|| Error::new("GIT_PROBE_FAILED", "Git probe lacked a final newline"))?;
@@ -574,7 +760,7 @@ impl StateRoot {
                 "HOME is not an owned directory",
             ));
         }
-        lock_descriptor(&home, "HOME")?;
+        lock_descriptor(&home, "HOME", HOME_LEASE_TIMEOUT)?;
 
         let root_name = cstring(STATE_ROOT, "state root")?;
         let created = match unsafe { libc::mkdirat(home.as_raw_fd(), root_name.as_ptr(), 0o700) } {
@@ -675,7 +861,6 @@ impl StateRoot {
                 "HOME is not an owned directory",
             ));
         }
-        lock_descriptor(&home, "HOME")?;
         let root_name = cstring(STATE_ROOT, "state root")?;
         let mut stat = zeroed_stat();
         if unsafe {
@@ -712,7 +897,7 @@ impl StateRoot {
             root_name,
             created: false,
             identity,
-            home_locked: true,
+            home_locked: false,
             root_locked: false,
             committed: false,
             preserve_root: false,
@@ -813,7 +998,11 @@ impl StateRoot {
     }
 
     fn lock(&mut self) -> Result<(), Error> {
-        lock_descriptor(self.root.as_ref().expect("state root open"), "state root")?;
+        lock_descriptor(
+            self.root.as_ref().expect("state root open"),
+            "state root",
+            STATE_ROOT_LEASE_TIMEOUT,
+        )?;
         self.root_locked = true;
         self.revalidate_root()
     }
@@ -1559,15 +1748,34 @@ fn state_root_path() -> Result<PathBuf, Error> {
     Ok(PathBuf::from(home).join(".git-vws"))
 }
 
-fn lock_descriptor(file: &File, label: &str) -> Result<(), Error> {
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(Error::io(
-            "STATE_BUSY",
-            &format!("cannot lock {label}"),
-            io::Error::last_os_error(),
-        ));
+fn lock_descriptor(file: &File, label: &str, timeout: Duration) -> Result<(), Error> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EWOULDBLOCK) => {}
+            Some(libc::EINTR) => continue,
+            _ => {
+                return Err(Error::io(
+                    "STATE_BUSY",
+                    &format!("cannot lock {label}"),
+                    error,
+                ))
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::new(
+                "STATE_BUSY",
+                format!(
+                    "{label} is held by another git-vws command; wait for it to finish, then retry"
+                ),
+            ));
+        }
+        std::thread::sleep(LEASE_POLL_INTERVAL);
     }
-    Ok(())
 }
 
 fn cleanup_new_root(
@@ -1654,12 +1862,9 @@ fn ignorable_system_metadata_name(name: &[u8]) -> bool {
 
 fn scan_records(state: &StateRoot, authority: &Authority) -> Result<(), Error> {
     let mut names = directory_names(state.root_fd())?;
-    if names.is_empty() && !state.created {
-        return Err(Error::new(
-            "STATE_CORRUPT",
-            "state root exists without an authority record",
-        ));
-    }
+    // An empty state root is a legitimate state: it is what remains after the
+    // last authority record is forgotten. Registering into it is safe, so init
+    // rebuilds rather than refusing and forcing manual cleanup.
     names.sort();
     for name in names {
         if name == b"templates" || name == b"sessions" || name == b"caches" {
@@ -1697,7 +1902,7 @@ fn scan_records(state: &StateRoot, authority: &Authority) -> Result<(), Error> {
             return if record.exactly_matches(authority) {
                 Err(Error::new(
                     "AUTHORITY_DUPLICATE",
-                    "authority already initialized",
+                    "this repository is already registered and unchanged; no action was taken",
                 ))
             } else {
                 Err(Error::new(
@@ -1710,8 +1915,14 @@ fn scan_records(state: &StateRoot, authority: &Authority) -> Result<(), Error> {
             && record.identity.ino == authority.identity.ino
         {
             return Err(Error::new(
-                "STATE_CORRUPT",
-                "foreign state record claims the authority identity",
+                "AUTHORITY_ALREADY_REGISTERED",
+                format!(
+                    "this repository is already registered under the old path {}; \
+                     run `git vws forget {}`, then `git vws init {}`",
+                    record.canonical.display(),
+                    record.canonical.display(),
+                    authority.canonical.display()
+                ),
             ));
         }
     }

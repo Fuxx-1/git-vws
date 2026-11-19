@@ -772,9 +772,13 @@ fn snapshot_entry(
 
 fn assert_publish_success(output: &Output, target: &str, expected: &str) {
     assert_success(output, "M5 publish");
-    assert_eq!(
-        output.stdout,
-        format!("published {} {expected}\n", hex(target.as_bytes())).as_bytes()
+    // A publish that finds the target already at the expected commit reports
+    // that explicitly instead of claiming a new publication.
+    let already = format!("{target} was already at {expected}; nothing to publish\n");
+    let published = format!("published {target} {expected}\n");
+    assert!(
+        output.stdout == published.as_bytes() || output.stdout == already.as_bytes(),
+        "unexpected publish output: {output:?}"
     );
     assert!(
         output.stderr.is_empty(),

@@ -6,6 +6,12 @@
 
 ## 安装
 
+`git vws --help` 由 Git 转交给 `man`，因此需要一次性安装 man page（页面由 CLI 帮助生成，不会与命令脱节）：
+
+    git-vws man --install
+
+在此之前请用 `git vws -h`，或直接调用 `git-vws --help`。
+
 可以从源码构建，也可以从 GitHub Releases 下载对应归档。将其中的 git-vws 放入 PATH，然后确认 Git 能发现它：
 
     git vws --version
@@ -37,7 +43,15 @@ publish 将 session 中已经提交的内容发布到 session 目标分支。它
 
     git vws --repo /path/to/project publish feature-a
 
-支持新目标、相同 tip 和 fast-forward。如果其他 writer 在 CAS 前更新目标，命令返回冲突，并保持对方 ref 不变。请在 session 中 rebase 或 merge 后重试。若返回 recovery-required，说明 CAS 结果不能安全重放；保留 session 并运行 doctor。
+支持新目标、相同 tip 和 fast-forward。如果其他 writer 在 CAS 前更新目标，命令返回冲突，并保持对方 ref 不变。
+
+会话默认没有 remote，因此要先在会话内显式加上 authority 才能 rebase：
+
+    git vws --repo /path/to/project exec feature-a -- git remote add authority /path/to/project/.git
+    git vws --repo /path/to/project exec feature-a -- git fetch authority
+    git vws --repo /path/to/project exec feature-a -- git rebase authority/feature/a
+
+之后再执行 publish。若返回 recovery-required，说明 CAS 结果不能安全重放；保留 session 并运行 doctor。
 
 ## 删除与垃圾回收
 
@@ -46,7 +60,7 @@ publish 将 session 中已经提交的内容发布到 session 目标分支。它
     git vws --repo /path/to/project remove feature-a
     git vws gc
 
-如果 tracked、untracked、ignored 或私有 Git 内容可能丢失，删除会被拒绝。--force 是明确的破坏性选项，仍不会绕过完整性或恢复检查。删除先进入 tombstone 状态，因此中断后的清理仍可诊断。
+如果 tracked、untracked、ignored 或**尚未 publish 的私有提交**可能丢失，删除会被拒绝。已经 publish 到目标分支的提交可以直接 remove，不需要 --force。--force 是明确的破坏性选项，仍不会绕过完整性或恢复检查。删除先进入 tombstone 状态，因此中断后的清理仍可诊断。
 
 gc 会先做完整 census，只清理没有引用的 template、私有 object、session tombstone 和缓存快照。成功清理后可以重复运行。
 
@@ -59,7 +73,20 @@ doctor 只检查已登记状态，不删除任何内容：
 
 遇到 SESSION_RECOVERY_REQUIRED、PUBLISH_RECOVERY_REQUIRED、CACHE_RECOVERY_REQUIRED、GC_RECOVERY_REQUIRED、SESSION_CORRUPT 或其他非零结果时，立即停止破坏性操作。保留 $HOME/.git-vws 和 session root，通过 doctor 输出定位记录，不要手工删除状态文件。
 
+## 仓库移动或删除后恢复
+
+如果已登记的仓库被改名、搬移或删除，`doctor` 会报告陈旧记录，`init` 也无法重新登记。用 `forget` 注销旧记录，再登记新路径：
+
+    git vws forget /old/path/to/repository.git
+    git vws init /new/path/to/repository.git
+
+`forget` 移除登记记录，并回收该 authority 下没有未发布内容的 session。若孤儿 session 仍持有未发布提交，命令会拒绝并给出两条出路：把仓库恢复到记录中的原路径以便发布，或加 `--force` 明确丢弃这些提交。仓库仍在但设备号或 inode 已变化（卷重新挂载、目录迁移）时同样适用。
+
+`list`、`doctor` 和 `gc` 默认输出 NDJSON，便于脚本处理；加上 `--human` 可得到可读表格，NDJSON 契约保持不变。
+
 忙碌 session 会被报告而不是强制 detach。先停止占用该 session 的编辑器、shell、编译器和子进程，再重试普通命令。
+
+所有租约都有超时：若 `$HOME` 或状态根被另一个 git-vws 命令长期占用，命令会在数秒后返回 `STATE_BUSY` 而不是无限挂起。`list`、`doctor` 和 `gc` 的只读扫描不获取 `$HOME` 写租约，因此不会被同一台机器上其他仓库的 `create` 阻塞。
 
 ## 缓存操作
 

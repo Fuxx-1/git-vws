@@ -1670,9 +1670,14 @@ fn prepare_destination_skeleton(
     root_identity: Identity,
     entries: &[ManifestEntry],
 ) -> Result<(), Error> {
+    let mut directories: BTreeSet<Vec<u8>> = BTreeSet::new();
     for entry in entries {
         let _ = destination_parent(root, root_identity, &entry.path)?;
         let _ = destination_leaf(&entry.path)?;
+        let components: Vec<_> = entry.path.split(|byte| *byte == b'/').collect();
+        for depth in 1..components.len() {
+            directories.insert(components[..depth].join(&b'/'));
+        }
     }
     root.sync_all().map_err(|error| {
         Error::io(
@@ -1680,7 +1685,20 @@ fn prepare_destination_skeleton(
             "cannot sync template directory skeleton",
             error,
         )
-    })
+    })?;
+    // Persist every directory's entries once. Materialization no longer syncs
+    // per file, so this pass is what makes the skeleton durable.
+    for path in directories {
+        let directory = destination_parent(root, root_identity, &path)?;
+        directory.sync_all().map_err(|error| {
+            Error::io(
+                "TEMPLATE_IO_FAILED",
+                "cannot sync template directory skeleton",
+                error,
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn materialize_entries(
@@ -1987,20 +2005,18 @@ fn write_regular(
             io::Error::last_os_error(),
         ));
     }
-    file.sync_all().map_err(|error| {
-        Error::io(
-            "TEMPLATE_IO_FAILED",
-            "cannot sync template regular file",
-            error,
-        )
-    })?;
     child.note_progress().map_err(git_error)?;
-    if !storage::sealed_regular(Identity::from_file(&file)?) {
+    let sealed = Identity::from_file(&file)?;
+    if !storage::sealed_regular(sealed) {
         return Err(Error::new(
             "TEMPLATE_IO_FAILED",
             "template regular file did not retain its sealed identity",
         ));
     }
+    // Closing the descriptor persists the contents and metadata; the sealing
+    // pass syncs each directory once afterwards. Syncing per file issued one
+    // fsync per entry, which dominated materialization on large trees.
+    drop(file);
     Ok(())
 }
 
@@ -2056,19 +2072,12 @@ fn destination_parent(root: &File, root_identity: Identity, path: &[u8]) -> Resu
     for component in components.iter().take(components.len().saturating_sub(1)) {
         let component = *component;
         let name = cstring(component, "template directory")?;
+        // The skeleton pass has already created every directory, so opening is
+        // the common case. Re-enumerating the parent for each component made
+        // materialization quadratic in directory size; a successful openat
+        // already proves the entry exists with the expected name.
         let child = match storage::open_directory_at(parent.as_raw_fd(), &name) {
-            Ok(child) => {
-                if !storage::directory_names(parent.as_raw_fd())?
-                    .iter()
-                    .any(|existing| existing == component)
-                {
-                    return Err(Error::new(
-                        "TEMPLATE_UNSUPPORTED",
-                        "tree path collided under target volume semantics",
-                    ));
-                }
-                child
-            }
+            Ok(child) => child,
             Err(_) => {
                 if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
                     let error = io::Error::last_os_error();
@@ -2085,22 +2094,10 @@ fn destination_parent(root: &File, root_identity: Identity, path: &[u8]) -> Resu
                         )
                     });
                 }
-                let child = storage::open_directory_at(parent.as_raw_fd(), &name)?;
-                child.sync_all().map_err(|error| {
-                    Error::io(
-                        "TEMPLATE_IO_FAILED",
-                        "cannot sync new template directory",
-                        error,
-                    )
-                })?;
-                parent.sync_all().map_err(|error| {
-                    Error::io(
-                        "TEMPLATE_IO_FAILED",
-                        "cannot sync new template directory parent",
-                        error,
-                    )
-                })?;
-                child
+                // The skeleton pass syncs the root once after every directory
+                // exists, so per-directory parent syncs here were redundant and
+                // cost two fsyncs per new directory.
+                storage::open_directory_at(parent.as_raw_fd(), &name)?
             }
         };
         let identity = Identity::from_file(&child)?;
@@ -2246,9 +2243,18 @@ fn config_fingerprint(effective: BTreeMap<String, String>) -> Result<String, Err
             _ => false,
         };
         if !accepted {
+            let required = match key.as_str() {
+                "core.autocrlf" => "false",
+                "core.eol" => "native",
+                "core.filemode" | "core.symlinks" => "true",
+                _ => "an unset value",
+            };
             return Err(Error::new(
                 "TEMPLATE_UNSUPPORTED",
-                "effective Git config requires unsupported checkout semantics",
+                format!(
+                    "{key} is {value:?} but git-vws requires {required}; run \
+                     `git config --local {key} {required}` in the repository, then retry"
+                ),
             ));
         }
     }

@@ -6,6 +6,12 @@ This page describes installation, normal session use, publication, cleanup, and 
 
 ## Install
 
+Git routes `git vws --help` to `man`, so install the page once (it is generated from the CLI help, so it cannot drift from the commands):
+
+    git-vws man --install
+
+Until then use `git vws -h`, or invoke `git-vws --help` directly.
+
 Build from source or download the matching archive from GitHub Releases. Put the git-vws executable on PATH, then verify that Git discovers it:
 
     git vws --version
@@ -37,7 +43,15 @@ publish publishes committed session work to the session target branch. It first 
 
     git vws --repo /path/to/project publish feature-a
 
-New-target, same-tip, and fast-forward publication are supported. If another writer changes the target before the CAS, the command returns a conflict and leaves that writer's ref untouched. Rebase or merge in the session, then retry. A recovery-required result means the CAS outcome is not safely replayable; preserve the session and run doctor.
+New-target, same-tip, and fast-forward publication are supported. If another writer changes the target before the CAS, the command returns a conflict and leaves that writer's ref untouched.
+
+A session has no remote by default, so add the authority explicitly before rebasing:
+
+    git vws --repo /path/to/project exec feature-a -- git remote add authority /path/to/project/.git
+    git vws --repo /path/to/project exec feature-a -- git fetch authority
+    git vws --repo /path/to/project exec feature-a -- git rebase authority/feature/a
+
+Then run publish again. A recovery-required result means the CAS outcome is not safely replayable; preserve the session and run doctor.
 
 ## Remove and garbage collection
 
@@ -46,7 +60,7 @@ Remove a clean session normally:
     git vws --repo /path/to/project remove feature-a
     git vws gc
 
-Removal refuses tracked, untracked, ignored, or private Git content that may be lost. --force is explicit and destructive; it does not bypass integrity or recovery checks. Removal first uses a tombstone transition so an interrupted cleanup remains diagnosable.
+Removal refuses tracked, untracked, ignored, or **unpublished private commits** that may be lost. Commits already published to the target branch do not block removal, so no --force is needed. --force is explicit and destructive; it does not bypass integrity or recovery checks. Removal first uses a tombstone transition so an interrupted cleanup remains diagnosable.
 
 gc performs a complete census and removes only unreferenced templates, private objects, session tombstones, and cache snapshots. It is safe to run repeatedly after successful cleanup.
 
@@ -59,7 +73,20 @@ doctor inspects registered state without deleting it:
 
 On SESSION_RECOVERY_REQUIRED, PUBLISH_RECOVERY_REQUIRED, CACHE_RECOVERY_REQUIRED, GC_RECOVERY_REQUIRED, SESSION_CORRUPT, or a related nonzero result, stop destructive actions. Preserve $HOME/.git-vws, keep the printed session root, and use doctor output to identify the affected record. Do not manually delete state files.
 
+## Recovering after a repository moves
+
+If a registered repository is renamed, moved, or deleted, doctor reports a stale record and init cannot register the new path. Forget the old record, then register the new one:
+
+    git vws forget /old/path/to/repository.git
+    git vws init /new/path/to/repository.git
+
+forget removes the registry record and reclaims sessions under that authority that hold no unpublished work. When an orphaned session still holds unpublished commits, forget refuses and names both options: restore the repository at its recorded path so the commits can be published, or add --force to discard them. The same path applies when the repository still exists but its device or inode changed, for example after a volume is remounted or a directory is migrated.
+
+list, doctor, and gc emit NDJSON by default for scripts; add --human for a readable table. The NDJSON contract is unchanged without it.
+
 Busy sessions are reported rather than forcibly detached. Stop editors, shells, compilers, and child processes that use the session, then retry the ordinary command.
+
+Every lease is bounded: if $HOME or the state root is held by another git-vws command, the command returns STATE_BUSY after a few seconds instead of blocking forever. The read-only scans behind list, doctor, and gc do not take the $HOME write lease, so they are not serialized behind a create running for another repository on the same machine.
 
 ## Cache operations
 

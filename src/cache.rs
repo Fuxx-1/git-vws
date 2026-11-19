@@ -12,11 +12,13 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 const CACHE_RECORD_LIMIT: usize = 64 * 1024;
 const CONFIG_LIMIT: usize = 64 * 1024;
 const MAX_CONFIG_PATHS: usize = 128;
 const MAX_CONFIG_PATH_BYTES: usize = 4096;
+const CACHE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 static NEXT_CACHE: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -77,19 +79,30 @@ impl Drop for CacheLock<'_> {
 }
 
 fn lock_container(file: &File) -> Result<CacheLock<'_>, Error> {
+    let deadline = Instant::now() + CACHE_LOCK_TIMEOUT;
     loop {
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(CacheLock { file });
         }
         let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            continue;
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EWOULDBLOCK) => {}
+            _ => {
+                return Err(Error::io(
+                    "CACHE_RECOVERY_REQUIRED",
+                    "cannot lock cache container",
+                    error,
+                ))
+            }
         }
-        return Err(Error::io(
-            "CACHE_RECOVERY_REQUIRED",
-            "cannot lock cache container",
-            error,
-        ));
+        if Instant::now() >= deadline {
+            return Err(Error::new(
+                "CACHE_RECOVERY_REQUIRED",
+                "cache container is held by another git-vws command; wait for it to finish, then retry",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 

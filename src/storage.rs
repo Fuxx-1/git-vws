@@ -728,17 +728,13 @@ fn walk_tree(
                         hasher,
                         entries,
                     )?;
+                    // Syncing the child after its subtree is complete also
+                    // persists the entries this directory added, so the parent
+                    // does not need a second sync here.
                     destination_child.sync_all().map_err(|error| {
                         Error::io(
                             "STORAGE_UNSUPPORTED",
                             "cannot sync nested native COW destination",
-                            error,
-                        )
-                    })?;
-                    destination.sync_all().map_err(|error| {
-                        Error::io(
-                            "STORAGE_UNSUPPORTED",
-                            "cannot sync nested native COW destination parent",
                             error,
                         )
                     })?;
@@ -769,13 +765,6 @@ fn walk_tree(
                         &file,
                         entry,
                     )?;
-                    destination.sync_all().map_err(|error| {
-                        Error::io(
-                            "STORAGE_UNSUPPORTED",
-                            "cannot sync native COW file parent",
-                            error,
-                        )
-                    })?;
                 }
                 *entries = entries.checked_add(1).ok_or_else(|| {
                     Error::new("STORAGE_UNSUPPORTED", "sealed-tree entry count overflow")
@@ -807,13 +796,6 @@ fn walk_tree(
                             "cloned symbolic link binding or metadata changed",
                         ));
                     }
-                    destination.sync_all().map_err(|error| {
-                        Error::io(
-                            "STORAGE_UNSUPPORTED",
-                            "cannot sync native COW symbolic-link parent",
-                            error,
-                        )
-                    })?;
                 }
                 *entries = entries.checked_add(1).ok_or_else(|| {
                     Error::new("STORAGE_UNSUPPORTED", "sealed-tree entry count overflow")
@@ -847,6 +829,18 @@ fn walk_tree(
             Error::io(
                 "STORAGE_UNSUPPORTED",
                 "cannot sync sealed-tree directory",
+                error,
+            )
+        })?;
+    }
+    // One sync per directory persists every entry this directory created,
+    // including cloned files and symlinks. Syncing per entry instead made
+    // session materialization cost one fsync per file.
+    if let Walk::Clone(destination) = walk {
+        destination.sync_all().map_err(|error| {
+            Error::io(
+                "STORAGE_UNSUPPORTED",
+                "cannot sync cloned destination directory",
                 error,
             )
         })?;
@@ -888,9 +882,10 @@ fn clone_regular(
             "native COW destination metadata is unsupported",
         ));
     }
-    destination
-        .sync_all()
-        .map_err(|error| Error::io("STORAGE_UNSUPPORTED", "cannot sync cloned file", error))
+    // Directory entries are synced once per directory by the caller. Syncing
+    // every cloned file made session materialization cost one fsync per file,
+    // which dominated create time on large trees.
+    Ok(())
 }
 
 fn snapshot_walk(

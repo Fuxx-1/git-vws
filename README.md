@@ -1,13 +1,13 @@
 # git-vws
 
-[![CI](https://github.com/Fuxx-1/git-vws/actions/workflows/ci.yml/badge.svg)](https://github.com/Fuxx-1/git-vws/actions/workflows/ci.yml)
+[CI workflow](.github/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 
 中文 | [English](docs/en/README.md)
 
 `git-vws` 是一个 Git Extension，为同一仓库创建多个独立、可正常编辑的开发会话。每个会话都有私有的 HEAD、index、refs、未提交修改和构建输出；未修改的 Git 文件通过 macOS APFS 或 Linux 原生 FICLONE 写时复制共享物理数据。它不修改 Git、不引入 FUSE、守护进程、管理员安装或全量复制回退。
 
-1.0.3 是当前支持 macOS 和 Linux 原生 COW 文件系统的稳定版本。发布或删除会话前，请先阅读命令输出和对应的恢复提示。
+1.1.0 是当前支持 macOS 和 Linux 原生 COW 文件系统的稳定版本。发布或删除会话前，请先阅读命令输出和对应的恢复提示。
 
 ## 快速开始
 
@@ -81,16 +81,22 @@ git vws --repo . cache feature-a
 ```text
 git vws init <repository-or-project>
 git vws create <name> [--from <rev>] [--target <branch>] [--path <managed-path>]
-git vws list [--all]
+git vws list [--all] [--human]
 git vws exec <name> -- <program> [args...]
 git vws cache <name>
-git vws remove <name> [--force]
+git vws remove <name> [--force] [--human]
 git vws publish <name>
-git vws doctor
-git vws gc
+git vws forget <path> [--force]
+git vws doctor [--human]
+git vws gc [--human]
+git-vws man [--install]
 ```
 
-面对自动化或陌生命令，先运行 `git vws -h`，再运行 `git vws <command> -h`。`list`、`doctor` 和 `gc` 输出 NDJSON；非零退出或 `*_RECOVERY_REQUIRED` 都应视为停止信号，先保留状态并运行 `doctor`，不要手动删除 `$HOME/.git-vws` 中的文件。
+面对自动化或陌生命令，先运行 `git vws -h`，再运行 `git vws <command> -h`。`list`、`doctor` 和 `gc` 默认输出 NDJSON，加 `--human` 可读；非零退出或 `*_RECOVERY_REQUIRED` 都应视为停止信号，先保留状态并运行 `doctor`，不要手动删除 `$HOME/.git-vws` 中的文件。
+
+`git vws --help` 由 Git 转交给 `man`，首次使用前运行 `git-vws man --install` 安装手册页；在此之前用 `git vws -h`。
+
+仓库被移动、改名或删除后，用 `git vws forget <旧路径>` 注销陈旧记录，再 `git vws init <新路径>`。
 
 ## 支持范围
 
@@ -114,18 +120,18 @@ git vws gc
 
 ## 安装与验证
 
-从 [Releases](https://github.com/Fuxx-1/git-vws/releases) 下载当前平台的归档，使用 `SHA256SUMS` 校验后将其中的 `git-vws` 放到 `PATH`。每个 release 都包含各归档校验和、SPDX 2.3 SBOM、第三方许可证清单、构建元数据和 `PROVENANCE.sigstore.json`。
+从 [Releases](../../releases) 下载当前平台的归档，使用 `SHA256SUMS` 校验后将其中的 `git-vws` 放到 `PATH`。每个 release 都包含各归档校验和、SPDX 2.3 SBOM、第三方许可证清单、构建元数据和 `PROVENANCE.sigstore.json`。
 
 公开仓库使用 GitHub artifact attestation 与公共 Sigstore 服务。用 release notes 中的 source commit 和 signer workflow commit 验证产物：
 
 ```sh
 gh attestation verify '<release-asset>' \
   --bundle PROVENANCE.sigstore.json \
-  --repo Fuxx-1/git-vws \
-  --signer-workflow Fuxx-1/git-vws/.github/workflows/release-sign.yml \
+  --repo '<owner>/git-vws' \
+  --signer-workflow '<owner>/git-vws/.github/workflows/release-sign.yml' \
   --signer-digest '<signer-workflow-commit-from-release-notes>' \
   --source-digest '<source-commit-from-release-notes>' \
-  --source-ref refs/tags/v1.0.3 \
+  --source-ref refs/tags/v1.1.0 \
   --deny-self-hosted-runners
 ```
 

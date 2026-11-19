@@ -55,8 +55,10 @@ COMMAND ORDER
   cache      Capture configured non-Git directories into the shared COW cache.
   publish    Publish committed session work using expected-old fast-forward CAS.
   remove     Safely discard a session; --force permits destructive removal.
+  forget     Unregister an authority whose repository was moved or deleted.
   doctor     Diagnose all registered state without reclaiming anything.
   gc         Reclaim only state that can be proven safe to remove.
+  man        Print a man page generated from this help text.
 
 REPOSITORY SELECTION
   Commands for one authority use --repo <PATH>; without it, the current
@@ -69,17 +71,41 @@ REPOSITORY SELECTION
 EDITING AND PUBLISHING
   After create, edit <printed-session-root>/worktree or use exec. Git sees a
   standard linked worktree, so status, diff, add, commit, checkout, reset,
-  merge, and rebase are ordinary Git commands. publish does not commit for you:
+  merge, and rebase are ordinary Git commands.
+
+  A session has its own private Git directory and does NOT inherit the
+  authority's local config, so user.name and user.email are usually unset
+  there. Set them inside the session before the first commit:
+
+    git vws --repo <repo> exec feature-a -- git config user.name "<name>"
+    git vws --repo <repo> exec feature-a -- git config user.email "<email>"
+
+  Run git vws commands from outside the session worktree. Inside a worktree the
+  directory is a linked worktree, not a sole authority, so commands such as
+  list or publish report AUTHORITY_NOT_SOLE.
+
+  publish does not commit for you:
   commit first, then publish with --repo. Publication never overwrites a target
   changed by another writer; resolve a conflict in the session and retry only
   after the target relation is valid.
 
 OUTPUT AND RECOVERY
   list, doctor, and gc emit NDJSON intended for scripts and agents. Names and
-  paths in list are hex-encoded OS-byte fields. Errors use stable codes such as
+  paths in list are hex-encoded OS-byte fields. Pass --human to any of them for
+  a readable table instead; the NDJSON contract is unchanged without it. Errors
+  use stable codes such as
   SESSION_DISCARD_RISK, PUBLISH_RECOVERY_REQUIRED, and STORAGE_UNSUPPORTED.
   A recovery-required result is fail-closed: stop destructive actions, inspect
   the output with doctor, and preserve the session until the state is resolved.
+  Leases are bounded: a lock held by another command yields STATE_BUSY (state
+  root) or SESSION_BUSY (session root) instead of blocking forever, and
+  list/doctor/gc scans never wait on the state write lease.
+  If you move, rename, or delete a registered repository, run `git vws forget
+  <old-path>` and then `git vws init <new-path>`. forget reclaims sessions that
+  hold no unpublished work and releases the stale registry record. When an
+  orphaned session still holds unpublished commits, forget refuses and explains
+  the two options: restore the repository at its recorded path to publish them,
+  or re-run `git vws forget <old-path> --force` to discard them.
 
 SAFETY RULES
   remove refuses dirty sessions unless --force is explicit. Integrity and
@@ -102,8 +128,16 @@ LICENSE
 
 AI / AUTOMATION ENTRYPOINT
   First run `git vws -h`. Then run `git vws <command> -h` before executing an
-  unfamiliar command. Use list/doctor/gc as machine-readable NDJSON streams,
-  keep the exact session root returned by create, edit only
+  unfamiliar command. Git routes `git vws --help` to `man`, so install the
+  manual page once:
+
+    git-vws man --install
+
+  Until then use `git vws -h`, or invoke the binary directly: `git-vws --help`.
+  The page is generated from this help text, so it cannot drift from the CLI.
+
+  Use list/doctor/gc as machine-readable NDJSON streams, or add --human for a
+  readable table. Keep the exact session root returned by create, edit only
   <session-root>/worktree, and treat any non-zero exit or recovery code as a
   stop signal rather than guessing or deleting state.
 
@@ -115,7 +149,8 @@ struct Cli {
         long,
         global = true,
         value_name = "PATH",
-        help = "Select an existing Git repository; default: current directory"
+        help = "Select an existing Git repository; default: current directory. \
+                Rejected by forget, doctor, gc, and man, which always operate globally"
     )]
     repo: Option<PathBuf>,
 
@@ -237,6 +272,8 @@ SELECTION
             help = "List sessions for every registered authority"
         )]
         all: bool,
+        #[arg(long, help = "Print a readable table instead of NDJSON")]
+        human: bool,
     },
     #[command(
         about = "Run a program inside a session worktree",
@@ -287,14 +324,17 @@ SYNTAX
         after_help = r#"
 WHAT IT DOES
   Captures the configured directories from a clean session into an immutable
-  shared snapshot. The project root reads `.vwscached`, one repository-relative
-  directory per line; blank lines and lines beginning with `#` are ignored.
-  A later session created from the same commit and configuration reuses the
-  snapshot, then receives its own writable copy-on-write directory.
+  shared snapshot. `.vwscached` is read from the authority working tree, one
+  repository-relative directory per line; blank lines and lines beginning with
+  `#` are ignored. The file is snapshotted when the session is created, so a
+  session only has a cache receipt if `.vwscached` was committed before that
+  create. A later session created from the same commit and configuration reuses
+  the snapshot, then receives its own writable copy-on-write directory.
 
 REQUIRED WORKFLOW
-  1. Add paths such as `target/` or `node_modules/` to `.vwscached` in the
-     project root and create or recreate the session.
+  1. Commit `.vwscached` in the authority (paths such as `target/` or
+     `node_modules/`), then create the session. Adding the file later does not
+     retrofit an existing session; create a new one.
   2. Build or otherwise populate those directories in the session.
   3. Ensure the session has no Git changes, then capture it:
      `git vws --repo repo.git cache feature-a`.
@@ -335,8 +375,12 @@ SAFETY AND SCOPE
         after_help = r#"
 DEFAULT BEHAVIOR
   Refuses to remove a READY session when it has tracked, untracked, ignored, or
-  private Git content that could be lost. Stop programs using the worktree
-  first. Removal uses a tombstone transition so an interrupted cleanup can be
+  unpublished private commits that could be lost. These two checks are
+  independent: publishing does not clear uncommitted worktree changes, and
+  committing does not publish. Both must be resolved before removal succeeds.
+  `list --human` reports which check blocks removal. Stop programs using the
+  worktree first.
+  Removal uses a tombstone transition so an interrupted cleanup can be
   diagnosed and completed by gc.
 
 EXAMPLES
@@ -371,6 +415,8 @@ OUTPUT
         name_hex: Option<String>,
         #[arg(long, help = "Allow destructive removal of session content")]
         force: bool,
+        #[arg(long, help = "Print a readable result instead of a JSON event")]
+        human: bool,
     },
     #[command(
         about = "Publish committed session work with Git CAS",
@@ -394,9 +440,15 @@ EXAMPLES
 CONFLICTS AND RECOVERY
   New-target, same-tip, and fast-forward publication are supported. If another
   writer changes the target first, publish exits non-zero and never overwrites
-  that update; rebase or merge in the session, then retry. A
-  PUBLISH_RECOVERY_REQUIRED result means a CAS outcome is not safely replayable:
-  stop publishing and inspect the state with doctor before taking action.
+  that update. A session has no remote by default, so rebasing needs the
+  authority added explicitly. Run these inside the session, then publish again:
+
+    git remote add authority <authority-path>
+    git fetch authority
+    git rebase authority/<target>
+
+  A PUBLISH_RECOVERY_REQUIRED result means a CAS outcome is not safely
+  replayable: stop publishing and inspect the state with doctor before acting.
 
 NOTE
   publish does not create a commit and does not publish uncommitted edits.
@@ -430,12 +482,64 @@ EXAMPLES
   git vws doctor | jq -c .
 
 EXIT STATUS
-  A recovery finding produces DOCTOR_RECOVERY_REQUIRED. Preserve affected
-  state and use the emitted scope, path_hex, and code to decide the next
-  operation. This command operates globally; --repo is rejected.
+  A recovery finding produces DOCTOR_RECOVERY_REQUIRED. Preserve affected state
+  and use the emitted scope, path_hex, and code to decide the next operation.
+
+  The usual cause is a repository that was moved, renamed, or deleted while it
+  was registered. For those findings path_hex holds the recorded repository
+  path (not a record name), and --human prints the exact repair commands:
+
+    git vws forget <recorded-path>
+    git vws init <new-path>
+
+  This command operates globally; --repo is rejected.
 "#
     )]
-    Doctor,
+    Doctor {
+        #[arg(long, help = "Print a readable summary instead of NDJSON")]
+        human: bool,
+    },
+    #[command(
+        about = "Forget a registered authority whose repository is gone",
+        after_help = r#"
+WHAT IT DOES
+  Removes the registry record for PATH when the recorded repository identity no
+  longer matches reality: the path is gone, or the repository still exists but
+  its device or inode changed (for example after a volume was remounted or the
+  directory was moved). Use it after you move, rename, or delete a registered
+  repository, so the path can be registered again and doctor stops reporting the
+  stale record. Sessions under that authority that hold no unpublished work are
+  reclaimed at the same time.
+
+REFUSALS
+  forget refuses while the authority still exists and validates, and refuses
+  while it still has managed sessions. Remove those sessions first; this command
+  never deletes session data.
+
+EXAMPLES
+  git vws doctor
+  git vws forget /path/to/old/repository.git
+  git vws init /path/to/new/repository.git
+
+SAFETY
+  Only the registry record is unlinked while sessions hold no unpublished work.
+  When an orphaned session still holds unpublished commits, forget refuses and
+  names both options: restore the repository at its recorded path to publish
+  them, or add --force to discard them.
+"#
+    )]
+    Forget {
+        #[arg(
+            value_name = "PATH",
+            help = "Registered repository path whose record should be forgotten"
+        )]
+        repository_path: PathBuf,
+        #[arg(
+            long,
+            help = "Also discard orphaned sessions whose commits were never published"
+        )]
+        force: bool,
+    },
     #[command(
         about = "Reclaim only provably safe global state",
         after_help = r#"
@@ -457,7 +561,35 @@ SAFETY
   gc. This command operates globally; --repo is rejected.
 "#
     )]
-    Gc,
+    Gc {
+        #[arg(long, help = "Print a readable summary instead of NDJSON")]
+        human: bool,
+    },
+    #[command(
+        about = "Print a man page for this extension",
+        after_help = r#"
+WHAT IT DOES
+  Writes a roff man page to stdout, generated from this binary's own help text
+  so the manual can never drift from the CLI. Git routes `git vws --help` to
+  `man`, which fails when no page is installed; installing the generated page
+  makes that command work.
+
+EXAMPLES
+  git-vws man --install      # install into ~/.local/share/man/man1
+  git vws --help             # now resolves through man
+  git-vws man > git-vws.1    # or capture the page for packaging
+
+  The page is generated from the same definitions as `git vws -h`, so it needs
+  no separate maintenance.
+"#
+    )]
+    Man {
+        #[arg(
+            long,
+            help = "Install the page into the user man directory instead of printing it"
+        )]
+        install: bool,
+    },
 }
 
 enum CommandOutput {
@@ -475,7 +607,16 @@ fn main() -> ExitCode {
     let Cli { repo, command } = Cli::parse();
     let result = match command {
         Command::Init { repository_path } => {
-            authority::init(&repository_path).map(CommandOutput::Text)
+            // init takes the repository as a positional argument, so a global
+            // --repo would silently be ignored. Refuse it instead of guessing.
+            if repo.is_some() {
+                Err(authority::Error::new(
+                    "SESSION_USAGE",
+                    "init takes the repository as an argument, not --repo; run `git vws init <path>`",
+                ))
+            } else {
+                authority::init(&repository_path).map(CommandOutput::Text)
+            }
         }
         Command::Create {
             name,
@@ -494,10 +635,20 @@ fn main() -> ExitCode {
                         path,
                     },
                 )
-                .map(|root| CommandOutput::Text(format!("created session {}", root.display())))
+                .map(|outcome| {
+                    CommandOutput::Text(match outcome {
+                        session::CreateOutcome::Created(root) => {
+                            format!("created session {}", root.display())
+                        }
+                        session::CreateOutcome::Reused(root) => format!(
+                            "session already exists at {} with identical create inputs; nothing changed",
+                            root.display()
+                        ),
+                    })
+                })
             })
         }
-        Command::List { all } => {
+        Command::List { all, human } => {
             let repository = if all && repo.is_some() {
                 Err(authority::Error::new(
                     "SESSION_USAGE",
@@ -509,7 +660,7 @@ fn main() -> ExitCode {
                 repository(repo).map(Some)
             };
             repository
-                .and_then(|repository| session::list(repository.as_deref(), all))
+                .and_then(|repository| session::list(repository.as_deref(), all, human))
                 .map(|_| CommandOutput::Silent)
         }
         Command::Exec {
@@ -526,14 +677,31 @@ fn main() -> ExitCode {
             name,
             name_hex,
             force,
+            human,
         } => repository(repo)
-            .and_then(|repository| session::remove(&repository, name, name_hex, force))
+            .and_then(|repository| session::remove(&repository, name, name_hex, force, human))
             .map(CommandOutput::Text),
         Command::Publish { name, name_hex } => repository(repo)
             .and_then(|repository| session::publish(&repository, name, name_hex))
             .map(CommandOutput::Text),
-        Command::Doctor => global_maintenance(repo, session::doctor),
-        Command::Gc => global_maintenance(repo, session::gc),
+        Command::Forget {
+            repository_path,
+            force,
+        } => authority::forget(&repository_path, force).map(CommandOutput::Text),
+        Command::Doctor { human } => global_maintenance(repo, || session::doctor(human)),
+        Command::Gc { human } => global_maintenance(repo, || session::gc(human)),
+        Command::Man { install } => {
+            if repo.is_some() {
+                Err(authority::Error::new(
+                    "SESSION_USAGE",
+                    "man does not accept --repo",
+                ))
+            } else if install {
+                install_man_page().map(CommandOutput::Text)
+            } else {
+                Ok(CommandOutput::Text(render_man_page()))
+            }
+        }
     };
     match result {
         Ok(CommandOutput::Text(message)) => {
@@ -551,9 +719,80 @@ fn main() -> ExitCode {
     }
 }
 
+/// Render a roff man page from this binary's own help text, so the manual and
+/// the CLI can never disagree.
+/// Install the generated page where `man` will find it, so `git vws --help`
+/// works. Git routes that form to man; without a page it fails with a message
+/// that does not explain how to fix it.
+fn install_man_page() -> Result<String, authority::Error> {
+    let home = env::var_os("HOME")
+        .ok_or_else(|| authority::Error::new("STATE_UNAVAILABLE", "HOME is not set"))?;
+    let directory = PathBuf::from(home)
+        .join(".local")
+        .join("share")
+        .join("man")
+        .join("man1");
+    std::fs::create_dir_all(&directory).map_err(|error| {
+        authority::Error::io(
+            "STATE_UNAVAILABLE",
+            "cannot create the man directory",
+            error,
+        )
+    })?;
+    let target = directory.join("git-vws.1");
+    std::fs::write(&target, render_man_page()).map_err(|error| {
+        authority::Error::io("STATE_UNAVAILABLE", "cannot write the man page", error)
+    })?;
+    Ok(format!(
+        "installed {}\nrun `man git-vws` or `git vws --help` to read it",
+        target.display()
+    ))
+}
+
+fn render_man_page() -> String {
+    use clap::CommandFactory;
+    let mut command = Cli::command();
+    let help = command.render_long_help().to_string();
+    let version = env!("CARGO_PKG_VERSION");
+    let mut page = String::new();
+    page.push_str(".TH GIT-VWS 1 \"2026-11-19\" \"git-vws ");
+    page.push_str(version);
+    page.push_str("\" \"Git Manual\"\n");
+    page.push_str(".SH NAME\n");
+    page.push_str("git-vws \\- native copy-on-write Git worktrees with isolated Git state\n");
+    page.push_str(".SH SYNOPSIS\n");
+    page.push_str(".B git vws\n[\\-\\-repo <path>] <command> [<args>]\n");
+    page.push_str(".SH DESCRIPTION\n");
+    for line in help.lines() {
+        page.push_str(&roff_line(line));
+        page.push('\n');
+    }
+    page.push_str(".SH SEE ALSO\n");
+    page.push_str(".BR git (1)\n");
+    page
+}
+
+fn roff_line(line: &str) -> String {
+    let trimmed = line.trim_end();
+    if trimmed.is_empty() {
+        return ".PP".to_owned();
+    }
+    // Escape the characters roff treats as control characters, then protect
+    // leading dots so help text cannot inject a macro.
+    let escaped = trimmed
+        .replace('\\', "\\\\")
+        .replace('-', "\\-")
+        .replace('\'', "\\'");
+    if escaped.starts_with('.') || escaped.starts_with('\'') {
+        format!(".br\n\\&{escaped}")
+    } else {
+        escaped
+    }
+}
+
 fn global_maintenance(
     repository: Option<PathBuf>,
-    command: fn() -> Result<(), authority::Error>,
+    command: impl FnOnce() -> Result<(), authority::Error>,
 ) -> Result<CommandOutput, authority::Error> {
     if repository.is_some() {
         return Err(authority::Error::new(
@@ -643,7 +882,8 @@ mod tests {
     #[test]
     fn every_public_subcommand_has_reference_help_and_examples() {
         for name in [
-            "init", "create", "list", "exec", "remove", "publish", "doctor", "gc", "cache",
+            "init", "create", "list", "exec", "remove", "publish", "forget", "doctor", "gc", "man",
+            "cache",
         ] {
             let help = rendered_help(Some(name));
             assert!(
@@ -658,6 +898,34 @@ mod tests {
                 help.lines().count() >= 14,
                 "{name} help regressed to a parameter-only summary"
             );
+        }
+    }
+
+    #[test]
+    fn generated_man_page_covers_the_cli_and_is_valid_roff() {
+        let page = super::render_man_page();
+        for required in [
+            ".TH GIT-VWS 1",
+            ".SH NAME",
+            ".SH SYNOPSIS",
+            ".SH DESCRIPTION",
+            ".SH SEE ALSO",
+            "git\\-vws",
+            "QUICK START",
+            "SAFETY RULES",
+        ] {
+            assert!(page.contains(required), "man page omitted {required:?}");
+        }
+        // No line may begin with an unescaped control character, and every
+        // macro line must be a known section or font directive.
+        for line in page.lines() {
+            if let Some(rest) = line.strip_prefix('.') {
+                let macro_name = rest.split_whitespace().next().unwrap_or("");
+                assert!(
+                    matches!(macro_name, "TH" | "SH" | "PP" | "br" | "B" | "BR"),
+                    "man page emitted an unexpected macro: {line:?}"
+                );
+            }
         }
     }
 

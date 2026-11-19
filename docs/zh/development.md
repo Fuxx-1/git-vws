@@ -48,9 +48,9 @@ CI 在 Linux 上运行格式化、编译、Clippy 和测试，随后在原生 ru
 
 发布版本必须同时存在于 Cargo.toml 和 Cargo.lock。发布 tag 必须是 annotated semantic-version tag，与 package 版本一致，并且指向 main push CI 成功的精确 commit。tag annotation 记录 source commit 和发布前 CI run 身份。
 
-    git tag -a v1.0.3 -m "git-vws v1.0.3"
+    git tag -a v1.1.0 -m "git-vws v1.1.0"
     git push origin main
-    git push origin v1.0.3
+    git push origin v1.1.0
 
 GitHub Actions 会生成确定性归档、SHA256SUMS、SPDX 2.3 SBOM、第三方许可证清单、构建元数据和公共 Sigstore provenance bundle。source commit 的完整 CI 通过前不要推送 tag。
 

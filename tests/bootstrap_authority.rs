@@ -711,6 +711,23 @@ fn assert_preserved_collision(
     );
 }
 
+fn forget_command(home: &Path, authority: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_git-vws"));
+    command.arg("forget").arg(authority).env("HOME", home);
+    for name in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_CONFIG_COUNT",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
 fn assert_duplicate_reopen(home: &Path, authority: &Path, root: &Path) {
     let before = snapshot(root);
     let output = init(home, authority);
@@ -917,6 +934,124 @@ fn common_desktop_metadata_is_ignored_but_unsafe_shapes_fail_closed() {
 }
 
 #[test]
+fn forget_releases_a_registry_record_for_a_moved_repository() {
+    let mut sandbox = Sandbox::new();
+    let shared_home = home(&sandbox, "forget-home");
+    let authority = bare(&sandbox, "authority.git");
+    let output = init(&shared_home, &authority);
+    assert!(
+        output.status.success(),
+        "init for forget fixture: {output:?}"
+    );
+
+    // Move the repository, which is a normal developer action.
+    let moved = sandbox.path("authority-moved.git");
+    fs::rename(&authority, &moved).expect("move authority");
+
+    let stale = init(&shared_home, &moved);
+    assert!(
+        !stale.status.success(),
+        "init accepted a moved authority under its new path: {stale:?}"
+    );
+
+    let forgotten = forget_command(&shared_home, &authority)
+        .output()
+        .expect("run forget");
+    assert!(
+        forgotten.status.success(),
+        "forget rejected a moved repository: {forgotten:?}"
+    );
+
+    let reinitialized = init(&shared_home, &moved);
+    assert!(
+        reinitialized.status.success(),
+        "init still rejected the moved repository after forget: {reinitialized:?}"
+    );
+    sandbox.cleanup().expect("cleanup forget sandbox");
+}
+
+#[test]
+fn forget_releases_a_record_whose_identity_drifted() {
+    let mut sandbox = Sandbox::new();
+    let shared_home = home(&sandbox, "drift-home");
+    let authority = bare(&sandbox, "authority.git");
+    let output = init(&shared_home, &authority);
+    assert!(
+        output.status.success(),
+        "init for drift fixture: {output:?}"
+    );
+
+    // Rewrite the recorded device number to simulate a volume that was
+    // remounted or migrated while the repository itself stayed in place.
+    let record = fs::read_dir(shared_home.join(".git-vws"))
+        .expect("read state root")
+        .map(|entry| entry.expect("read state entry").path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "record"))
+        .expect("find authority record");
+    let bytes = fs::read(&record).expect("read authority record");
+    let text = String::from_utf8(bytes).expect("authority record is UTF-8");
+    let mut rewritten = String::new();
+    for line in text.lines() {
+        if let Some(dev) = line.strip_prefix("dev=") {
+            let value: u64 = dev.parse().expect("device number is numeric");
+            rewritten.push_str(&format!("dev={}\n", value.wrapping_add(1)));
+        } else {
+            rewritten.push_str(line);
+            rewritten.push('\n');
+        }
+    }
+    fs::write(&record, rewritten.as_bytes()).expect("rewrite authority record");
+
+    let stale = init(&shared_home, &authority);
+    assert!(
+        !stale.status.success(),
+        "init accepted a drifted record: {stale:?}"
+    );
+
+    let forgotten = forget_command(&shared_home, &authority)
+        .output()
+        .expect("run forget on a drifted record");
+    assert!(
+        forgotten.status.success(),
+        "forget rejected a drifted record: {forgotten:?}"
+    );
+
+    let reinitialized = init(&shared_home, &authority);
+    assert!(
+        reinitialized.status.success(),
+        "init still rejected the authority after forget: {reinitialized:?}"
+    );
+    sandbox.cleanup().expect("cleanup drift sandbox");
+}
+
+#[test]
+fn forget_refuses_a_live_authority() {
+    let mut sandbox = Sandbox::new();
+    let shared_home = home(&sandbox, "live-home");
+    let authority = bare(&sandbox, "authority.git");
+    let output = init(&shared_home, &authority);
+    assert!(output.status.success(), "init for live fixture: {output:?}");
+    let before = snapshot(&shared_home);
+    let refused = forget_command(&shared_home, &authority)
+        .output()
+        .expect("run forget on a live authority");
+    assert!(
+        !refused.status.success(),
+        "forget removed a live authority record: {refused:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("AUTHORITY_IN_USE"),
+        "unexpected live forget error: {refused:?}"
+    );
+    assert_eq!(
+        snapshot(&shared_home),
+        before,
+        "refused forget changed the state root"
+    );
+    sandbox.cleanup().expect("cleanup live sandbox");
+}
+
+#[test]
 fn state_symlink_and_concurrent_init_do_not_create_two_truths() {
     let mut sandbox = Sandbox::new();
     let authority = bare(&sandbox, "authority.git");
@@ -937,12 +1072,19 @@ fn state_symlink_and_concurrent_init_do_not_create_two_truths() {
     );
     assert_eq!(snapshot(&home_target), before_home_target);
 
+    // An empty state root is the normal residue of forgetting the last
+    // authority record, so init must be able to register into it again rather
+    // than forcing the user to delete files by hand.
     let empty_home = home(&sandbox, "empty-home");
     let empty_root = empty_home.join(".git-vws");
     fs::create_dir(&empty_root).expect("empty state root");
     fs::set_permissions(&empty_root, fs::Permissions::from_mode(0o700))
         .expect("protect empty state root");
-    assert_rejected(&empty_home, &authority);
+    let registered = init(&empty_home, &authority);
+    assert!(
+        registered.status.success(),
+        "init refused an empty state root: {registered:?}"
+    );
 
     let mode_home = home(&sandbox, "mode-home");
     let mode_root = mode_home.join(".git-vws");

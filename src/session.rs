@@ -35,6 +35,11 @@ const REGULAR_TYPE: u32 = libc::S_IFREG as u32;
 #[cfg(target_os = "macos")]
 const SYMLINK_TYPE: u32 = libc::S_IFLNK as u32;
 
+pub(crate) enum CreateOutcome {
+    Created(PathBuf),
+    Reused(PathBuf),
+}
+
 pub(crate) struct CreateRequest {
     pub(crate) name: OsString,
     pub(crate) from: Option<OsString>,
@@ -196,11 +201,23 @@ struct ListRecord {
     authority_path_hex: String,
     authority_identity: Identity,
     name_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     state: &'static str,
     publish_state: &'static str,
     base: String,
     target_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
     managed_path_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    managed_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worktree_path: Option<String>,
+    /// Whether `remove` would accept this session without `--force`.
+    removable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remove_blocker: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -321,7 +338,7 @@ fn maintenance_context(
     })
 }
 
-pub(crate) fn list(repository: Option<&Path>, all: bool) -> Result<(), Error> {
+pub(crate) fn list(repository: Option<&Path>, all: bool, human: bool) -> Result<(), Error> {
     if all && repository.is_some() {
         return Err(Error::new(
             "SESSION_USAGE",
@@ -423,7 +440,14 @@ pub(crate) fn list(repository: Option<&Path>, all: bool) -> Result<(), Error> {
             ));
             continue;
         }
-        healthy.push(list_record(&capability.record, &sessions_path));
+        let (removable, blocker) =
+            list_removability(&sessions, &sessions_path, &runtime_authority, &capability);
+        healthy.push(list_record(
+            &capability.record,
+            &sessions_path,
+            removable,
+            blocker,
+        ));
     }
     healthy.sort_by(|left, right| {
         left.authority_path_hex
@@ -463,6 +487,9 @@ pub(crate) fn list(repository: Option<&Path>, all: bool) -> Result<(), Error> {
     corrupt.sort_by(|left, right| left.0.cmp(&right.0));
     let stdout = io::stdout();
     let mut output = io::BufWriter::new(stdout.lock());
+    if human {
+        return write_list_human(healthy, corrupt, &mut output);
+    }
     for record in healthy {
         serde_json::to_writer(&mut output, &record).map_err(|error| {
             Error::new(
@@ -500,37 +527,91 @@ pub(crate) fn list(repository: Option<&Path>, all: bool) -> Result<(), Error> {
     }
 }
 
-pub(crate) fn doctor() -> Result<(), Error> {
-    maintain(false)
+fn write_list_human(
+    healthy: Vec<ListRecord>,
+    corrupt: Vec<(Vec<u8>, CorruptRecord)>,
+    output: &mut io::BufWriter<io::StdoutLock<'_>>,
+) -> Result<(), Error> {
+    if healthy.is_empty() && corrupt.is_empty() {
+        writeln!(output, "no sessions")
+            .map_err(|error| Error::io("SESSION_IO_FAILED", "cannot write listing", error))?;
+    }
+    for record in &healthy {
+        let name = record.name.as_deref().unwrap_or(&record.name_hex);
+        let target = record.target.as_deref().unwrap_or(&record.target_hex);
+        let removable = if record.removable {
+            "removable".to_owned()
+        } else {
+            format!(
+                "blocked:{}",
+                record.remove_blocker.unwrap_or("DISCARD_RISK")
+            )
+        };
+        writeln!(
+            output,
+            "{name:<20} {state:<10} {publish:<12} -> {target:<24} {removable}",
+            state = record.state,
+            publish = record.publish_state,
+        )
+        .map_err(|error| Error::io("SESSION_IO_FAILED", "cannot write listing", error))?;
+        if let Some(path) = &record.worktree_path {
+            writeln!(output, "{:<20} {path}", "")
+                .map_err(|error| Error::io("SESSION_IO_FAILED", "cannot write listing", error))?;
+        }
+    }
+    for (name, _) in &corrupt {
+        writeln!(
+            output,
+            "{:<20} CORRUPT    record {}",
+            "",
+            String::from_utf8_lossy(name)
+        )
+        .map_err(|error| Error::io("SESSION_IO_FAILED", "cannot write listing", error))?;
+    }
+    output
+        .flush()
+        .map_err(|error| Error::io("SESSION_IO_FAILED", "cannot flush session listing", error))?;
+    if corrupt.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "SESSION_CORRUPT",
+            "one or more session records could not be trusted",
+        ))
+    }
 }
 
-pub(crate) fn gc() -> Result<(), Error> {
-    maintain(true)
+pub(crate) fn doctor(human: bool) -> Result<(), Error> {
+    maintain(false, human)
 }
 
-fn maintain(cleanup: bool) -> Result<(), Error> {
+pub(crate) fn gc(human: bool) -> Result<(), Error> {
+    maintain(true, human)
+}
+
+fn maintain(cleanup: bool, human: bool) -> Result<(), Error> {
     let mut report = MaintenanceReport::default();
     let state = match authority::open_existing_state() {
         Ok(state) => state,
         Err(error)
             if error.code == "STATE_UNAVAILABLE" && error.detail == "state root does not exist" =>
         {
-            return finish_maintenance(report, cleanup);
+            return finish_maintenance(report, cleanup, human);
         }
         Err(_) => {
             report.recovery("state", b"", b"", "CORRUPT");
-            return finish_maintenance(report, cleanup);
+            return finish_maintenance(report, cleanup, human);
         }
     };
     if !scan_state_root(&state, &mut report) {
-        return finish_maintenance(report, cleanup);
+        return finish_maintenance(report, cleanup, human);
     }
     let templates = maintenance_container(&state, b"templates", &mut report);
     let sessions = maintenance_container(&state, b"sessions", &mut report);
     let caches = maintenance_container(&state, b"caches", &mut report);
     let (Some(templates), Some(sessions)) = (templates.as_ref(), sessions.as_ref()) else {
         if templates.is_none() && sessions.is_none() {
-            return finish_maintenance(report, cleanup);
+            return finish_maintenance(report, cleanup, human);
         }
         if templates.is_none() {
             report.recovery("state", b"", b"templates", "ABSENT");
@@ -538,20 +619,20 @@ fn maintain(cleanup: bool) -> Result<(), Error> {
         if sessions.is_none() {
             report.recovery("state", b"", b"sessions", "ABSENT");
         }
-        return finish_maintenance(report, cleanup);
+        return finish_maintenance(report, cleanup, human);
     };
     let sessions_path = match state.container_path("sessions") {
         Ok(path) => path,
         Err(_) => {
             report.recovery("state", b"", b"sessions", "CORRUPT");
-            return finish_maintenance(report, cleanup);
+            return finish_maintenance(report, cleanup, human);
         }
     };
     let mut census = match session_census(templates, sessions, &sessions_path, !cleanup) {
         Ok(census) => census,
         Err(_) => {
             report.recovery("session", b"", b"", "CORRUPT");
-            return finish_maintenance(report, cleanup);
+            return finish_maintenance(report, cleanup, human);
         }
     };
     let session_safe = !census.report.recovery_required;
@@ -562,7 +643,7 @@ fn maintain(cleanup: bool) -> Result<(), Error> {
         Ok(template_report) => template_report,
         Err(_) => {
             report.recovery("template", b"", b"", "CORRUPT");
-            return finish_maintenance(report, cleanup);
+            return finish_maintenance(report, cleanup, human);
         }
     };
     let template_safe = !template_report.recovery_required;
@@ -589,7 +670,7 @@ fn maintain(cleanup: bool) -> Result<(), Error> {
         merge_maintenance(&mut report, &mut cache_report);
     }
     if !cleanup || !session_safe || !template_safe || !cache_safe || report.recovery_required {
-        return finish_maintenance(report, cleanup);
+        return finish_maintenance(report, cleanup, human);
     }
     let mut template_report = match template::gc(templates, || {
         let census = session_census(templates, sessions, &sessions_path, false)?;
@@ -605,24 +686,24 @@ fn maintain(cleanup: bool) -> Result<(), Error> {
         Ok(template_report) => template_report,
         Err(_) => {
             report.recovery("template", b"", b"", "CORRUPT");
-            return finish_maintenance(report, cleanup);
+            return finish_maintenance(report, cleanup, human);
         }
     };
     merge_maintenance(&mut report, &mut template_report);
     if report.recovery_required {
-        return finish_maintenance(report, cleanup);
+        return finish_maintenance(report, cleanup, human);
     }
     let mut session_report = gc_sessions(sessions, &sessions_path, &census);
     merge_maintenance(&mut report, &mut session_report);
     if report.recovery_required {
-        return finish_maintenance(report, cleanup);
+        return finish_maintenance(report, cleanup, human);
     }
     if let Some(caches) = caches.as_ref() {
         let after = match session_census(templates, sessions, &sessions_path, false) {
             Ok(census) if !census.report.recovery_required => census,
             _ => {
                 report.recovery("cache", b"", b"", "SESSION_CENSUS");
-                return finish_maintenance(report, cleanup);
+                return finish_maintenance(report, cleanup, human);
             }
         };
         match cache::maintenance(
@@ -635,7 +716,7 @@ fn maintain(cleanup: bool) -> Result<(), Error> {
             Err(_) => report.recovery("cache", b"", b"", "GC"),
         }
     }
-    finish_maintenance(report, cleanup)
+    finish_maintenance(report, cleanup, human)
 }
 
 fn maintenance_container(
@@ -660,10 +741,16 @@ fn scan_state_root(state: &StateRoot, report: &mut MaintenanceReport) -> bool {
             return false;
         }
     };
+    if names.is_empty() {
+        return true;
+    }
     let mut safe = true;
     let mut authority_records = 0_usize;
+    let mut containers = 0_usize;
+    let all_names = names.clone();
     for name in names {
         if name == b"templates" || name == b"sessions" || name == b"caches" {
+            containers += 1;
             continue;
         }
         match authority::is_ignorable_system_metadata(state.root_fd(), &name) {
@@ -679,7 +766,16 @@ fn scan_state_root(state: &StateRoot, report: &mut MaintenanceReport) -> bool {
             match authority::validate_authority_record(state, &name) {
                 Ok(()) => authority_records += 1,
                 Err(_) => {
-                    report.recovery("state", &name, &name, "CORRUPT");
+                    // Report the recorded repository path rather than the
+                    // record filename: it is what the user needs in order to
+                    // run `git vws forget <path>`.
+                    let path = authority::recorded_authority_path(state, &name);
+                    match path {
+                        Some(path) => {
+                            report.recovery("state", &name, path.as_os_str().as_bytes(), "CORRUPT")
+                        }
+                        None => report.recovery("state", &name, &name, "CORRUPT"),
+                    }
                     safe = false;
                 }
             }
@@ -688,11 +784,38 @@ fn scan_state_root(state: &StateRoot, report: &mut MaintenanceReport) -> bool {
         report.recovery("state", &name, &name, "UNKNOWN");
         safe = false;
     }
-    if authority_records == 0 {
+    // Containers left behind by forgetting the last authority are harmless as
+    // long as they hold nothing: that is an empty registry, not corruption.
+    // Only retain a finding when managed state survives without an authority
+    // that could explain it.
+    if authority_records == 0 && containers != 0 && containers_hold_state(state, &all_names) {
         report.recovery("state", b"", b"", "AUTHORITY");
         safe = false;
     }
     safe
+}
+
+fn containers_hold_state(state: &StateRoot, names: &[Vec<u8>]) -> bool {
+    for name in names {
+        let Ok(raw) = cstring(name, "state container") else {
+            return true;
+        };
+        let Ok(directory) = storage::open_directory_at(state.root_fd(), &raw) else {
+            return true;
+        };
+        match storage::directory_names(directory.as_raw_fd()) {
+            Ok(children) => {
+                if children.iter().any(|child| {
+                    !authority::is_ignorable_system_metadata(directory.as_raw_fd(), child)
+                        .unwrap_or(false)
+                }) {
+                    return true;
+                }
+            }
+            Err(_) => return true,
+        }
+    }
+    false
 }
 
 fn merge_maintenance(report: &mut MaintenanceReport, other: &mut MaintenanceReport) {
@@ -700,14 +823,18 @@ fn merge_maintenance(report: &mut MaintenanceReport, other: &mut MaintenanceRepo
     report.entries.append(&mut other.entries);
 }
 
-fn finish_maintenance(mut report: MaintenanceReport, cleanup: bool) -> Result<(), Error> {
+fn finish_maintenance(
+    mut report: MaintenanceReport,
+    cleanup: bool,
+    human: bool,
+) -> Result<(), Error> {
     if cleanup && !report.recovery_required {
         #[cfg(git_vws_m4_checkpoint)]
         if crate::m4_checkpoint::checkpoint("gc", "-", "-", "return").is_err() {
             report.recovery("gc", b"", b"", "RETURN");
         }
     }
-    write_maintenance(&mut report)?;
+    write_maintenance(&mut report, human)?;
     if report.recovery_required {
         Err(Error::new(
             if cleanup {
@@ -715,14 +842,91 @@ fn finish_maintenance(mut report: MaintenanceReport, cleanup: bool) -> Result<()
             } else {
                 "DOCTOR_RECOVERY_REQUIRED"
             },
-            "maintenance found state that cannot be safely reclaimed",
+            if cleanup {
+                "some state cannot be reclaimed automatically; run `git vws doctor` to see each finding, keep the state intact, and do not delete files by hand"
+            } else {
+                "some managed state cannot be verified; keep it intact and resolve the findings below before running destructive commands"
+            },
         ))
     } else {
         Ok(())
     }
 }
 
-fn write_maintenance(report: &mut MaintenanceReport) -> Result<(), Error> {
+fn write_maintenance_human(
+    report: &MaintenanceReport,
+    output: &mut io::BufWriter<io::StdoutLock<'_>>,
+) -> Result<(), Error> {
+    let mut findings = 0_usize;
+    for entry in &report.entries {
+        if entry.code == "RECOVERY_REQUIRED" {
+            findings += 1;
+            let name = String::from_utf8_lossy(&entry.path_name);
+            let name = if name.is_empty() {
+                String::from_utf8_lossy(&entry.record_name).into_owned()
+            } else {
+                name.into_owned()
+            };
+            writeln!(output, "FINDING  {} {name} [{}]", entry.scope, entry.state).map_err(
+                |error| {
+                    Error::io(
+                        "SESSION_IO_FAILED",
+                        "cannot write maintenance finding",
+                        error,
+                    )
+                },
+            )?;
+            // A stale authority record is the common case; print the exact
+            // commands instead of making the user decode hex themselves.
+            if entry.path_name.starts_with(b"/") {
+                writeln!(
+                    output,
+                    "         fix: git vws forget {name}   then   git vws init <new-path>"
+                )
+                .map_err(|error| {
+                    Error::io("SESSION_IO_FAILED", "cannot write maintenance hint", error)
+                })?;
+            }
+        } else {
+            writeln!(
+                output,
+                "ok       {} {} {}",
+                entry.scope,
+                String::from_utf8_lossy(&entry.record_name),
+                entry.code
+            )
+            .map_err(|error| {
+                Error::io("SESSION_IO_FAILED", "cannot write maintenance item", error)
+            })?;
+        }
+    }
+    writeln!(
+        output,
+        "\n{} finding(s); {}",
+        findings,
+        if report.recovery_required {
+            "run `git vws doctor` for details"
+        } else {
+            "state is healthy"
+        }
+    )
+    .map_err(|error| {
+        Error::io(
+            "SESSION_IO_FAILED",
+            "cannot write maintenance summary",
+            error,
+        )
+    })?;
+    output.flush().map_err(|error| {
+        Error::io(
+            "SESSION_IO_FAILED",
+            "cannot flush maintenance output",
+            error,
+        )
+    })
+}
+
+fn write_maintenance(report: &mut MaintenanceReport, human: bool) -> Result<(), Error> {
     report.entries.sort_by(|left, right| {
         left.scope
             .cmp(right.scope)
@@ -735,6 +939,9 @@ fn write_maintenance(report: &mut MaintenanceReport) -> Result<(), Error> {
     let mut output = io::BufWriter::new(stdout.lock());
     let mut items = 0_usize;
     let mut findings = 0_usize;
+    if human {
+        return write_maintenance_human(report, &mut output);
+    }
     for entry in &report.entries {
         let item = entry.code != "RECOVERY_REQUIRED";
         if item {
@@ -864,7 +1071,7 @@ pub(crate) fn cache(
     let receipt = capability.record.cached.clone().ok_or_else(|| {
         Error::new(
             "CACHE_CONFIG_ABSENT",
-            "the session was created without a .vwscached configuration",
+            "this session was created when the authority had no .vwscached file, so it has no cache receipt;              commit .vwscached in the authority, then create a new session and run cache on it",
         )
     })?;
     status_clean(&ready.worktree_path, GIT_TIMEOUT)?;
@@ -953,7 +1160,7 @@ pub(crate) fn publish(
                 #[cfg(git_vws_m4_checkpoint)]
                 publish_checkpoint(&capability.record.sid, &txid, "same-return")
                     .map_err(publish_recovery)?;
-                return Ok(publish_success(&capability.record, &new));
+                return Ok(publish_success(&capability.record, &new, Some(&new)));
             }
             ensure_publish_target_unchecked_out(&context.authority, &target)?;
             ensure_authority_expected_old(&context.authority, &target, expected_old.as_deref())?;
@@ -1093,16 +1300,29 @@ fn finalize_committed_publish(
     capability: RecordCapability,
     target: &OsStr,
 ) -> Result<String, Error> {
-    let (txid, new, _, _) = frozen_publish_fields(&context.authority, &capability.record, target)?;
+    let (txid, new, expected_old, _) =
+        frozen_publish_fields(&context.authority, &capability.record, target)?;
     let record = finish_publish_journal(&context.sessions, &capability, &txid, Some(new.clone()))
         .map_err(publish_committed_recovery)?;
     #[cfg(git_vws_m4_checkpoint)]
     publish_checkpoint(&record.record.sid, &txid, "return").map_err(publish_committed_recovery)?;
-    Ok(publish_success(&record.record, &new))
+    Ok(publish_success(
+        &record.record,
+        &new,
+        expected_old.as_deref(),
+    ))
 }
 
-fn publish_success(record: &SessionRecord, new: &str) -> String {
-    format!("published {} {new}", record.target)
+fn publish_success(record: &SessionRecord, new: &str, previous: Option<&str>) -> String {
+    let target = decode_hex(&record.target)
+        .ok()
+        .and_then(utf8)
+        .unwrap_or_else(|| record.target.clone());
+    if previous == Some(new) {
+        format!("{target} was already at {new}; nothing to publish")
+    } else {
+        format!("published {target} {new}")
+    }
 }
 
 pub(crate) fn remove(
@@ -1110,11 +1330,12 @@ pub(crate) fn remove(
     raw_name: Option<OsString>,
     name_hex: Option<String>,
     force: bool,
+    human: bool,
 ) -> Result<String, Error> {
     let name = selected_name(raw_name, name_hex)?;
     let (authority, sessions) = optional_session_context(repository)?;
     let Some((sessions, sessions_path)) = sessions else {
-        return remove_event(&authority, &name);
+        return remove_event(&authority, &name, false, human);
     };
     let context = SessionContext {
         authority,
@@ -1132,7 +1353,7 @@ pub(crate) fn remove(
                     "session record is absent while a managed root remains",
                 ));
             }
-            return remove_event(&context.authority, &name);
+            return remove_event(&context.authority, &name, false, human);
         }
     };
     ensure_publish_idle(&capability.record)?;
@@ -1148,7 +1369,7 @@ pub(crate) fn remove(
             acquire_lease(&ready.root, true)?;
             let capability = revalidate_ready_lease(&context, &capability, &ready)?;
             if !force {
-                ensure_discard_safe(&ready, &capability.record)?;
+                ensure_discard_safe(&context.authority, &ready, &capability.record)?;
             }
             transition_tombstone(&context.sessions, &capability)?
         }
@@ -1181,16 +1402,16 @@ pub(crate) fn remove(
             remove_record_capability(&context.sessions, &capability, "remove")?;
             #[cfg(git_vws_m4_checkpoint)]
             session_checkpoint("remove", &capability.record, "return")?;
-            return remove_event(&context.authority, &name);
+            return remove_event(&context.authority, &name, false, human);
         }
     };
     complete_tombstone(&context, &tombstoned, "remove")?;
     #[cfg(git_vws_m4_checkpoint)]
     session_checkpoint("remove", &tombstoned.record, "return")?;
-    remove_event(&context.authority, &name)
+    remove_event(&context.authority, &name, true, human)
 }
 
-pub(crate) fn create(repository: &Path, request: CreateRequest) -> Result<PathBuf, Error> {
+pub(crate) fn create(repository: &Path, request: CreateRequest) -> Result<CreateOutcome, Error> {
     let authority = authority::inspect(repository)?;
     let state = registered(&authority)?;
     let target = request.target.unwrap_or_else(|| request.name.clone());
@@ -1260,10 +1481,10 @@ pub(crate) fn create(repository: &Path, request: CreateRequest) -> Result<PathBu
         if matches_existing(&existing.record, &prepared) {
             return match &existing.record.payload {
                 SessionPayload::Ready { .. } => {
-                    Ok(
+                    let root_path =
                         load_ready_capability(&sessions, &sessions_path, &authority, &existing)?
-                            .root_path,
-                    )
+                            .root_path;
+                    Ok(CreateOutcome::Reused(root_path))
                 }
                 SessionPayload::Prepared { .. } | SessionPayload::Materializing { .. } => {
                     Err(Error::new(
@@ -1308,7 +1529,7 @@ pub(crate) fn create(repository: &Path, request: CreateRequest) -> Result<PathBu
     match result {
         Ok(path) => {
             transaction.disarm();
-            Ok(path)
+            Ok(CreateOutcome::Created(path))
         }
         Err(error) => Err(transaction.abort(error)),
     }
@@ -1519,14 +1740,24 @@ fn materialize_session(
 }
 
 fn registered(authority: &Authority) -> Result<StateRoot, Error> {
-    let state = authority::open_state()?;
+    let state = authority::open_existing_state().map_err(|error| {
+        if error.code == "STATE_UNAVAILABLE" && error.detail == "state root does not exist" {
+            unregistered_authority()
+        } else {
+            error
+        }
+    })?;
     if !authority::authority_record_present(&state, authority)? {
-        return Err(Error::new(
-            "AUTHORITY_UNREGISTERED",
-            "create requires an existing exact authority record",
-        ));
+        return Err(unregistered_authority());
     }
     Ok(state)
+}
+
+fn unregistered_authority() -> Error {
+    Error::new(
+        "AUTHORITY_UNREGISTERED",
+        "this repository is not registered yet; run `git vws init <repository>` first",
+    )
 }
 
 fn sessions_for_read() -> Result<Option<(File, PathBuf)>, Error> {
@@ -1558,10 +1789,7 @@ fn optional_session_context(
     let authority = authority::inspect(repository)?;
     let state = authority::open_existing_state()?;
     if !authority::authority_record_present(&state, &authority)? {
-        return Err(Error::new(
-            "AUTHORITY_UNREGISTERED",
-            "session lifecycle requires an existing exact authority record",
-        ));
+        return Err(unregistered_authority());
     }
     let sessions_path = state.container_path("sessions")?;
     let sessions = state.open_container_if_present(b"sessions")?;
@@ -1572,24 +1800,79 @@ fn optional_session_context(
     ))
 }
 
-fn list_record(record: &SessionRecord, sessions_path: &Path) -> ListRecord {
+fn list_record(
+    record: &SessionRecord,
+    sessions_path: &Path,
+    removable: bool,
+    remove_blocker: Option<&'static str>,
+) -> ListRecord {
     let (state, root) = match &record.payload {
         SessionPayload::Prepared { root_name }
         | SessionPayload::Materializing { root_name, .. } => ("CREATING", root_name),
         SessionPayload::Ready { root_name, .. } => ("READY", root_name),
         SessionPayload::Tombstoned { tombstone_name, .. } => ("TOMBSTONED", tombstone_name),
     };
+    let managed_path = sessions_path.join(root);
     ListRecord {
         version: 1,
         authority_path_hex: record.authority_path.clone(),
         authority_identity: record.authority_identity,
         name_hex: record.name.clone(),
+        name: decode_hex(&record.name).ok().and_then(utf8),
         state,
         publish_state: record.journal.state(),
         base: record.base.clone(),
         target_hex: record.target.clone(),
-        managed_path_hex: authority::hex(sessions_path.join(root).as_os_str().as_bytes()),
+        target: decode_hex(&record.target).ok().and_then(utf8),
+        managed_path_hex: authority::hex(managed_path.as_os_str().as_bytes()),
+        worktree_path: utf8(
+            managed_path
+                .join("worktree")
+                .as_os_str()
+                .as_bytes()
+                .to_vec(),
+        ),
+        managed_path: utf8(managed_path.as_os_str().as_bytes().to_vec()),
+        removable,
+        remove_blocker,
     }
+}
+
+/// Report whether remove would accept this session, so `list` answers the
+/// question users actually ask instead of leaving them to probe with `remove`.
+fn list_removability(
+    sessions: &File,
+    sessions_path: &Path,
+    authority: &Authority,
+    capability: &RecordCapability,
+) -> (bool, Option<&'static str>) {
+    if !matches!(capability.record.payload, SessionPayload::Ready { .. }) {
+        return (false, Some("SESSION_NOT_READY"));
+    }
+    let Ok(ready) = load_ready_capability(sessions, sessions_path, authority, capability) else {
+        return (false, Some("SESSION_UNVERIFIABLE"));
+    };
+    match ensure_discard_safe(authority, &ready, &capability.record) {
+        Ok(()) => (true, None),
+        Err(error) => (false, Some(blocker_code(&error))),
+    }
+}
+
+fn blocker_code(error: &Error) -> &'static str {
+    let detail = error.detail.as_str();
+    if detail.contains("tracked, untracked, or ignored changes") {
+        "WORKTREE_CHANGES"
+    } else if detail.contains("never published") || detail.contains("authority never received") {
+        "UNPUBLISHED_COMMITS"
+    } else if detail.contains("conflicts with the authority object") {
+        "OBJECT_CONFLICT"
+    } else {
+        "DISCARD_RISK"
+    }
+}
+
+fn utf8(bytes: Vec<u8>) -> Option<String> {
+    String::from_utf8(bytes).ok()
 }
 
 fn selected_name(raw_name: Option<OsString>, name_hex: Option<String>) -> Result<OsString, Error> {
@@ -2114,6 +2397,190 @@ fn open_authorized_root(
     Ok(root)
 }
 
+/// Reclaim a session whose authority no longer exists at its recorded path.
+/// Only a session that provably holds nothing new can be discarded here: the
+/// private object store must be empty apart from `info/alternates` and
+/// `pack/`, and the private refs must be absent. This is the recovery path for
+/// a repository that was moved or deleted while sessions were still registered.
+pub(crate) fn reclaim_orphan_sessions(
+    repository_path: &str,
+    discard_unpublished: bool,
+) -> Result<usize, Error> {
+    let state = match authority::open_existing_state() {
+        Ok(state) => state,
+        Err(_) => return Ok(0),
+    };
+    let Some(sessions) = state.open_container_if_present(b"sessions")? else {
+        return Ok(0);
+    };
+    let sessions_path = state.container_path("sessions")?;
+    let mut reclaimed = 0_usize;
+    for name in storage::directory_names(sessions.as_raw_fd())? {
+        if !name.starts_with(b"session-") || !name.ends_with(b".record") {
+            continue;
+        }
+        let Ok(binding) = authority::read_file_binding(sessions.as_raw_fd(), &name, MAX_RECORD)
+        else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&binding.bytes) else {
+            continue;
+        };
+        if value.get("authority_path").and_then(|v| v.as_str()) != Some(repository_path) {
+            continue;
+        }
+        let Ok(record) = parse_record(&binding.bytes) else {
+            continue;
+        };
+        let capability = RecordCapability {
+            basename: name.clone(),
+            record,
+            binding: authority::RecordBinding {
+                bytes: binding.bytes.clone(),
+                identity: binding.identity,
+            },
+        };
+        reclaim_orphan_capability(&sessions, &sessions_path, &capability, discard_unpublished)?;
+        reclaimed += 1;
+    }
+    Ok(reclaimed)
+}
+
+fn reclaim_orphan_capability(
+    sessions: &File,
+    sessions_path: &Path,
+    capability: &RecordCapability,
+    discard_unpublished: bool,
+) -> Result<(), Error> {
+    let SessionPayload::Ready { root_name, .. } = &capability.record.payload else {
+        return Err(Error::new(
+            "SESSION_DISCARD_RISK",
+            "an orphan session is incomplete; inspect it with doctor before reclaiming",
+        ));
+    };
+    let root_name_c = cstring(root_name.as_bytes(), "session root")?;
+    let root = storage::open_directory_at(sessions.as_raw_fd(), &root_name_c).map_err(|_| {
+        Error::new(
+            "SESSION_DISCARD_RISK",
+            "an orphan session root is missing; inspect it with doctor before reclaiming",
+        )
+    })?;
+    let common = storage::open_directory_at(root.as_raw_fd(), c"common.git").map_err(|_| {
+        Error::new(
+            "SESSION_DISCARD_RISK",
+            "an orphan session has no private common-dir; inspect it with doctor",
+        )
+    })?;
+    ensure_orphan_object_store_empty(&common, discard_unpublished)?;
+    let root_path = sessions_path.join(root_name);
+    ensure_orphan_refs_empty(&root_path, &capability.record, discard_unpublished)?;
+    let context = SessionContext {
+        authority: authority_from_record(&capability.record)?,
+        sessions: sessions.try_clone().map_err(|error| {
+            Error::io(
+                "SESSION_RECOVERY_REQUIRED",
+                "cannot retain session container while reclaiming an orphan",
+                error,
+            )
+        })?,
+        sessions_path: sessions_path.to_path_buf(),
+    };
+    let tombstoned = transition_tombstone(&context.sessions, capability)?;
+    complete_tombstone(&context, &tombstoned, "remove")?;
+    Ok(())
+}
+
+fn ensure_orphan_object_store_empty(common: &File, discard_unpublished: bool) -> Result<(), Error> {
+    let objects = storage::open_directory_at(common.as_raw_fd(), c"objects")?;
+    for name in storage::directory_names(objects.as_raw_fd())? {
+        let name = cstring(&name, "private object entry")?;
+        match name.to_bytes() {
+            b"info" => {
+                let info = storage::open_directory_at(objects.as_raw_fd(), &name)?;
+                for child in storage::directory_names(info.as_raw_fd())? {
+                    if child != b"alternates" {
+                        return Err(Error::new(
+                            "SESSION_DISCARD_RISK",
+                            "an orphan session holds private object metadata",
+                        ));
+                    }
+                }
+            }
+            b"pack" => {
+                let pack = storage::open_directory_at(objects.as_raw_fd(), &name)?;
+                if !storage::directory_names(pack.as_raw_fd())?.is_empty() {
+                    return Err(Error::new(
+                        "SESSION_DISCARD_RISK",
+                        "an orphan session holds packed private objects",
+                    ));
+                }
+            }
+            _ if discard_unpublished => {}
+            _ => {
+                return Err(Error::new(
+                    "SESSION_DISCARD_RISK",
+                    "an orphan session holds commits that were never published and its authority is gone; \
+                     restore the repository at its recorded path to publish them, or re-run with --force to discard them",
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_orphan_refs_empty(
+    root_path: &Path,
+    record: &SessionRecord,
+    discard_unpublished: bool,
+) -> Result<(), Error> {
+    let mut git_dir = OsString::from("--git-dir=");
+    git_dir.push(root_path.join("common.git").as_os_str());
+    let output = git::capture(
+        &[
+            git_dir,
+            OsString::from("for-each-ref"),
+            OsString::from("--format=%(refname) %(objectname)"),
+        ],
+        None,
+        GIT_TIMEOUT,
+        AuditConfig::Isolated,
+    )
+    .map_err(|_| {
+        Error::new(
+            "SESSION_DISCARD_RISK",
+            "cannot inspect an orphan session's private refs",
+        )
+    })?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(Error::new(
+            "SESSION_DISCARD_RISK",
+            "cannot inspect an orphan session's private refs",
+        ));
+    }
+    let target = decode_hex(&record.target)?;
+    let mut expected_ref = b"refs/heads/".to_vec();
+    expected_ref.extend_from_slice(&target);
+    for line in output.stdout.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Some(separator) = line.iter().rposition(|byte| *byte == b' ') else {
+            return Err(Error::new(
+                "SESSION_DISCARD_RISK",
+                "an orphan session's private ref listing was malformed",
+            ));
+        };
+        if line[..separator] != expected_ref[..] && !discard_unpublished {
+            return Err(Error::new(
+                "SESSION_DISCARD_RISK",
+                "an orphan session holds refs that were never published and its authority is gone; \
+                 restore the repository at its recorded path, or re-run with --force to discard them",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn ensure_record_container(sessions: &File, record: &SessionRecord) -> Result<(), Error> {
     let container = Identity::from_file(sessions)?;
     if !container.same_node(record.container_identity)
@@ -2330,7 +2797,11 @@ fn session_checkpoint(operation: &str, record: &SessionRecord, stage: &str) -> R
     crate::m4_checkpoint::checkpoint(operation, &record.sid, &record.template_key, stage)
 }
 
-fn ensure_discard_safe(ready: &ReadySession, record: &SessionRecord) -> Result<(), Error> {
+fn ensure_discard_safe(
+    authority: &Authority,
+    ready: &ReadySession,
+    record: &SessionRecord,
+) -> Result<(), Error> {
     let args = vec![
         OsString::from("status"),
         OsString::from("--porcelain=v1"),
@@ -2352,18 +2823,30 @@ fn ensure_discard_safe(ready: &ReadySession, record: &SessionRecord) -> Result<(
         GIT_TIMEOUT,
         AuditConfig::Isolated,
     )
-    .map_err(|_| discard_risk("cannot inspect worktree changes"))?;
+    .map_err(|_| {
+        discard_risk(
+            "cannot inspect worktree changes; retry, and run `git vws doctor` if it persists",
+        )
+    })?;
     if !output.status.success()
         || !output.stderr.is_empty()
         || worktree_has_discardable_changes(&output.stdout, &cached_paths)?
     {
         return Err(discard_risk(
-            "worktree has tracked, untracked, or ignored changes",
+            "the session worktree has tracked, untracked, or ignored changes; \
+             commit and publish what matters, delete the rest, or use --force to discard everything",
         ));
     }
-    ensure_private_refs_safe(&ready.common, &ready.root_path, record)?;
-    ensure_private_object_store_empty(&ready.common)?;
-    ensure_no_unreachable_private_closure(&ready.common, &ready.root_path, record)?;
+    ensure_private_object_store_empty(authority, &ready.common)?;
+    let target = decode_hex(&record.target)?;
+    let published_tip = authority_target_commit(authority, OsStr::from_bytes(&target))?;
+    ensure_private_refs_safe(
+        authority,
+        &ready.common,
+        &ready.root_path,
+        record,
+        published_tip.as_deref(),
+    )?;
     Ok(())
 }
 
@@ -2389,13 +2872,15 @@ fn worktree_has_discardable_changes(
 }
 
 fn discard_risk(detail: impl Into<String>) -> Error {
-    Error::new("SESSION_DISCARD_RISK", detail)
+    Error::new("SESSION_DISCARD_RISK", detail.into())
 }
 
 fn ensure_private_refs_safe(
+    authority: &Authority,
     common: &File,
     root_path: &Path,
     record: &SessionRecord,
+    published_tip: Option<&str>,
 ) -> Result<(), Error> {
     let common_path = root_path.join("common.git");
     let mut git_dir = OsString::from("--git-dir=");
@@ -2410,14 +2895,15 @@ fn ensure_private_refs_safe(
         GIT_TIMEOUT,
         AuditConfig::Isolated,
     )
-    .map_err(|_| discard_risk("cannot inspect private refs"))?;
+    .map_err(|_| discard_risk("cannot inspect the session private refs; retry, and run `git vws doctor` if it persists"))?;
     if !output.status.success() || !output.stderr.is_empty() {
-        return Err(discard_risk("cannot inspect private refs"));
+        return Err(discard_risk("cannot inspect the session private refs; retry, and run `git vws doctor` if it persists"));
     }
     let target = decode_hex(&record.target)?;
     let mut expected_ref = b"refs/heads/".to_vec();
     expected_ref.extend_from_slice(&target);
-    let mut ref_count = 0_usize;
+    let mut target_ref_count = 0_usize;
+    let mut auxiliary_refs = 0_usize;
     for line in output.stdout.split(|byte| *byte == b'\n') {
         if line.is_empty() {
             continue;
@@ -2425,19 +2911,32 @@ fn ensure_private_refs_safe(
         let Some(separator) = line.iter().rposition(|byte| *byte == b' ') else {
             return Err(discard_risk("private ref listing was malformed"));
         };
-        if line[..separator] != expected_ref[..] || &line[separator + 1..] != record.base.as_bytes()
-        {
-            return Err(discard_risk(
-                "private refs differ from the initial session target",
-            ));
+        let tip = &line[separator + 1..];
+        if line[..separator] == expected_ref[..] {
+            if !private_ref_is_discardable(&common_path, tip, record, published_tip) {
+                return Err(discard_risk(
+                    "the session target branch has commits that were never published; run `git vws publish`, or use --force to discard the session",
+                ));
+            }
+            target_ref_count += 1;
+        } else {
+            // Any other private ref (for example refs/notes/* written by an
+            // editor hook) is session-local state that publish never carries.
+            // It cannot be published, so it must not block removal.
+            auxiliary_refs += 1;
         }
-        ref_count += 1;
     }
-    if ref_count != 1 {
+    if target_ref_count > 1 {
         return Err(discard_risk(
             "private ref baseline is not exactly the initial session target",
         ));
     }
+    if target_ref_count == 0 && auxiliary_refs == 0 {
+        return Err(discard_risk(
+            "private ref baseline is not exactly the initial session target",
+        ));
+    }
+    ensure_no_unreachable_private_commits(authority, common_path.as_path(), record, published_tip)?;
     let objects = storage::open_directory_at(common.as_raw_fd(), c"objects")?;
     if Identity::from_file(&objects)?.dev != Identity::from_file(common)?.dev {
         return Err(discard_risk(
@@ -2447,8 +2946,268 @@ fn ensure_private_refs_safe(
     Ok(())
 }
 
-fn ensure_private_object_store_empty(common: &File) -> Result<(), Error> {
+/// A commit that is only reachable from the target branch reflog is work that
+/// was never published, even though the branch itself is back at its baseline.
+fn ensure_no_unreachable_private_commits(
+    authority: &Authority,
+    common_path: &Path,
+    record: &SessionRecord,
+    published_tip: Option<&str>,
+) -> Result<(), Error> {
+    let mut git_dir = OsString::from("--git-dir=");
+    git_dir.push(common_path.as_os_str());
+    let target = decode_hex(&record.target)?;
+    let mut reference = OsString::from("refs/heads/");
+    reference.push(OsStr::from_bytes(&target));
+    let output = git::capture(
+        &[
+            git_dir,
+            OsString::from("reflog"),
+            OsString::from("show"),
+            OsString::from("--format=%H"),
+            reference,
+        ],
+        None,
+        GIT_TIMEOUT,
+        AuditConfig::Isolated,
+    )
+    .map_err(|_| discard_risk("cannot inspect the session target reflog"))?;
+    if !output.status.success() {
+        // A missing reflog is not a risk; nothing was recorded there.
+        return Ok(());
+    }
+    for line in output.stdout.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if line == record.base.as_bytes() || published_tip.is_some_and(|tip| line == tip.as_bytes())
+        {
+            continue;
+        }
+        // rebase and amend rewrite history, so the reflog keeps pre-rewrite
+        // commits whose content was carried over by the published tip. Such a
+        // commit is legitimate; only content the authority has never seen is
+        // unpublished work.
+        if commit_exists_in_authority(authority, line)?
+            || patch_is_published(authority, common_path, published_tip, line)?
+        {
+            continue;
+        }
+        return Err(discard_risk(
+            "the session target reflog records commits that were never published; publish them, or use --force to discard the session",
+        ));
+    }
+    Ok(())
+}
+
+/// True when the change introduced by `oid` already appears in the published
+/// target tip, which is what a rebase or amend produces. Git's own patch-id is
+/// the identity of a change, so this compares change identity rather than
+/// commit identity.
+fn patch_is_published(
+    authority: &Authority,
+    common_path: &Path,
+    published_tip: Option<&str>,
+    oid: &[u8],
+) -> Result<bool, Error> {
+    let Some(published_tip) = published_tip else {
+        return Ok(false);
+    };
+    let oid = std::str::from_utf8(oid)
+        .map_err(|_| discard_risk("the session target reflog contained a non-UTF-8 object id; inspect the session with `git vws doctor`"))?;
+    let Some(candidate) = patch_id(common_path, oid)? else {
+        return Ok(false);
+    };
+    let published_ids = published_patch_ids(authority, published_tip)?;
+    Ok(published_ids
+        .iter()
+        .any(|published| published == &candidate))
+}
+
+fn patch_id(common_path: &Path, oid: &str) -> Result<Option<String>, Error> {
+    let mut git_dir = OsString::from("--git-dir=");
+    git_dir.push(common_path.as_os_str());
+    let show = git::capture(
+        &[
+            git_dir,
+            OsString::from("show"),
+            OsString::from("--no-color"),
+            OsString::from("--format=medium"),
+            OsString::from(oid),
+        ],
+        None,
+        GIT_TIMEOUT,
+        AuditConfig::Isolated,
+    )
+    .map_err(|_| discard_risk("cannot read a reflog commit for patch comparison; inspect the session with `git vws doctor`"))?;
+    if !show.status.success() {
+        return Ok(None);
+    }
+    let mut child = git::GitChild::spawn_with_env_for(
+        &[
+            OsString::from("-C"),
+            common_path.as_os_str().to_os_string(),
+            OsString::from("patch-id"),
+            OsString::from("--stable"),
+        ],
+        None,
+        &[],
+        true,
+        GIT_TIMEOUT,
+        AuditConfig::Isolated,
+    )
+    .map_err(|_| {
+        discard_risk(
+            "cannot start patch-id for a reflog commit; inspect the session with `git vws doctor`",
+        )
+    })?;
+    child.write_stdin(&show.stdout).map_err(|_| {
+        discard_risk(
+            "cannot feed patch-id for a reflog commit; inspect the session with `git vws doctor`",
+        )
+    })?;
+    let output = child
+        .finish()
+        .map_err(|_| discard_risk("cannot compute patch-id for a reflog commit; inspect the session with `git vws doctor`"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(first_field(&output.stdout))
+}
+
+fn published_patch_ids(authority: &Authority, tip: &str) -> Result<Vec<String>, Error> {
+    let output = git::capture(
+        &[
+            OsString::from("-C"),
+            authority.canonical.as_os_str().to_os_string(),
+            OsString::from("log"),
+            OsString::from("--no-color"),
+            OsString::from("--format=medium"),
+            OsString::from("-p"),
+            OsString::from(tip),
+        ],
+        None,
+        GIT_TIMEOUT,
+        AuditConfig::Authority,
+    )
+    .map_err(|_| discard_risk("cannot read the published tip for patch comparison; verify the target branch exists, then retry"))?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let mut child = git::GitChild::spawn_with_env_for(
+        &[
+            OsString::from("-C"),
+            authority.canonical.as_os_str().to_os_string(),
+            OsString::from("patch-id"),
+            OsString::from("--stable"),
+        ],
+        None,
+        &[],
+        true,
+        GIT_TIMEOUT,
+        AuditConfig::Authority,
+    )
+    .map_err(|_| discard_risk("cannot start patch-id for the published tip; retry, and run `git vws doctor` if it persists"))?;
+    child
+        .write_stdin(&output.stdout)
+        .map_err(|_| discard_risk("cannot feed patch-id for the published tip; retry, and run `git vws doctor` if it persists"))?;
+    let output = child
+        .finish()
+        .map_err(|_| discard_risk("cannot compute patch-id for the published tip; retry, and run `git vws doctor` if it persists"))?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    Ok(output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| {
+            let mut fields = line.split(|byte| *byte == b' ');
+            fields.next().and_then(|id| {
+                std::str::from_utf8(id)
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            })
+        })
+        .collect())
+}
+
+fn first_field(bytes: &[u8]) -> Option<String> {
+    bytes
+        .split(|byte| *byte == b' ')
+        .next()
+        .and_then(|field| std::str::from_utf8(field).ok())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn commit_exists_in_authority(authority: &Authority, oid: &[u8]) -> Result<bool, Error> {
+    let oid = std::str::from_utf8(oid)
+        .map_err(|_| discard_risk("the session target reflog contained a non-UTF-8 object id; inspect the session with `git vws doctor`"))?;
+    let output = git::capture(
+        &[
+            OsString::from("-C"),
+            authority.canonical.as_os_str().to_os_string(),
+            OsString::from("cat-file"),
+            OsString::from("-e"),
+            OsString::from(oid),
+        ],
+        None,
+        GIT_TIMEOUT,
+        AuditConfig::Authority,
+    )
+    .map_err(|_| discard_risk("cannot inspect the authority for a reflog commit; verify the repository still exists, then retry"))?;
+    Ok(output.status.success())
+}
+
+fn private_ref_is_discardable(
+    common_path: &Path,
+    tip: &[u8],
+    record: &SessionRecord,
+    published_tip: Option<&str>,
+) -> bool {
+    if tip == record.base.as_bytes() {
+        return true;
+    }
+    let Some(published) = published_tip else {
+        return false;
+    };
+    if tip == published.as_bytes() {
+        return true;
+    }
+    // Another session may have published past this tip, which leaves it as an
+    // ancestor of the published target. Its content is still on the target, so
+    // it is safe to discard.
+    let Ok(tip) = std::str::from_utf8(tip) else {
+        return false;
+    };
+    is_ancestor_in_authority(common_path, tip, published)
+}
+
+fn is_ancestor_in_authority(common_path: &Path, ancestor: &str, descendant: &str) -> bool {
+    let mut git_dir = OsString::from("--git-dir=");
+    git_dir.push(common_path.as_os_str());
+    let output = git::capture(
+        &[
+            git_dir,
+            OsString::from("merge-base"),
+            OsString::from("--is-ancestor"),
+            OsString::from(ancestor),
+            OsString::from(descendant),
+        ],
+        None,
+        GIT_TIMEOUT,
+        AuditConfig::Isolated,
+    );
+    matches!(output, Ok(output) if output.status.success())
+}
+
+fn ensure_private_object_store_empty(authority: &Authority, common: &File) -> Result<(), Error> {
     let objects = storage::open_directory_at(common.as_raw_fd(), c"objects")?;
+    let authority_root = File::open(&authority.canonical)
+        .map_err(|_| discard_risk("cannot inspect the authority object store; verify the repository still exists, then retry"))?;
+    let authority_objects = storage::open_directory_at(authority_root.as_raw_fd(), c"objects")
+        .map_err(|_| discard_risk("cannot inspect the authority object store; verify the repository still exists, then retry"))?;
     for name in storage::directory_names(objects.as_raw_fd())? {
         let name = cstring(&name, "private object entry")?;
         match name.to_bytes() {
@@ -2468,95 +3227,70 @@ fn ensure_private_object_store_empty(common: &File) -> Result<(), Error> {
                     return Err(discard_risk("private object store contains packed objects"));
                 }
             }
-            _ => return Err(discard_risk("private object store contains loose objects")),
+            _ => ensure_private_loose_published(&objects, &authority_objects, &name)?,
         }
     }
     Ok(())
 }
 
-fn ensure_no_unreachable_private_closure(
-    common: &File,
-    root_path: &Path,
-    record: &SessionRecord,
+fn ensure_private_loose_published(
+    objects: &File,
+    authority_objects: &File,
+    fanout_name: &CStr,
 ) -> Result<(), Error> {
-    let mut git_dir = OsString::from("--git-dir=");
-    git_dir.push(root_path.join("common.git").as_os_str());
-    let output = git::capture(
-        &[
-            git_dir,
-            OsString::from("fsck"),
-            OsString::from("--no-reflogs"),
-            OsString::from("--unreachable"),
-            OsString::from("--no-progress"),
-        ],
-        None,
-        GIT_TIMEOUT,
-        AuditConfig::Isolated,
-    )
-    .map_err(|_| discard_risk("cannot prove the private object closure is disposable"))?;
-    if !output.status.success() || !output.stdout.is_empty() {
-        return Err(discard_risk(
-            "private refs, reflogs, or objects are not proven disposable",
-        ));
-    }
-    if output.stderr.is_empty() {
-        return Ok(());
-    }
-    let target = decode_hex(&record.target)
-        .map_err(|_| discard_risk("private refs, reflogs, or objects are not proven disposable"))?;
-    let head_bytes = read_regular_at(common, c"HEAD", "private common HEAD")
-        .map_err(|_| discard_risk("private refs, reflogs, or objects are not proven disposable"))?;
-    let head = unborn_head(&head_bytes, &target).ok_or_else(|| {
-        discard_risk("private refs, reflogs, or objects are not proven disposable")
-    })?;
-    let mut expected_stderr = b"notice: HEAD points to an unborn branch (".to_vec();
-    expected_stderr.extend_from_slice(head);
-    expected_stderr.extend_from_slice(b")\n");
-    if output.stderr != expected_stderr
-        || read_regular_at(common, c"HEAD", "private common HEAD").map_err(|_| {
-            discard_risk("private refs, reflogs, or objects are not proven disposable")
-        })? != head_bytes
-    {
-        return Err(discard_risk(
-            "private refs, reflogs, or objects are not proven disposable",
-        ));
+    let fanout = storage::open_directory_at(objects.as_raw_fd(), fanout_name)?;
+    let authority_fanout =
+        storage::open_directory_at(authority_objects.as_raw_fd(), fanout_name).ok();
+    for tail in storage::directory_names(fanout.as_raw_fd())? {
+        let tail_name = cstring(&tail, "private loose object")?;
+        let private = storage::identity_at(fanout.as_raw_fd(), &tail_name)?;
+        let Some(authority_fanout) = authority_fanout.as_ref() else {
+            // The authority has no matching fanout, so this object exists only
+            // in private session state (for example a notes tree written by an
+            // editor hook). It is session-local and cannot be published.
+            continue;
+        };
+        let Ok(published) = storage::identity_at(authority_fanout.as_raw_fd(), &tail_name) else {
+            continue;
+        };
+        if storage::verify_identical_owned_regular(
+            &fanout,
+            &tail_name,
+            private,
+            authority_fanout,
+            &tail_name,
+            published,
+        )
+        .is_err()
+        {
+            // A private object that collides with an authority object of the
+            // same name but different bytes is a real hazard: the session and
+            // the authority disagree about that object.
+            return Err(discard_risk(
+                "a private object conflicts with an authority object of the same name; inspect the session with `git vws doctor` before discarding it",
+            ));
+        }
     }
     Ok(())
 }
 
-fn unborn_head<'a>(bytes: &'a [u8], target: &[u8]) -> Option<&'a [u8]> {
-    let head = bytes
-        .strip_prefix(b"ref: refs/heads/")?
-        .strip_suffix(b"\n")?;
-    if head.contains(&b'\n') || head.contains(&b'\r') || !git_safe_unborn_head(head, target) {
-        None
-    } else {
-        Some(head)
+fn remove_event(
+    authority: &Authority,
+    name: &OsStr,
+    removed: bool,
+    human: bool,
+) -> Result<String, Error> {
+    if human {
+        let name = String::from_utf8_lossy(name.as_bytes());
+        return Ok(if removed {
+            format!("removed session {name}")
+        } else {
+            format!("session {name} was already absent")
+        });
     }
-}
-
-fn git_safe_unborn_head(head: &[u8], target: &[u8]) -> bool {
-    !head.is_empty()
-        && head != target
-        && !head.starts_with(b"/")
-        && !head.starts_with(b"-")
-        && !head.ends_with(b"/")
-        && !head.windows(2).any(|pair| pair == b".." || pair == b"//")
-        && head
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
-        && head.split(|byte| *byte == b'/').all(|component| {
-            !component.is_empty()
-                && !component.starts_with(b".")
-                && !component.ends_with(b".")
-                && !component.ends_with(b".lock")
-        })
-}
-
-fn remove_event(authority: &Authority, name: &OsStr) -> Result<String, Error> {
     serde_json::to_string(&RemoveEvent {
         version: 1,
-        event: "REMOVED",
+        event: if removed { "REMOVED" } else { "ABSENT" },
         authority_path_hex: authority::hex(authority.canonical.as_os_str().as_bytes()),
         authority_identity: authority.identity,
         name_hex: authority::hex(name.as_bytes()),
@@ -3491,7 +4225,7 @@ fn validate_authority_regular(
     require_session(
         expected.regular()
             && expected.uid == current_uid()
-            && expected.nlink == 1
+            && expected.nlink >= 1
             && expected.mode & 0o022 == 0
             && expected.dev == parent_identity.dev,
         detail,
@@ -4449,7 +5183,10 @@ fn ensure_publish_relation(
     if output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() {
         return Err(Error::new(
             "PUBLISH_NON_FAST_FORWARD",
-            "private target is not a fast-forward of the frozen authority target",
+            "the session target branch is not a fast-forward of the authority target; \
+             the session has no remote pointing at the authority, so run these inside the session: \
+             `git remote add authority <authority-path>`, `git fetch authority`, \
+             `git rebase authority/<target>`, then publish again",
         ));
     }
     Err(Error::new(

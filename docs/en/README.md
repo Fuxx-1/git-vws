@@ -1,13 +1,13 @@
 # git-vws
 
-[![CI](https://github.com/Fuxx-1/git-vws/actions/workflows/ci.yml/badge.svg)](https://github.com/Fuxx-1/git-vws/actions/workflows/ci.yml)
+[CI workflow](../../.github/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](../../LICENSE)
 
 [English](README.md) | [中文](../../README.md)
 
 `git-vws` is a Git Extension for creating independent, editable development sessions from one Git repository. Every session has private HEAD, index, refs, uncommitted changes, and build output. Unchanged Git files share physical storage through native copy-on-write on macOS APFS or supported Linux filesystems.
 
-Version 1.0.3 is the stable release for the current macOS and Linux scope. git-vws does not modify Git, install FUSE or a daemon, require administrator access, or silently fall back to a full worktree copy.
+Version 1.1.0 is the stable release for the current macOS and Linux scope. git-vws does not modify Git, install FUSE or a daemon, require administrator access, or silently fall back to a full worktree copy.
 
 ## Quick start
 
@@ -81,16 +81,22 @@ Cache contents are excluded through private Git configuration, are never committ
 ```text
 git vws init <repository-or-project>
 git vws create <name> [--from <rev>] [--target <branch>] [--path <managed-path>]
-git vws list [--all]
+git vws list [--all] [--human]
 git vws exec <name> -- <program> [args...]
 git vws cache <name>
-git vws remove <name> [--force]
+git vws remove <name> [--force] [--human]
 git vws publish <name>
-git vws doctor
-git vws gc
+git vws forget <path> [--force]
+git vws doctor [--human]
+git vws gc [--human]
+git-vws man [--install]
 ```
 
-Run `git vws -h` first, then `git vws <command> -h` before using an unfamiliar command. `list`, `doctor`, and `gc` emit NDJSON. Treat every nonzero exit and `*_RECOVERY_REQUIRED` as a stop signal: preserve the state, run `doctor`, and do not delete `$HOME/.git-vws` by hand.
+Run `git vws -h` first, then `git vws <command> -h` before using an unfamiliar command. `list`, `doctor`, and `gc` emit NDJSON by default; add `--human` for a readable table. Treat every nonzero exit and `*_RECOVERY_REQUIRED` as a stop signal: preserve the state, run `doctor`, and do not delete `$HOME/.git-vws` by hand.
+
+Git routes `git vws --help` to `man`, so run `git-vws man --install` once; until then use `git vws -h`.
+
+After a repository is moved, renamed, or deleted, run `git vws forget <old-path>` to release the stale record, then `git vws init <new-path>`.
 
 ## Supported scope
 

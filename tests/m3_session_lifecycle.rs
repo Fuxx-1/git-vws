@@ -1304,6 +1304,329 @@ fn remove_rejects_discard_risk_and_force_only_skips_user_data_risk() {
 }
 
 #[test]
+fn remove_accepts_published_work_and_rejects_unpublished_commits() {
+    require_native_cow();
+    let mut fixture = Fixture::new();
+
+    assert_success(
+        &fixture.create(OsString::from("published")),
+        "create published session",
+    );
+    let published_root = fixture.session_root();
+    let worktree = published_root.join("worktree");
+    git(&worktree, &git_args(&["config", "user.name", "Published"]));
+    git(
+        &worktree,
+        &git_args(&["config", "user.email", "published@example.invalid"]),
+    );
+    fs::write(worktree.join("nested/data"), b"published content\n").expect("write published data");
+    git(&worktree, &git_args(&["add", "nested/data"]));
+    git(&worktree, &git_args(&["commit", "-m", "published change"]));
+    assert_success(
+        &fixture.vws(fixture.for_repository(
+            &fixture.authority,
+            vec![OsString::from("publish"), OsString::from("published")],
+        )),
+        "publish committed session work",
+    );
+    let removed = fixture.remove("published", false);
+    assert_remove_event(&removed, b"published", "remove published session");
+
+    assert_success(
+        &fixture.create(OsString::from("unpublished")),
+        "create unpublished session",
+    );
+    let unpublished_root = fixture.session_root();
+    let worktree = unpublished_root.join("worktree");
+    git(
+        &worktree,
+        &git_args(&["config", "user.name", "Unpublished"]),
+    );
+    git(
+        &worktree,
+        &git_args(&["config", "user.email", "unpublished@example.invalid"]),
+    );
+    fs::write(worktree.join("nested/data"), b"unpublished content\n")
+        .expect("write unpublished data");
+    git(&worktree, &git_args(&["add", "nested/data"]));
+    git(
+        &worktree,
+        &git_args(&["commit", "-m", "unpublished change"]),
+    );
+    let record = fixture.session_record();
+    let record_before = fs::read(&record).expect("read unpublished record");
+    assert_error(
+        &fixture.remove("unpublished", false),
+        "SESSION_DISCARD_RISK",
+        "remove session with unpublished commits",
+    );
+    assert!(
+        unpublished_root.exists(),
+        "discard risk removed the unpublished session root"
+    );
+    assert_eq!(
+        fs::read(&record).expect("read unpublished record after rejection"),
+        record_before,
+        "discard risk changed the unpublished session record"
+    );
+    let forced = fixture.remove("unpublished", true);
+    assert_remove_event(&forced, b"unpublished", "force remove unpublished session");
+    fixture.cleanup();
+}
+
+#[test]
+fn published_session_with_auxiliary_refs_can_be_removed_without_force() {
+    require_native_cow();
+    let mut fixture = Fixture::new();
+    assert_success(
+        &fixture.create(OsString::from("aux")),
+        "create session with an auxiliary ref",
+    );
+    let root = fixture.session_root();
+    let worktree = root.join("worktree");
+    git(&worktree, &git_args(&["config", "user.name", "Aux Ref"]));
+    git(
+        &worktree,
+        &git_args(&["config", "user.email", "aux@example.invalid"]),
+    );
+    fs::write(worktree.join("nested/data"), b"aux content\n").expect("write aux data");
+    git(&worktree, &git_args(&["add", "nested/data"]));
+    git(&worktree, &git_args(&["commit", "-m", "aux change"]));
+    // Editor hooks such as git-ai write refs/notes/* into the private repo.
+    // publish never carries those refs, so they must not block removal.
+    git(
+        &worktree,
+        &git_args(&["notes", "--ref=ai", "add", "-m", "hook note", "HEAD"]),
+    );
+    assert_success(
+        &fixture.vws(fixture.for_repository(
+            &fixture.authority,
+            vec![OsString::from("publish"), OsString::from("aux")],
+        )),
+        "publish session with an auxiliary ref",
+    );
+    let removed = fixture.remove("aux", false);
+    assert_remove_event(
+        &removed,
+        b"aux",
+        "remove published session with auxiliary refs",
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn list_reports_removability_consistently_with_remove() {
+    require_native_cow();
+    let mut fixture = Fixture::new();
+    assert_success(
+        &fixture.create(OsString::from("ready")),
+        "create ready session",
+    );
+    assert_success(
+        &fixture.create(OsString::from("dirty")),
+        "create dirty session",
+    );
+    // Resolve the dirty session's root through list, which is what the test
+    // is exercising anyway.
+    let listed_roots =
+        fixture.vws(fixture.for_repository(&fixture.authority, vec![OsString::from("list")]));
+    assert_success(&listed_roots, "list session roots");
+    let dirty_root = PathBuf::from(
+        ndjson(&listed_roots)
+            .iter()
+            .find(|row| row_string(row, "name") == "dirty")
+            .and_then(|row| row.get("managed_path"))
+            .and_then(Value::as_str)
+            .expect("list omitted the dirty session path"),
+    );
+    fs::write(dirty_root.join("worktree/scratch.txt"), b"scratch\n").expect("write scratch");
+
+    let listed =
+        fixture.vws(fixture.for_repository(&fixture.authority, vec![OsString::from("list")]));
+    assert_success(&listed, "list removability");
+    let rows = ndjson(&listed);
+    let find = |name: &str| {
+        rows.iter()
+            .find(|row| row_string(row, "name") == name)
+            .unwrap_or_else(|| panic!("list omitted {name}: {rows:?}"))
+    };
+    assert_eq!(
+        find("ready").get("removable").and_then(Value::as_bool),
+        Some(true),
+        "list did not mark a clean session removable"
+    );
+    assert_eq!(
+        find("dirty").get("removable").and_then(Value::as_bool),
+        Some(false),
+        "list marked a dirty session removable"
+    );
+    assert_eq!(
+        find("dirty").get("remove_blocker").and_then(Value::as_str),
+        Some("WORKTREE_CHANGES"),
+        "list did not name the dirty worktree blocker"
+    );
+
+    // The advertised flag must agree with the command it describes.
+    assert_remove_event(
+        &fixture.remove("ready", false),
+        b"ready",
+        "remove session list called removable",
+    );
+    assert_error(
+        &fixture.remove("dirty", false),
+        "SESSION_DISCARD_RISK",
+        "remove session list called blocked",
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn rebased_session_can_be_removed_without_force() {
+    require_native_cow();
+    let mut fixture = Fixture::new();
+    assert_success(
+        &fixture.create(OsString::from("rebased")),
+        "create rebased session",
+    );
+    let root = fixture.session_root();
+    let worktree = root.join("worktree");
+    git(
+        &worktree,
+        &git_args(&["config", "user.name", "Rebase Test"]),
+    );
+    git(
+        &worktree,
+        &git_args(&["config", "user.email", "rebase@example.invalid"]),
+    );
+    fs::write(worktree.join("nested/data"), b"rebased content\n").expect("write rebased data");
+    git(&worktree, &git_args(&["add", "nested/data"]));
+    git(&worktree, &git_args(&["commit", "-m", "rebased change"]));
+    let head = String::from_utf8(git(&worktree, &git_args(&["rev-parse", "HEAD"])).stdout)
+        .expect("head is UTF-8");
+    // Rewrite the commit so the original object stays behind in the reflog
+    // while its content is carried by the rewritten commit.
+    git(
+        &worktree,
+        &[
+            OsString::from("commit"),
+            OsString::from("--amend"),
+            OsString::from("-m"),
+            OsString::from("rebased change, amended"),
+        ],
+    );
+    let amended = String::from_utf8(git(&worktree, &git_args(&["rev-parse", "HEAD"])).stdout)
+        .expect("amended head is UTF-8");
+    assert_ne!(
+        head.trim(),
+        amended.trim(),
+        "amend did not rewrite the commit"
+    );
+    assert_success(
+        &fixture.vws(fixture.for_repository(
+            &fixture.authority,
+            vec![OsString::from("publish"), OsString::from("rebased")],
+        )),
+        "publish amended session",
+    );
+    let removed = fixture.remove("rebased", false);
+    assert_remove_event(&removed, b"rebased", "remove amended session");
+    fixture.cleanup();
+}
+
+#[test]
+fn reflog_only_commits_still_block_removal() {
+    require_native_cow();
+    let mut fixture = Fixture::new();
+    assert_success(
+        &fixture.create(OsString::from("reflog-only")),
+        "create reflog-only session",
+    );
+    let root = fixture.session_root();
+    let record = fixture.session_record();
+    let worktree = root.join("worktree");
+    git(
+        &worktree,
+        &git_args(&["config", "user.name", "Reflog Only"]),
+    );
+    git(
+        &worktree,
+        &git_args(&["config", "user.email", "reflog-only@example.invalid"]),
+    );
+    let baseline = String::from_utf8(git(&worktree, &git_args(&["rev-parse", "HEAD"])).stdout)
+        .expect("baseline head is UTF-8");
+    fs::write(worktree.join("nested/data"), b"reflog only\n").expect("write reflog data");
+    git(&worktree, &git_args(&["add", "nested/data"]));
+    git(&worktree, &git_args(&["commit", "-m", "reflog only"]));
+    git(
+        &worktree,
+        &[
+            OsString::from("reset"),
+            OsString::from("--hard"),
+            OsString::from(baseline.trim()),
+        ],
+    );
+    let record_before = fs::read(&record).expect("read reflog-only record");
+    assert_error(
+        &fixture.remove("reflog-only", false),
+        "SESSION_DISCARD_RISK",
+        "remove session whose only new commit lives in the target reflog",
+    );
+    assert!(root.exists(), "reflog-only risk removed the session root");
+    assert_eq!(
+        fs::read(&record).expect("read reflog-only record after rejection"),
+        record_before,
+        "reflog-only risk changed the session record"
+    );
+    let forced = fixture.remove("reflog-only", true);
+    assert_remove_event(&forced, b"reflog-only", "force remove reflog-only session");
+    fixture.cleanup();
+}
+
+#[test]
+fn authority_with_tags_and_unreachable_objects_does_not_block_doctor_or_remove() {
+    require_native_cow();
+    let mut fixture = Fixture::new();
+    // Supply an identity so the fixture does not depend on the host's global
+    // Git configuration.
+    let mut git_dir = OsString::from("--git-dir=");
+    git_dir.push(fixture.authority.as_os_str());
+    git(
+        &fixture.sandbox.path,
+        &[
+            git_dir.clone(),
+            OsString::from("-c"),
+            OsString::from("user.name=M3 Tag"),
+            OsString::from("-c"),
+            OsString::from("user.email=m3-tag@example.invalid"),
+            OsString::from("tag"),
+            OsString::from("-a"),
+            OsString::from("v1"),
+            OsString::from("-m"),
+            OsString::from("release"),
+            OsString::from("refs/heads/main"),
+        ],
+    );
+
+    assert_success(
+        &fixture.create(OsString::from("tagged")),
+        "create tagged session",
+    );
+    let doctor = fixture.vws(vec![OsString::from("doctor")]);
+    assert_success(&doctor, "doctor with an authority tag");
+    let rows = ndjson(&doctor);
+    assert_eq!(
+        rows.last()
+            .and_then(|row| row.get("recovery_required"))
+            .and_then(Value::as_bool),
+        Some(false),
+        "doctor reported recovery for a tagged authority: {doctor:?}"
+    );
+    let removed = fixture.remove("tagged", false);
+    assert_remove_event(&removed, b"tagged", "remove session on tagged authority");
+    fixture.cleanup();
+}
+
+#[test]
 fn tombstone_recovery_resumes_and_already_absent_remove_is_idempotent() {
     require_native_cow();
     let mut fixture = Fixture::new();
@@ -1360,8 +1683,18 @@ fn tombstone_recovery_resumes_and_already_absent_remove_is_idempotent() {
             && children_with_suffix(&fixture.sessions(), ".record").is_empty(),
         "tombstone recovery left a managed artifact"
     );
+    // A second remove of an already absent session is still a success, but it
+    // reports ABSENT so scripts can tell it apart from a real removal.
     let idempotent = fixture.remove("alpha", false);
-    assert_remove_event(&idempotent, b"alpha", "idempotent remove after recovery");
+    assert_success(&idempotent, "idempotent remove after recovery");
+    assert!(
+        idempotent.stderr.is_empty(),
+        "idempotent remove added diagnostics: {idempotent:?}"
+    );
+    let rows = ndjson(&idempotent);
+    assert_eq!(rows.len(), 1, "idempotent remove did not emit one event");
+    assert_eq!(row_string(&rows[0], "event"), "ABSENT");
+    assert_eq!(row_string(&rows[0], "name_hex"), hex(b"alpha"));
     assert_protected(&protected, &protected_paths);
     fixture.cleanup();
 }

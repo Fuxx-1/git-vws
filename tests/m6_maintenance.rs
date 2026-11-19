@@ -1047,6 +1047,186 @@ fn maintenance_lines(output: &Output, label: &str) -> Vec<Value> {
 }
 
 #[test]
+fn hard_linked_authority_objects_do_not_block_doctor_or_gc() {
+    let mut fixture = Fixture::new(true);
+    let objects = fixture.authority.join("objects");
+    let mut hard_linked = 0_usize;
+    for entry in fs::read_dir(&objects).expect("read authority objects") {
+        let fanout = entry.expect("read fanout entry").path();
+        if !fanout.is_dir()
+            || fanout
+                .file_name()
+                .is_some_and(|name| name == "info" || name == "pack")
+        {
+            continue;
+        }
+        for loose in fs::read_dir(&fanout).expect("read fanout") {
+            let path = loose.expect("read loose object").path();
+            let linked = fixture.sandbox.child(&format!(
+                "hardlink-{}",
+                path.file_name().expect("loose name").to_string_lossy()
+            ));
+            fs::hard_link(&path, &linked).expect("hard-link authority loose object");
+            hard_linked += 1;
+        }
+    }
+    assert!(hard_linked != 0, "fixture authority had no loose objects");
+
+    assert_success(
+        &fixture.create("alpha", "main"),
+        "create against a hard-linked authority",
+    );
+    let doctor = fixture.doctor();
+    assert_success(&doctor, "doctor against a hard-linked authority");
+    let rows = maintenance_lines(&doctor, "hard-linked authority doctor");
+    assert_eq!(
+        rows.last()
+            .and_then(|row| row.get("recovery_required"))
+            .and_then(Value::as_bool),
+        Some(false),
+        "doctor reported recovery for a hard-linked authority: {doctor:?}"
+    );
+    let gc = fixture.gc();
+    assert_success(&gc, "gc against a hard-linked authority");
+    let rows = maintenance_lines(&gc, "hard-linked authority gc");
+    assert_eq!(
+        rows.last()
+            .and_then(|row| row.get("recovery_required"))
+            .and_then(Value::as_bool),
+        Some(false),
+        "gc reported recovery for a hard-linked authority: {gc:?}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn human_output_is_readable_and_keeps_the_ndjson_contract() {
+    let mut fixture = Fixture::new(true);
+    assert_success(
+        &fixture.create("alpha", "main"),
+        "create alpha for human output",
+    );
+
+    let human = fixture.vws(vec![OsString::from("doctor"), OsString::from("--human")]);
+    assert_success(&human, "doctor --human");
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        text.contains("state is healthy"),
+        "doctor --human omitted a readable verdict: {human:?}"
+    );
+    assert!(
+        !text.contains("{\"version\""),
+        "doctor --human still emitted NDJSON: {human:?}"
+    );
+
+    // The machine contract must stay unchanged when --human is absent.
+    let ndjson_output = fixture.doctor();
+    assert_success(&ndjson_output, "doctor NDJSON");
+    let rows = maintenance_lines(&ndjson_output, "doctor NDJSON");
+    assert!(
+        rows.last()
+            .and_then(|row| row.get("recovery_required"))
+            .is_some(),
+        "doctor NDJSON lost its summary contract: {ndjson_output:?}"
+    );
+
+    let list_human =
+        fixture.vws(fixture.repo_args(vec![OsString::from("list"), OsString::from("--human")]));
+    assert_success(&list_human, "list --human");
+    let text = String::from_utf8_lossy(&list_human.stdout);
+    assert!(
+        text.contains("alpha"),
+        "list --human omitted the session name: {list_human:?}"
+    );
+    assert!(
+        text.contains("removable"),
+        "list --human omitted removability: {list_human:?}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn home_lease_is_bounded_and_readonly_commands_do_not_need_it() {
+    let mut fixture = Fixture::new(true);
+    assert_success(
+        &fixture.create("alpha", "main"),
+        "create alpha before HOME lease",
+    );
+
+    let home = File::open(&fixture.home).expect("open HOME for lease");
+    assert_eq!(
+        unsafe { libc::flock(home.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "acquire HOME lease"
+    );
+
+    let started = Instant::now();
+    let list = fixture.list(&fixture.authority);
+    assert_success(&list, "list under an external HOME lease");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "list blocked on the HOME lease for {:?}",
+        started.elapsed()
+    );
+
+    let doctor = fixture.doctor();
+    assert!(
+        doctor.status.success(),
+        "doctor blocked on the HOME lease: {doctor:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "read-only maintenance blocked on the HOME lease for {:?}",
+        started.elapsed()
+    );
+
+    let create_started = Instant::now();
+    let create = fixture.create("beta", "main");
+    assert_success(&create, "create under an external HOME lease");
+    assert!(
+        create_started.elapsed() < Duration::from_secs(30),
+        "create was blocked by the HOME lease for {:?}",
+        create_started.elapsed()
+    );
+    assert_eq!(
+        unsafe { libc::flock(home.as_raw_fd(), libc::LOCK_UN) },
+        0,
+        "release HOME lease"
+    );
+    drop(home);
+
+    let held = File::open(fixture.state()).expect("open state root for lease");
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "acquire state root lease"
+    );
+    let init_started = Instant::now();
+    let reinit = fixture.vws(vec![
+        OsString::from("init"),
+        fixture.authority.as_os_str().to_os_string(),
+    ]);
+    assert_error(&reinit, "STATE_BUSY", "init under a state root lease");
+    assert!(
+        init_started.elapsed() < Duration::from_secs(30),
+        "init did not time out on the state root lease: {:?}",
+        init_started.elapsed()
+    );
+    let stderr = String::from_utf8_lossy(&reinit.stderr);
+    assert!(
+        stderr.contains("wait for it to finish"),
+        "state root lease timeout did not explain the next step: {reinit:?}"
+    );
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) },
+        0,
+        "release state root lease"
+    );
+    drop(held);
+    fixture.cleanup();
+}
+
+#[test]
 fn global_maintenance_cli_and_doctor_are_readonly() {
     let mut absent = Fixture::new(false);
     let absent_before = snapshot(&absent.home);
