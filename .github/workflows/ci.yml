@@ -868,6 +868,17 @@ jobs:
           sudo chown "$(id -u):$(id -g)" "$mountpoint"
           export HOME="$mountpoint/home"
           mkdir -p "$HOME"
+          # git-vws audits Git with a scrubbed environment, so it reads the
+          # system and global config directly. The hosted runner ships a system
+          # config containing includes, which git-vws rejects by design; remove
+          # it so this job exercises a clean host like the macOS one.
+          for cfg in /etc/gitconfig /usr/local/etc/gitconfig "$RUNNER_TEMP"/../gitconfig; do
+            if [ -e "$cfg" ]; then
+              printf 'removing %s\n' "$cfg" | tee -a "$evidence/host-config.log"
+              sudo rm -f "$cfg"
+            fi
+          done
+          git config --system --list 2>&1 | tee -a "$evidence/host-config.log" || true
           git init -q --bare "$mountpoint/repo.git"
           git --git-dir="$mountpoint/repo.git" symbolic-ref HEAD refs/heads/main
           git init -q "$RUNNER_TEMP/seed"
