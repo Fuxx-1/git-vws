@@ -222,10 +222,10 @@ jobs:
               >> runner-evidence/m4-m5-source-contract.log
             test "$actual" = "$expected"
           done <<'EOF'
-          src/authority.rs 12a3260bea88e226a806bc3d7331b7dc8f2b76baa196affd27c7cfbbeb0a7f2a
+          src/authority.rs dad07f80e9aa1a152d569e2ed24231a883f71423449146871a1137773d877d43
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
-          src/main.rs ae0b1942511650882ae7a8b62d9a35154c7e8f72b211d39b3283435b26a35a2b
-          src/session.rs d1fdcec461d6b20e653884655e921f1dd8766972b9304aa6200fd9b4d488ad27
+          src/main.rs 7c00ff425ef673c84cc195754c2361632785a00465c8e5c7defc65a5005397b7
+          src/session.rs 22f1710cf67bd419d9e087b7e9b85b7f626e14510d1ca5cb6dfd21bcba1083bd
           src/storage.rs a93306fbf0c95f6ce8929294fa64eee1a1bec661b5d9045c499d3c109a1c4f24
           src/template.rs 82baebc408696e9ec49c1039d113902dc37ccdf8f2b485d90b7516bf1d7a0a9a
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
@@ -600,10 +600,10 @@ jobs:
               >> runner-evidence/m4-m5-source-contract.log
             test "$actual" = "$expected"
           done <<'EOF'
-          src/authority.rs 12a3260bea88e226a806bc3d7331b7dc8f2b76baa196affd27c7cfbbeb0a7f2a
+          src/authority.rs dad07f80e9aa1a152d569e2ed24231a883f71423449146871a1137773d877d43
           src/m4_checkpoint.rs e74b38d5619d88306640bdab263494c6debd87fa561c7983d84d5dbb3f4be0c9
-          src/main.rs ae0b1942511650882ae7a8b62d9a35154c7e8f72b211d39b3283435b26a35a2b
-          src/session.rs d1fdcec461d6b20e653884655e921f1dd8766972b9304aa6200fd9b4d488ad27
+          src/main.rs 7c00ff425ef673c84cc195754c2361632785a00465c8e5c7defc65a5005397b7
+          src/session.rs 22f1710cf67bd419d9e087b7e9b85b7f626e14510d1ca5cb6dfd21bcba1083bd
           src/storage.rs a93306fbf0c95f6ce8929294fa64eee1a1bec661b5d9045c499d3c109a1c4f24
           src/template.rs 82baebc408696e9ec49c1039d113902dc37ccdf8f2b485d90b7516bf1d7a0a9a
           tests/m4_git_parity.rs c28c11f4f4ca98f58f6253591a8cb6acf8664ef90c578176cd44aa020058e56c
@@ -817,4 +817,169 @@ jobs:
         with:
           name: ci-linux-x86_64-xfs-reflink
           path: runner-evidence
+          if-no-files-found: error
+
+  linux-ext4-loop:
+    name: Linux ext4 loop-backed state root
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          set-safe-directory: false
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: rustfmt, clippy
+      - name: Install btrfs and loop tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y btrfs-progs e2fsprogs util-linux
+      - name: Build release binary
+        run: cargo build --locked --release --bin git-vws
+      - name: Verify ext4 rejects native COW and names the filesystem
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/ext4-evidence"
+          mkdir -p "$evidence"
+          image="$RUNNER_TEMP/ext4.img"
+          mountpoint="$RUNNER_TEMP/ext4"
+          truncate -s 1G "$image"
+          sudo mkfs.ext4 -q -F "$image"
+          sudo mkdir -p "$mountpoint"
+          sudo mount -o loop "$image" "$mountpoint"
+          sudo chown "$(id -u):$(id -g)" "$mountpoint"
+          export HOME="$mountpoint/home"
+          mkdir -p "$HOME"
+          git init -q --bare "$mountpoint/repo.git"
+          git --git-dir="$mountpoint/repo.git" symbolic-ref HEAD refs/heads/main
+          git init -q "$RUNNER_TEMP/seed"
+          cd "$RUNNER_TEMP/seed"
+          git config user.email ci@example.invalid
+          git config user.name CI
+          printf 'seed\n' > seed.txt
+          git add .
+          git commit -qm seed
+          git push -q "$mountpoint/repo.git" HEAD:main
+          cd "$GITHUB_WORKSPACE"
+          binary="$GITHUB_WORKSPACE/target/release/git-vws"
+          "$binary" init "$mountpoint/repo.git" | tee "$evidence/init.log"
+          set +e
+          "$binary" --repo "$mountpoint/repo.git" create native > "$evidence/create.log" 2>&1
+          status=$?
+          set -e
+          test "$status" -ne 0
+          grep -F 'ext2/ext3/ext4' "$evidence/create.log" | tee "$evidence/rejection.log"
+          grep -F 'reflink' "$evidence/create.log"
+      - name: Set up a loop-backed state root and run the full lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/ext4-evidence"
+          mountpoint="$RUNNER_TEMP/ext4"
+          export HOME="$mountpoint/home"
+          binary="$GITHUB_WORKSPACE/target/release/git-vws"
+          sudo -E env "PATH=$PATH" "HOME=$HOME" "$binary" setup-loop --size 1G --adopt \
+            | tee "$evidence/setup-loop.log"
+          mountpoint -q "$HOME/.git-vws"
+          df -T "$HOME/.git-vws" | tee "$evidence/mounted.log"
+          grep -F 'btrfs' "$evidence/mounted.log"
+          grep -F 'git-vws loop state root' /etc/fstab | tee "$evidence/fstab.log"
+          "$binary" doctor --human | tee "$evidence/doctor-setup.log"
+          "$binary" --repo "$mountpoint/repo.git" create alpha --target feature/alpha \
+            | tee "$evidence/create-alpha.log"
+          "$binary" --repo "$mountpoint/repo.git" exec alpha -- sh -c \
+            'echo alpha > alpha.txt; git add -A; git commit -qm alpha'
+          "$binary" --repo "$mountpoint/repo.git" create beta --target feature/beta \
+            | tee "$evidence/create-beta.log"
+          "$binary" --repo "$mountpoint/repo.git" exec beta -- sh -c \
+            'echo beta > beta.txt; git add -A; git commit -qm beta'
+          "$binary" --repo "$mountpoint/repo.git" list --human | tee "$evidence/list.log"
+          "$binary" --repo "$mountpoint/repo.git" publish alpha | tee "$evidence/publish-alpha.log"
+          "$binary" --repo "$mountpoint/repo.git" publish beta | tee "$evidence/publish-beta.log"
+          git --git-dir="$mountpoint/repo.git" rev-parse refs/heads/feature/alpha
+          git --git-dir="$mountpoint/repo.git" rev-parse refs/heads/feature/beta
+          "$binary" --repo "$mountpoint/repo.git" remove alpha | tee "$evidence/remove-alpha.log"
+          "$binary" --repo "$mountpoint/repo.git" remove beta | tee "$evidence/remove-beta.log"
+          "$binary" gc --human | tee "$evidence/gc.log"
+          "$binary" doctor --human | tee "$evidence/doctor-final.log"
+          grep -F '0 finding(s)' "$evidence/doctor-final.log"
+      - name: Verify sessions share physical data through reflinks
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/ext4-evidence"
+          mountpoint="$RUNNER_TEMP/ext4"
+          export HOME="$mountpoint/home"
+          binary="$GITHUB_WORKSPACE/target/release/git-vws"
+          head -c 4194304 /dev/urandom > "$mountpoint/repo.git/large.bin"
+          git --git-dir="$mountpoint/repo.git" --work-tree="$mountpoint" add -f large.bin
+          tree=$(git --git-dir="$mountpoint/repo.git" write-tree)
+          commit=$(git --git-dir="$mountpoint/repo.git" commit-tree "$tree" -m "add large file")
+          git --git-dir="$mountpoint/repo.git" update-ref refs/heads/main "$commit"
+          before=$(df -k --output=used "$HOME/.git-vws" | tail -1 | tr -d ' ')
+          "$binary" --repo "$mountpoint/repo.git" create shared-a --target feature/shared \
+            | tee "$evidence/create-shared-a.log"
+          "$binary" --repo "$mountpoint/repo.git" create shared-b --target feature/shared \
+            | tee "$evidence/create-shared-b.log"
+          after=$(df -k --output=used "$HOME/.git-vws" | tail -1 | tr -d ' ')
+          delta=$((after - before))
+          printf 'reflink growth for two 4MiB sessions: %s KiB\n' "$delta" \
+            | tee "$evidence/reflink.log"
+          # Two sessions sharing one 4 MiB file must not cost two full copies.
+          test "$delta" -lt 8192
+          "$binary" --repo "$mountpoint/repo.git" remove shared-a --force
+          "$binary" --repo "$mountpoint/repo.git" remove shared-b --force
+      - name: Grow the state root in place
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/ext4-evidence"
+          mountpoint="$RUNNER_TEMP/ext4"
+          export HOME="$mountpoint/home"
+          binary="$GITHUB_WORKSPACE/target/release/git-vws"
+          sudo -E env "PATH=$PATH" "HOME=$HOME" "$binary" loop-resize --size 2G \
+            | tee "$evidence/resize.log"
+          df -h "$HOME/.git-vws" | tee "$evidence/resized.log"
+          "$binary" doctor --human | tee "$evidence/doctor-resized.log"
+          grep -F '0 finding(s)' "$evidence/doctor-resized.log"
+      - name: Unmount and confirm doctor explains the missing state root
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/ext4-evidence"
+          mountpoint="$RUNNER_TEMP/ext4"
+          export HOME="$mountpoint/home"
+          binary="$GITHUB_WORKSPACE/target/release/git-vws"
+          sudo umount "$HOME/.git-vws"
+          set +e
+          "$binary" doctor --human > "$evidence/doctor-unmounted.log" 2>&1
+          status=$?
+          set -e
+          test "$status" -ne 0
+          grep -F 'not mounted' "$evidence/doctor-unmounted.log" \
+            | tee "$evidence/unmounted.log"
+          sudo mount "$HOME/.git-vws"
+          "$binary" doctor --human | tee "$evidence/doctor-remounted.log"
+          grep -F '0 finding(s)' "$evidence/doctor-remounted.log"
+      - name: Remove loop artifacts
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mountpoint="$RUNNER_TEMP/ext4"
+          if mountpoint -q "$mountpoint/home/.git-vws"; then
+            sudo umount "$mountpoint/home/.git-vws" || true
+          fi
+          if mountpoint -q "$mountpoint"; then
+            sudo umount "$mountpoint" || true
+          fi
+          sudo sed -i '/# git-vws loop state root/,+1d' /etc/fstab || true
+          sudo rm -rf "$mountpoint" "$RUNNER_TEMP/ext4.img" || true
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: ci-linux-ext4-loop
+          path: ${{ runner.temp }}/ext4-evidence
           if-no-files-found: error

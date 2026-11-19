@@ -1737,6 +1737,12 @@ fn open_home() -> Result<File, Error> {
     Ok(current)
 }
 
+/// Public accessor for the state root location, used to explain an unmounted
+/// loop-backed root without opening it.
+pub(crate) fn state_root_location() -> Result<PathBuf, Error> {
+    state_root_path()
+}
+
 fn state_root_path() -> Result<PathBuf, Error> {
     let home =
         env::var_os("HOME").ok_or_else(|| Error::new("STATE_UNAVAILABLE", "HOME is not set"))?;

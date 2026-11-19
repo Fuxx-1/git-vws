@@ -596,6 +596,13 @@ fn maintain(cleanup: bool, human: bool) -> Result<(), Error> {
         Err(error)
             if error.code == "STATE_UNAVAILABLE" && error.detail == "state root does not exist" =>
         {
+            // A loop-backed state root looks missing when its image is not
+            // mounted, so say that instead of reporting an empty registry.
+            if let Some(detail) = crate::looproot::describe_state_root(
+                &authority::state_root_location().unwrap_or_default(),
+            ) {
+                report.recovery("state", b"", detail.as_bytes(), "UNMOUNTED");
+            }
             return finish_maintenance(report, cleanup, human);
         }
         Err(_) => {

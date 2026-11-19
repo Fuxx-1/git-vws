@@ -60,7 +60,23 @@ Measured on Linux:
 | **ext4** | **No** | The kernel has no reflink support, so FICLONE returns EOPNOTSUPP (errno 95) |
 | tmpfs / NFS / overlayfs | No | No reflink capability |
 
-init does not probe storage; the first create fails when COW is probed. If the state root lands on ext4, move $HOME/.git-vws to an XFS or btrfs volume.
+init does not probe storage; the first create fails when COW is probed.
+
+## Using a loop-backed state root on ext4
+
+When the host only has ext4, one-time root access can place the state root on a sparse btrfs image:
+
+    sudo git vws setup-loop --size 8G
+    sudo git vws setup-loop --size 8G --adopt   # move an existing $HOME/.git-vws in
+    git vws doctor
+
+The image defaults to $HOME/.git-vws.img. It is nominally 8G but starts out a few megabytes and grows with writes. The command mounts it at $HOME/.git-vws and adds an /etc/fstab entry, so the mount returns after a reboot; every later command runs as your normal user without further elevation.
+
+Grow it in place without unmounting:
+
+    sudo git vws loop-resize --size 16G
+
+--adopt copies the previous state root into the image and keeps $HOME/.git-vws.pre-loop as a fallback, so no data is destroyed. When the image is not mounted, doctor tells you to mount it first.
 
 The current release rejects LFS, submodules, sparse or partial clone layouts, clean/smudge filters, and unsupported ACL, xattr, file-flag, special-file, or hard-link combinations.
 

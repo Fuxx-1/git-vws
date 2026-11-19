@@ -60,7 +60,23 @@ Linux 上的实测结论：
 | **ext4** | **不支持** | 内核未实现 reflink，`FICLONE` 返回 `EOPNOTSUPP`（errno 95） |
 | tmpfs / NFS / overlayfs | 不支持 | 无 reflink 能力 |
 
-`init` 不检测存储能力；第一次 `create` 触发 COW 探测时才失败。若状态根落在 ext4 上，把 `$HOME/.git-vws` 移到 XFS 或 btrfs 卷即可。
+`init` 不检测存储能力；第一次 `create` 触发 COW 探测时才失败。
+
+## 在 ext4 上使用 loop 状态根
+
+若宿主只有 ext4，可以用一次性的 root 权限把状态根放到一个稀疏 btrfs 镜像里：
+
+    sudo git vws setup-loop --size 8G
+    sudo git vws setup-loop --size 8G --adopt   # 把已有 $HOME/.git-vws 迁进镜像
+    git vws doctor
+
+镜像文件默认 `$HOME/.git-vws.img`，表观 8G 但初始只占几 MB，按写入量增长。命令会挂载到 `$HOME/.git-vws` 并写入 `/etc/fstab`，因此重启后自动恢复；此后的所有命令都以普通用户身份运行，不需要再提权。
+
+扩容在原地完成，不需要卸载：
+
+    sudo git vws loop-resize --size 16G
+
+`--adopt` 会把原有状态根复制进镜像，并保留 `$HOME/.git-vws.pre-loop` 作为回退，不销毁数据。镜像未挂载时 `doctor` 会提示先执行 `mount`。
 
 当前版本拒绝 LFS、submodule、sparse 或 partial clone、clean/smudge filter，以及不支持的 ACL、xattr、file flag、特殊文件或 hard link 组合。
 

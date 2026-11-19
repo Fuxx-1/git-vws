@@ -1,6 +1,7 @@
 mod authority;
 mod cache;
 mod git;
+mod looproot;
 #[cfg(git_vws_m4_checkpoint)]
 mod m4_checkpoint;
 mod session;
@@ -150,7 +151,7 @@ struct Cli {
         global = true,
         value_name = "PATH",
         help = "Select an existing Git repository; default: current directory. \
-                Rejected by forget, doctor, gc, and man, which always operate globally"
+                Rejected by forget, doctor, gc, man, setup-loop, and loop-resize"
     )]
     repo: Option<PathBuf>,
 
@@ -566,6 +567,67 @@ SAFETY
         human: bool,
     },
     #[command(
+        about = "Create a loop-backed state root on filesystems without reflink",
+        after_help = r#"
+WHAT IT DOES
+  On a filesystem without copy-on-write reflinks (ext4, tmpfs, and most network
+  filesystems), git-vws cannot share file data between sessions and refuses to
+  create one. This command gives such a host a supported state root anyway: it
+  creates a sparse image file, formats it with btrfs, mounts it over
+  $HOME/.git-vws, and adds an /etc/fstab entry so the mount returns on boot.
+
+WHY IT WORKS
+  The image is sparse, so a nominal 8G state root starts out using a few
+  megabytes and grows only as data is written. btrfs provides reflinks, so
+  sessions keep sharing unchanged file data exactly as on a native XFS or APFS
+  volume. The surrounding ext4 filesystem is never modified.
+
+REQUIREMENTS
+  One-time root access for mkfs, mount, chown, and /etc/fstab. Every later
+  command runs as your normal user.
+
+EXAMPLES
+  sudo git vws setup-loop --size 8G
+  sudo git vws setup-loop --size 8G --adopt   # move an existing state root in
+  git vws doctor
+  sudo git vws loop-resize --size 16G         # grow later, in place
+
+SAFETY
+  setup-loop refuses when the image or mount point already exists. With --adopt
+  the previous state root is copied into the image and the original is kept
+  beside it as $HOME/.git-vws.pre-loop, so nothing is destroyed.
+"#
+    )]
+    SetupLoop {
+        #[arg(
+            long,
+            value_name = "SIZE",
+            help = "Nominal image size, e.g. 8G; the file is sparse"
+        )]
+        size: Option<String>,
+        #[arg(long, help = "Move an existing $HOME/.git-vws into the new image")]
+        adopt: bool,
+    },
+    #[command(
+        about = "Grow the loop-backed state root in place",
+        after_help = r#"
+WHAT IT DOES
+  Grows the sparse image and resizes the btrfs filesystem inside it, without
+  unmounting or losing data.
+
+EXAMPLES
+  sudo git vws loop-resize --size 16G
+  git vws doctor
+
+REQUIREMENTS
+  One-time root access. The new size must be larger than the current one.
+"#
+    )]
+    LoopResize {
+        #[arg(long, value_name = "SIZE", help = "New nominal image size")]
+        size: Option<String>,
+    },
+    #[command(
         about = "Print a man page for this extension",
         after_help = r#"
 WHAT IT DOES
@@ -690,6 +752,30 @@ fn main() -> ExitCode {
         } => authority::forget(&repository_path, force).map(CommandOutput::Text),
         Command::Doctor { human } => global_maintenance(repo, || session::doctor(human)),
         Command::Gc { human } => global_maintenance(repo, || session::gc(human)),
+        Command::SetupLoop { size, adopt } => {
+            if repo.is_some() {
+                Err(authority::Error::new(
+                    "SESSION_USAGE",
+                    "setup-loop does not accept --repo",
+                ))
+            } else {
+                looproot::LoopPlan::discover(size.as_deref())
+                    .and_then(|plan| looproot::setup(&plan, adopt))
+                    .map(CommandOutput::Text)
+            }
+        }
+        Command::LoopResize { size } => {
+            if repo.is_some() {
+                Err(authority::Error::new(
+                    "SESSION_USAGE",
+                    "loop-resize does not accept --repo",
+                ))
+            } else {
+                looproot::LoopPlan::discover(size.as_deref())
+                    .and_then(|plan| looproot::resize(&plan, size.as_deref()))
+                    .map(CommandOutput::Text)
+            }
+        }
         Command::Man { install } => {
             if repo.is_some() {
                 Err(authority::Error::new(
