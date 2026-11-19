@@ -239,12 +239,22 @@ pub(crate) fn setup(plan: &LoopPlan, adopt: bool) -> Result<String, Error> {
             "chown of the state root",
         )?;
     }
-    // The state root must be owner-only (0700); chown preserves the mode but a
-    // freshly formatted mount point is 0755, so set it explicitly.
+    // The state root and its containers must be owner-only (0700). A freshly
+    // formatted mount point is 0755, and copied entries can keep a wider mode,
+    // so normalize the root and the container directories explicitly.
     run(
         Command::new("chmod").arg("700").arg(&plan.mount),
         "chmod of the state root",
     )?;
+    for container in ["sessions", "templates", "caches"] {
+        let path = plan.mount.join(container);
+        if path.is_dir() {
+            run(
+                Command::new("chmod").arg("700").arg(&path),
+                "chmod of a state container",
+            )?;
+        }
+    }
     let fstab = install_fstab(&plan)?;
     notes.push(fstab);
     notes.push(format!(
