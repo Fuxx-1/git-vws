@@ -593,16 +593,20 @@ fn maintain(cleanup: bool, human: bool) -> Result<(), Error> {
     let mut report = MaintenanceReport::default();
     let state = match authority::open_existing_state() {
         Ok(state) => state,
-        Err(error)
-            if error.code == "STATE_UNAVAILABLE" && error.detail == "state root does not exist" =>
-        {
-            // A loop-backed state root looks missing when its image is not
-            // mounted, so say that instead of reporting an empty registry.
+        Err(error) if error.code == "STATE_UNAVAILABLE" => {
+            // A loop-backed state root looks missing, or looks like an empty
+            // directory, when its image is not mounted. Explain that instead of
+            // reporting corruption the user cannot act on.
             if let Some(detail) = crate::looproot::describe_state_root(
                 &authority::state_root_location().unwrap_or_default(),
             ) {
                 report.recovery("state", b"", detail.as_bytes(), "UNMOUNTED");
+                return finish_maintenance(report, cleanup, human);
             }
+            if error.detail == "state root does not exist" {
+                return finish_maintenance(report, cleanup, human);
+            }
+            report.recovery("state", b"", b"", "CORRUPT");
             return finish_maintenance(report, cleanup, human);
         }
         Err(_) => {
