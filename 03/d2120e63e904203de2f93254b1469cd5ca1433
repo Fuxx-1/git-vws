@@ -1,0 +1,14 @@
+src/looproot.rs
+  h_e59efd41e8686d 25-26,35,38,166-199,221-228,230-237,239
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "03d2120e63e904203de2f93254b1469cd5ca1433",
+  "prompts": {},
+  "humans": {
+    "h_e59efd41e8686d": {
+      "author": "Fuxx-1 <583742849@qq.com>"
+    }
+  }
+}
