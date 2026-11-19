@@ -907,8 +907,14 @@ jobs:
           "$binary" doctor --human > "$evidence/doctor-setup.log" 2>&1 || true
           cat "$evidence/doctor-setup.log"
           grep -F '0 finding(s)' "$evidence/doctor-setup.log"
+          set +e
           "$binary" --repo "$mountpoint/repo.git" create alpha --target feature/alpha \
-            | tee "$evidence/create-alpha.log"
+            > "$evidence/create-alpha.log" 2>&1
+          create_status=$?
+          set -e
+          cat "$evidence/create-alpha.log"
+          printf 'create exit=%s\n' "$create_status" | tee -a "$evidence/create-alpha.log"
+          test "$create_status" -eq 0
           "$binary" --repo "$mountpoint/repo.git" exec alpha -- sh -c \
             'echo alpha > alpha.txt; git add -A; git commit -qm alpha'
           "$binary" --repo "$mountpoint/repo.git" create beta --target feature/beta \
