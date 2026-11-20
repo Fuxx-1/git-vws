@@ -7,7 +7,7 @@
 
 `git-vws` 是一个 Git Extension，为同一仓库创建多个独立、可正常编辑的开发会话。每个会话都有私有的 HEAD、index、refs、未提交修改和构建输出；未修改的 Git 文件通过 macOS APFS 或 Linux 原生 FICLONE 写时复制共享物理数据。它不修改 Git、不引入 FUSE、守护进程、管理员安装或全量复制回退。
 
-1.1.0 是当前支持 macOS 和 Linux 原生 COW 文件系统的稳定版本。发布或删除会话前，请先阅读命令输出和对应的恢复提示。
+1.2.0 是当前支持 macOS 和 Linux 原生 COW 文件系统的稳定版本。发布或删除会话前，请先阅读命令输出和对应的恢复提示。
 
 ## 快速开始
 
@@ -90,6 +90,8 @@ git vws forget <path> [--force]
 git vws doctor [--human]
 git vws gc [--human]
 git-vws man [--install]
+sudo git vws setup-loop [--size 8G] [--adopt]
+sudo git vws loop-resize --size 16G
 ```
 
 面对自动化或陌生命令，先运行 `git vws -h`，再运行 `git vws <command> -h`。`list`、`doctor` 和 `gc` 默认输出 NDJSON，加 `--human` 可读；非零退出或 `*_RECOVERY_REQUIRED` 都应视为停止信号，先保留状态并运行 `doctor`，不要手动删除 `$HOME/.git-vws` 中的文件。
@@ -133,7 +135,7 @@ gh attestation verify '<release-asset>' \
   --signer-workflow '<owner>/git-vws/.github/workflows/release-sign.yml' \
   --signer-digest '<signer-workflow-commit-from-release-notes>' \
   --source-digest '<source-commit-from-release-notes>' \
-  --source-ref refs/tags/v1.1.0 \
+  --source-ref refs/tags/v1.2.0 \
   --deny-self-hosted-runners
 ```
 

@@ -48,9 +48,9 @@ The release workflow builds x86_64 and ARM64 macOS assets and an x86_64 static L
 
 The release version is kept in Cargo.toml and Cargo.lock. A release tag must be an annotated semantic-version tag matching the package version and must point at the exact commit of a successful main push CI run. The tag annotation records the source commit and pre-tag CI run identity.
 
-    git tag -a v1.1.0 -m "git-vws v1.1.0"
+    git tag -a v1.2.0 -m "git-vws v1.2.0"
     git push origin main
-    git push origin v1.1.0
+    git push origin v1.2.0
 
 GitHub Actions creates deterministic archives, SHA256SUMS, SPDX 2.3 SBOM metadata, a third-party license inventory, build metadata, and the public Sigstore provenance bundle. Do not publish a tag before the source commit's full CI run succeeds.
 

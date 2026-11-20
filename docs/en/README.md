@@ -7,7 +7,7 @@
 
 `git-vws` is a Git Extension for creating independent, editable development sessions from one Git repository. Every session has private HEAD, index, refs, uncommitted changes, and build output. Unchanged Git files share physical storage through native copy-on-write on macOS APFS or supported Linux filesystems.
 
-Version 1.1.0 is the stable release for the current macOS and Linux scope. git-vws does not modify Git, install FUSE or a daemon, require administrator access, or silently fall back to a full worktree copy.
+Version 1.2.0 is the stable release for the current macOS and Linux scope. git-vws does not modify Git, install FUSE or a daemon, require administrator access, or silently fall back to a full worktree copy.
 
 ## Quick start
 
@@ -90,6 +90,8 @@ git vws forget <path> [--force]
 git vws doctor [--human]
 git vws gc [--human]
 git-vws man [--install]
+sudo git vws setup-loop [--size 8G] [--adopt]
+sudo git vws loop-resize --size 16G
 ```
 
 Run `git vws -h` first, then `git vws <command> -h` before using an unfamiliar command. `list`, `doctor`, and `gc` emit NDJSON by default; add `--human` for a readable table. Treat every nonzero exit and `*_RECOVERY_REQUIRED` as a stop signal: preserve the state, run `doctor`, and do not delete `$HOME/.git-vws` by hand.
